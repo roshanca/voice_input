@@ -68,8 +68,8 @@ If the input looks correct, return it unchanged.
 
         AppLogger.shared.info("Sending LLM request to \(urlString)")
         task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
                 if let error {
                     AppLogger.shared.error("LLM request error: \(error.localizedDescription)")
                     self.delegate?.llmRefiner(self, didFailWith: error)

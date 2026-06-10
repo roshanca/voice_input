@@ -75,10 +75,10 @@ final class SpeechRecognizer: NSObject {
         recognitionRequest.requiresOnDeviceRecognition = false
 
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
-            guard let self else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
 
-            if let error {
-                Task { @MainActor in
+                if let error {
                     let nsError = error as NSError
                     if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
                         AppLogger.shared.debug("Speech recognition task canceled (expected on stop)")
@@ -86,20 +86,16 @@ final class SpeechRecognizer: NSObject {
                     }
                     AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
                     self.delegate?.speechRecognizer(self, didFailWithError: error)
+                    return
                 }
-                return
-            }
 
-            guard let result else { return }
-            let text = result.bestTranscription.formattedString
-            if result.isFinal {
-                self.finalResult = text
-                Task { @MainActor in
+                guard let result else { return }
+                let text = result.bestTranscription.formattedString
+                if result.isFinal {
+                    self.finalResult = text
                     AppLogger.shared.info("Final speech result: \(text)")
                     self.delegate?.speechRecognizer(self, didFinishWithResult: text)
-                }
-            } else {
-                Task { @MainActor in
+                } else {
                     AppLogger.shared.debug("Partial result: \(text)")
                     self.delegate?.speechRecognizer(self, didReceivePartialResult: text)
                 }
@@ -157,8 +153,7 @@ final class SpeechRecognizer: NSObject {
             AppLogger.shared.debug("RMS: \(String(format: "%.4f", rms)), normalized: \(String(format: "%.3f", normalized))")
         }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        Task { @MainActor in
             self.delegate?.speechRecognizer(self, didUpdateRMS: normalized)
         }
     }

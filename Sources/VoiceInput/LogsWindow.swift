@@ -19,7 +19,9 @@ final class LogsWindowController: NSWindowController {
         setupUI()
 
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.reload()
+            Task { @MainActor [weak self] in
+                self?.reload()
+            }
         }
     }
 
@@ -27,7 +29,7 @@ final class LogsWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
-    deinit {
+    isolated deinit {
         refreshTimer?.invalidate()
     }
 

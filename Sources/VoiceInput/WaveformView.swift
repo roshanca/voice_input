@@ -1,5 +1,6 @@
 import Cocoa
 
+@MainActor
 final class WaveformView: NSView {
     private let barCount = 5
     private let weights: [CGFloat] = [0.5, 0.8, 1.0, 0.75, 0.55]
@@ -41,7 +42,7 @@ final class WaveformView: NSView {
 
         let callback: CVDisplayLinkOutputCallback = { _, _, _, _, _, context -> CVReturn in
             let view = Unmanaged<WaveformView>.fromOpaque(context!).takeUnretainedValue()
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 view.updateBars()
             }
             return kCVReturnSuccess

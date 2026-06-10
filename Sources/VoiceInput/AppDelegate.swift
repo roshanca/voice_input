@@ -310,10 +310,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
                 floatingPanel.setText("Error: \(error.localizedDescription)")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                    self?.floatingPanel.hide()
-                    self?.isFnHeld = false
-                    self?.stopRecordingAnimation()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self.floatingPanel.hide()
+                    self.isFnHeld = false
+                    self.stopRecordingAnimation()
                 }
             }
         }
@@ -371,7 +371,7 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
         return Unmanaged.passUnretained(event)
     }
     let fnDown = event.flags.contains(.maskSecondaryFn)
-    DispatchQueue.main.async {
+    Task { @MainActor in
         if fnDown {
             appDelegateRef?.fnPressed()
         } else {

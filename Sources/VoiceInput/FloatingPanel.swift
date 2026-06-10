@@ -1,5 +1,6 @@
 import Cocoa
 
+@MainActor
 final class FloatingPanel: NSPanel {
     private let containerView = NSView()
     private let shadowView = NSView()
@@ -120,7 +121,11 @@ final class FloatingPanel: NSPanel {
     }
 
     func centerOnScreen() {
-        guard let screen = NSScreen.main else { return }
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouseLocation) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return }
         let frame = screen.visibleFrame
         let size = self.frame.size
         let x = frame.midX - size.width / 2
