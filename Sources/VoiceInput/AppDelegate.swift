@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var isFnHeld = false
     private var rawText = ""
+    private var annotatedText = ""
     private var resultTimeout: Timer?
     private var recordingAnimationTimer: Timer?
 
@@ -332,15 +333,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 AppLogger.shared.info("Result timeout fired — processing final text")
-                processFinalText(rawText)
+                processFinalText()
             }
         }
     }
 
-    private func processFinalText(_ text: String) {
+    private func processFinalText() {
         resultTimeout?.invalidate()
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        AppLogger.shared.info("processFinalText called — raw length: \(text.count), trimmed length: \(trimmed.count)")
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAnnotated = annotatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        AppLogger.shared.info("processFinalText called — raw length: \(rawText.count), trimmed length: \(trimmed.count)")
         guard !trimmed.isEmpty else {
             AppLogger.shared.warning("processFinalText — trimmed text is empty, hiding panel")
             floatingPanel.hide()
@@ -351,7 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if UserDefaults.standard.llmEnabled && llmRefiner.isConfigured {
             AppLogger.shared.info("LLM enabled and configured — starting refinement")
             floatingPanel.setText("Refining…")
-            llmRefiner.refine(text: trimmed)
+            llmRefiner.refine(text: trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated)
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
             floatingPanel.hide()
@@ -395,17 +397,19 @@ extension AppDelegate: NSWindowDelegate {
 }
 
 extension AppDelegate: SpeechRecognizerDelegate {
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult text: String) {
-        rawText = text
-        floatingPanel.setText(text)
-        AppLogger.shared.debug("Partial result: \(text)")
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult) {
+        rawText = result.text
+        floatingPanel.setText(result.text)
+        AppLogger.shared.debug("Partial result: \(result.text)")
     }
 
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult text: String) {
-        rawText = text
-        floatingPanel.setText(text)
-        AppLogger.shared.info("Final result: \(text)")
-        processFinalText(text)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult) {
+        rawText = result.text
+        annotatedText = result.annotatedText
+        floatingPanel.setText(result.text)
+        AppLogger.shared.info("Final result: \(result.text)")
+        AppLogger.shared.info("Annotated result: \(result.annotatedText)")
+        processFinalText()
     }
 
     func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error) {

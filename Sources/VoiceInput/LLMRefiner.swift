@@ -12,7 +12,11 @@ final class LLMRefiner {
     weak var delegate: LLMRefinerDelegate?
     private var task: URLSessionDataTask?
 
-    private let config: LLMConfig
+    private let overrideConfig: LLMConfig?
+
+    private var config: LLMConfig {
+        overrideConfig ?? UserDefaults.standard.currentLLMConfig ?? LLMConfig.default
+    }
 
     var isConfigured: Bool {
         !config.baseURL.isEmpty && !config.model.isEmpty &&
@@ -20,7 +24,7 @@ final class LLMRefiner {
     }
 
     init(config: LLMConfig? = nil) {
-        self.config = config ?? UserDefaults.standard.currentLLMConfig ?? LLMConfig.default
+        self.overrideConfig = config
     }
 
     func refine(text: String) {
@@ -41,25 +45,28 @@ final class LLMRefiner {
         }
 
         let systemPrompt = """
-You correct obvious speech recognition errors only. \
-Fix: Chinese homophone mistakes, English technical terms wrongly transcribed into Chinese \
-(e.g., 配森→Python, 杰森→JSON, 拍森→Python, 杰森→JSON). \
-Do NOT rewrite, polish, summarize, or remove any content that appears correct. \
-If the input looks correct, return it unchanged.
+You correct obvious speech recognition errors only. The input already contains punctuation added by the speech recognizer; preserve it unless it is clearly wrong.
 
-Process speech-to-text transcripts:
-- Remove meaningless filler words and ending periods.
-- Transcription model flaws: generally does not omit characters, but misrecognizes characters (homophones with different characters).
-- Considering the model's flaws, correct transcription errors as much as possible based on user intent and rational thinking of "ordinary people".
-- Consider user intent, preserve original sentence structure.
-- Fluency and reasonableness of text > preserving original sentence.
-- For vulgar content, keep the original expression without any modification.
-- Proofread all typos based on context.
-- Remove all meaningless filler words, catchphrases, and padding words (e.g., um, ah, like, then, this, that…).
-- Re-add punctuation marks to make the text look neat.
-- Absolutely prohibit any explanations, clarifications, or extra text. Directly return the modified text.
-- Handle corrections: if the original text appears as "aaa correct bbb" or "aaa (bbb)", directly retain the content of "bbb".
-- Polishing: if the user requests polishing or modification in the recorded text, polish and organize the content before output.
+Rules:
+1. Fix only clear transcription errors:
+   - Chinese homophone mistakes (e.g., 配森→Python, 拍森→Python, 杰森→JSON).
+   - English technical terms wrongly transcribed into Chinese.
+   - Obvious typos that can be confidently corrected from context.
+
+2. Remove only filler words that carry no meaning, such as "um", "ah", "like", "那个", "然后" when overused. Do not remove words that affect meaning.
+
+3. Never do the following:
+   - Summarize, condense, or rewrite correct content.
+   - Change wording that is already natural and correct.
+   - Strip or alter existing punctuation unless it is clearly misplaced.
+   - Add explanations, clarifications, labels, or any extra text.
+   - Censor or soften vulgar content; keep the original expression.
+
+4. If the user explicitly asks to polish or rephrase within the transcript (e.g., "帮我润色一下"), follow that instruction for the relevant part only.
+
+5. For self-corrections like "aaa correct bbb" or "aaa (bbb)", output "bbb".
+
+Output only the corrected text, with no introduction, labels, or markdown.
 """
 
         let body: [String: Any] = [
@@ -96,6 +103,21 @@ Process speech-to-text transcripts:
                 }
                 if let httpResponse = response as? HTTPURLResponse {
                     AppLogger.shared.info("LLM HTTP status: \(httpResponse.statusCode)")
+                    guard (200...299).contains(httpResponse.statusCode) else {
+                        let bodyString = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+                        AppLogger.shared.error("LLM request failed — status: \(httpResponse.statusCode), body: \(bodyString)")
+                        let message: String
+                        switch httpResponse.statusCode {
+                        case 401:
+                            message = "Unauthorized: check your API key."
+                        case 429:
+                            message = "Rate limited: too many requests."
+                        default:
+                            message = "LLM request failed with status \(httpResponse.statusCode)."
+                        }
+                        self.delegate?.llmRefiner(self, didFailWith: NSError(domain: "LLMRefiner", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message]))
+                        return
+                    }
                 }
                 do {
                     if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],

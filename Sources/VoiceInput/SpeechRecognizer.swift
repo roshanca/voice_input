@@ -2,10 +2,15 @@ import Speech
 import AVFoundation
 import AVFAudio
 
+struct TranscriptionResult {
+    let text: String
+    let annotatedText: String
+}
+
 @MainActor
 protocol SpeechRecognizerDelegate: AnyObject {
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult text: String)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult text: String)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult)
     func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error)
     func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float)
 }
@@ -83,6 +88,7 @@ final class SpeechRecognizer: NSObject {
         }
         recognitionRequest.shouldReportPartialResults = true
         recognitionRequest.requiresOnDeviceRecognition = false
+        recognitionRequest.addsPunctuation = true
 
         guard let speechRecognizer else {
             AppLogger.shared.error("No SFSpeechRecognizer available")
@@ -106,13 +112,16 @@ final class SpeechRecognizer: NSObject {
 
                 guard let result else { return }
                 let text = result.bestTranscription.formattedString
+                let annotated = Self.annotatedText(from: result.bestTranscription)
+                let transcription = TranscriptionResult(text: text, annotatedText: annotated)
                 if result.isFinal {
                     self.finalResult = text
                     AppLogger.shared.info("Final speech result: \(text)")
-                    self.delegate?.speechRecognizer(self, didFinishWithResult: text)
+                    AppLogger.shared.info("Annotated speech result: \(annotated)")
+                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription)
                 } else {
                     AppLogger.shared.debug("Partial result: \(text)")
-                    self.delegate?.speechRecognizer(self, didReceivePartialResult: text)
+                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription)
                 }
             }
         }
@@ -197,6 +206,10 @@ final class SpeechRecognizer: NSObject {
             self.recognitionRequest = nil
         }
         isRecording = false
+    }
+
+    static func annotatedText(from transcription: SFTranscription) -> String {
+        transcription.formattedString
     }
 
     private func processRMS(buffer: AVAudioPCMBuffer) {
