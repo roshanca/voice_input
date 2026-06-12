@@ -20,6 +20,7 @@ final class SettingsWindowController: NSWindowController {
     private var configs: [LLMConfig] = []
     private var editingIndex: Int? = nil
     private var testRefiner: LLMRefiner?
+    private var isProgrammaticSelection = false
 
     init() {
         let window = NSWindow(
@@ -49,12 +50,25 @@ final class SettingsWindowController: NSWindowController {
         scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
-        col.title = "Configurations"
-        col.width = 190
-        col.minWidth = 120
-        tableView.addTableColumn(col)
-        tableView.headerView = nil
+        let selectedCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("selected"))
+        selectedCol.title = ""
+        selectedCol.width = 32
+        selectedCol.minWidth = 32
+        selectedCol.maxWidth = 32
+        tableView.addTableColumn(selectedCol)
+
+        let nameCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        nameCol.title = "Name"
+        nameCol.width = 120
+        nameCol.minWidth = 80
+        tableView.addTableColumn(nameCol)
+
+        let providerCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("provider"))
+        providerCol.title = "Provider"
+        providerCol.width = 80
+        providerCol.minWidth = 60
+        tableView.addTableColumn(providerCol)
+
         tableView.rowHeight = 28
         tableView.allowsMultipleSelection = false
         tableView.allowsEmptySelection = true
@@ -181,10 +195,14 @@ final class SettingsWindowController: NSWindowController {
         tableView.reloadData()
         if let selectedID = UserDefaults.standard.selectedConfigID,
            let idx = configs.firstIndex(where: { $0.id == selectedID }) {
+            isProgrammaticSelection = true
             tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+            isProgrammaticSelection = false
             loadForm(at: idx)
         } else if !configs.isEmpty {
+            isProgrammaticSelection = true
             tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            isProgrammaticSelection = false
             loadForm(at: 0)
         } else {
             clearForm()
@@ -369,14 +387,25 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
     func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
         guard configs.indices.contains(row) else { return nil }
-        return configs[row].name
+        let config = configs[row]
+        let selectedID = UserDefaults.standard.selectedConfigID
+        switch tableColumn?.identifier.rawValue {
+        case "selected":
+            return config.id == selectedID ? "✅" : ""
+        case "provider":
+            return config.providerType.displayName
+        default:
+            return config.name
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !isProgrammaticSelection else { return }
         let row = tableView.selectedRow
         if row >= 0 && row < configs.count {
             loadForm(at: row)
             UserDefaults.standard.selectedConfigID = configs[row].id
+            tableView.reloadData()
         } else {
             clearForm()
         }

@@ -46,6 +46,20 @@ Fix: Chinese homophone mistakes, English technical terms wrongly transcribed int
 (e.g., 配森→Python, 杰森→JSON, 拍森→Python, 杰森→JSON). \
 Do NOT rewrite, polish, summarize, or remove any content that appears correct. \
 If the input looks correct, return it unchanged.
+
+Process speech-to-text transcripts:
+- Remove meaningless filler words and ending periods.
+- Transcription model flaws: generally does not omit characters, but misrecognizes characters (homophones with different characters).
+- Considering the model's flaws, correct transcription errors as much as possible based on user intent and rational thinking of "ordinary people".
+- Consider user intent, preserve original sentence structure.
+- Fluency and reasonableness of text > preserving original sentence.
+- For vulgar content, keep the original expression without any modification.
+- Proofread all typos based on context.
+- Remove all meaningless filler words, catchphrases, and padding words (e.g., um, ah, like, then, this, that…).
+- Re-add punctuation marks to make the text look neat.
+- Absolutely prohibit any explanations, clarifications, or extra text. Directly return the modified text.
+- Handle corrections: if the original text appears as "aaa correct bbb" or "aaa (bbb)", directly retain the content of "bbb".
+- Polishing: if the user requests polishing or modification in the recorded text, polish and organize the content before output.
 """
 
         let body: [String: Any] = [
