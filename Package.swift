@@ -8,7 +8,7 @@ let package = Package(
         .executableTarget(
             name: "VoiceInput",
             swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
+                .swiftLanguageMode(.v5)
             ]
         )
     ]

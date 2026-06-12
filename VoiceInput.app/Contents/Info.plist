@@ -26,5 +26,7 @@
     <string>VoiceInput needs microphone access to transcribe your speech.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>VoiceInput uses speech recognition to convert your voice to text.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>VoiceInput uses Apple Events to simulate keystrokes for text injection.</string>
 </dict>
 </plist>

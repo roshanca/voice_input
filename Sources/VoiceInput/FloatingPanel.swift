@@ -155,7 +155,7 @@ final class FloatingPanel: NSPanel {
             animator().alphaValue = 0
             self.containerView.layer?.transform = CATransform3DMakeScale(0.9, 0.9, 1)
         } completionHandler: { [weak self] in
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 self?.orderOut(nil)
             }
         }

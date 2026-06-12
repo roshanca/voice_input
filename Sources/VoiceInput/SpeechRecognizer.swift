@@ -22,6 +22,7 @@ final class SpeechRecognizer: NSObject {
     private var finalResult = ""
     private var isRecording = false
     private var rmsLogCounter = 0
+    private var audioConverter: AVAudioConverter?
 
     override init() {
         super.init()
@@ -30,8 +31,14 @@ final class SpeechRecognizer: NSObject {
     }
 
     @objc private func updateLocale() {
-        speechRecognizer = SFSpeechRecognizer(locale: LanguageManager.shared.current.locale)
+        let locale = LanguageManager.shared.current.locale
+        speechRecognizer = SFSpeechRecognizer(locale: locale)
         speechRecognizer?.delegate = self
+        if let sr = speechRecognizer {
+            AppLogger.shared.info("SFSpeechRecognizer created for locale: \(locale.identifier), available: \(sr.isAvailable)")
+        } else {
+            AppLogger.shared.error("SFSpeechRecognizer is nil for locale: \(locale.identifier)")
+        }
     }
 
     func requestAuthorization() async -> Bool {
@@ -70,11 +77,19 @@ final class SpeechRecognizer: NSObject {
         }
 
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest else { return }
+        guard let recognitionRequest else {
+            AppLogger.shared.error("Failed to create SFSpeechAudioBufferRecognitionRequest")
+            throw RecognizerError.audioEngineFailure
+        }
         recognitionRequest.shouldReportPartialResults = true
         recognitionRequest.requiresOnDeviceRecognition = false
 
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+        guard let speechRecognizer else {
+            AppLogger.shared.error("No SFSpeechRecognizer available")
+            throw RecognizerError.recognizerUnavailable
+        }
+
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
 
@@ -102,27 +117,75 @@ final class SpeechRecognizer: NSObject {
             }
         }
 
+        guard recognitionTask != nil else {
+            AppLogger.shared.error("Failed to create SFSpeechRecognitionTask")
+            throw RecognizerError.recognizerUnavailable
+        }
+        AppLogger.shared.info("SFSpeechRecognitionTask created")
+
         let inputNode = audioEngine.inputNode
-        // Force 16kHz mono — the format SFSpeechRecognizer expects
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         AppLogger.shared.info("Hardware input format: \(hardwareFormat)")
+
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: targetFormat) { [weak self] buffer, _ in
+        AppLogger.shared.info("Target recognition format: \(targetFormat)")
+
+        audioConverter = nil
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: hardwareFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            self.recognitionRequest?.append(buffer)
-            self.processRMS(buffer: buffer)
+            AppLogger.shared.debug("Audio buffer received - frameLength: \(buffer.frameLength), format: \(buffer.format)")
+
+            if self.audioConverter == nil {
+                self.audioConverter = AVAudioConverter(from: buffer.format, to: targetFormat)
+                if self.audioConverter == nil {
+                    AppLogger.shared.error("Failed to create AVAudioConverter from \(buffer.format) to \(targetFormat)")
+                }
+            }
+
+            guard let converter = self.audioConverter else {
+                self.recognitionRequest?.append(buffer)
+                self.processRMS(buffer: buffer)
+                return
+            }
+
+            let capacity = UInt32(Double(buffer.frameLength) * Double(targetFormat.sampleRate) / Double(buffer.format.sampleRate)) + 1
+            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+                AppLogger.shared.error("Failed to create converted AVAudioPCMBuffer")
+                self.recognitionRequest?.append(buffer)
+                self.processRMS(buffer: buffer)
+                return
+            }
+
+            var error: NSError?
+            converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
+                outStatus.pointee = .haveData
+                return buffer
+            }
+
+            if let error {
+                AppLogger.shared.error("Audio conversion error: \(error)")
+                self.recognitionRequest?.append(buffer)
+                self.processRMS(buffer: buffer)
+                return
+            }
+
+            convertedBuffer.frameLength = convertedBuffer.frameCapacity
+            AppLogger.shared.debug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
+            self.recognitionRequest?.append(convertedBuffer)
+            self.processRMS(buffer: convertedBuffer)
         }
 
         audioEngine.prepare()
         try audioEngine.start()
         isRecording = true
-        AppLogger.shared.info("Audio engine started, recording in 16kHz mono")
+        AppLogger.shared.info("Audio engine started, recording from hardware format")
     }
 
     func stopRecording() {
         guard isRecording else { return }
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
+        audioConverter = nil
         recognitionRequest?.endAudio()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }
@@ -161,11 +224,15 @@ final class SpeechRecognizer: NSObject {
     enum RecognizerError: Error {
         case notAuthorized
         case microphoneDenied
+        case recognizerUnavailable
+        case audioEngineFailure
 
         var localizedDescription: String {
             switch self {
             case .notAuthorized: return "Speech recognition not authorized"
             case .microphoneDenied: return "Microphone access denied. Please enable it in System Settings → Privacy & Security → Microphone."
+            case .recognizerUnavailable: return "Speech recognizer is unavailable for the selected language"
+            case .audioEngineFailure: return "Failed to initialize audio engine"
             }
         }
     }

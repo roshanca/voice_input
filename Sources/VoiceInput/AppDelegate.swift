@@ -266,8 +266,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard tapActive else { return }
         statusItem.button?.image = recordingImage
         recordingAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let button = self?.statusItem.button else { return }
+            Task { @MainActor [weak self] in
+                guard let self, let button = statusItem.button else { return }
                 let currentOpacity = button.layer?.opacity ?? 1.0
                 let targetOpacity: Float = currentOpacity > 0.7 ? 0.45 : 1.0
                 NSAnimationContext.runAnimationGroup { context in
@@ -329,10 +329,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Wait a bit for the final result
         resultTimeout?.invalidate()
         resultTimeout = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 AppLogger.shared.info("Result timeout fired — processing final text")
-                self.processFinalText(self.rawText)
+                processFinalText(rawText)
             }
         }
     }
