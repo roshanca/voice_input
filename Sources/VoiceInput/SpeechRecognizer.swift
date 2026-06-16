@@ -22,7 +22,7 @@ final class SpeechRecognizer: NSObject {
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine: AVAudioEngine?
 
     private var finalResult = ""
     private var isRecording = false
@@ -33,6 +33,16 @@ final class SpeechRecognizer: NSObject {
         super.init()
         updateLocale()
         NotificationCenter.default.addObserver(self, selector: #selector(updateLocale), name: .languageDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleConfigurationChange), name: .AVAudioEngineConfigurationChange, object: nil)
+    }
+
+    @objc private func handleConfigurationChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            guard let self, self.isRecording else { return }
+            AppLogger.shared.warning("Audio engine configuration changed, stopping recognition")
+            self.stopRecording()
+            self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged)
+        }
     }
 
     @objc private func updateLocale() {
@@ -132,7 +142,10 @@ final class SpeechRecognizer: NSObject {
         }
         AppLogger.shared.info("SFSpeechRecognitionTask created")
 
-        let inputNode = audioEngine.inputNode
+        let engine = AVAudioEngine()
+        audioEngine = engine
+
+        let inputNode = engine.inputNode
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         AppLogger.shared.info("Hardware input format: \(hardwareFormat)")
 
@@ -184,16 +197,17 @@ final class SpeechRecognizer: NSObject {
             self.processRMS(buffer: convertedBuffer)
         }
 
-        audioEngine.prepare()
-        try audioEngine.start()
+        engine.prepare()
+        try engine.start()
         isRecording = true
         AppLogger.shared.info("Audio engine started, recording from hardware format")
     }
 
     func stopRecording() {
         guard isRecording else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine?.stop()
+        audioEngine = nil
         audioConverter = nil
         recognitionRequest?.endAudio()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
@@ -239,6 +253,7 @@ final class SpeechRecognizer: NSObject {
         case microphoneDenied
         case recognizerUnavailable
         case audioEngineFailure
+        case audioEngineConfigurationChanged
 
         var localizedDescription: String {
             switch self {
@@ -246,6 +261,7 @@ final class SpeechRecognizer: NSObject {
             case .microphoneDenied: return "Microphone access denied. Please enable it in System Settings → Privacy & Security → Microphone."
             case .recognizerUnavailable: return "Speech recognizer is unavailable for the selected language"
             case .audioEngineFailure: return "Failed to initialize audio engine"
+            case .audioEngineConfigurationChanged: return "Audio input device changed. Please try again."
             }
         }
     }
