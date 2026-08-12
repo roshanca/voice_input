@@ -146,6 +146,29 @@ final class SpeechRecognizer: NSObject {
         audioEngine = engine
 
         let inputNode = engine.inputNode
+
+        // Apply the user's preferred input device, if any. Must happen before
+        // reading outputFormat / installing the tap so the converter sees the
+        // right source format.
+        if let uid = UserDefaults.standard.selectedMicUID,
+           let deviceID = AudioDeviceManager.audioDeviceID(forUID: uid),
+           let audioUnit = inputNode.audioUnit {
+            var id = deviceID
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &id,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            if status == noErr {
+                AppLogger.shared.info("Using selected input device UID: \(uid)")
+            } else {
+                AppLogger.shared.warning("Failed to set input device (status \(status)); falling back to system default")
+            }
+        }
+
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         AppLogger.shared.info("Hardware input format: \(hardwareFormat)")
 

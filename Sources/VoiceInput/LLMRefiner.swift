@@ -13,18 +13,26 @@ final class LLMRefiner {
     private var task: URLSessionDataTask?
 
     private let overrideConfig: LLMConfig?
+    /// Explicit key for ad-hoc configs (e.g. testing an unsaved profile);
+    /// otherwise the key is resolved from the Keychain by config id.
+    private let apiKeyOverride: String?
 
     private var config: LLMConfig {
         overrideConfig ?? UserDefaults.standard.currentLLMConfig ?? LLMConfig.default
     }
 
-    var isConfigured: Bool {
-        !config.baseURL.isEmpty && !config.model.isEmpty &&
-        (config.providerType == .ollama || !config.apiKey.isEmpty)
+    private var resolvedAPIKey: String {
+        apiKeyOverride ?? KeychainHelper.key(for: config.id)
     }
 
-    init(config: LLMConfig? = nil) {
+    var isConfigured: Bool {
+        !config.baseURL.isEmpty && !config.model.isEmpty &&
+        (config.providerType == .ollama || !resolvedAPIKey.isEmpty)
+    }
+
+    init(config: LLMConfig? = nil, apiKeyOverride: String? = nil) {
         self.overrideConfig = config
+        self.apiKeyOverride = apiKeyOverride
     }
 
     func refine(text: String) {
@@ -44,30 +52,7 @@ final class LLMRefiner {
             return
         }
 
-        let systemPrompt = """
-You correct obvious speech recognition errors only. The input already contains punctuation added by the speech recognizer; preserve it unless it is clearly wrong.
-
-Rules:
-1. Fix only clear transcription errors:
-   - Chinese homophone mistakes (e.g., 配森→Python, 拍森→Python, 杰森→JSON).
-   - English technical terms wrongly transcribed into Chinese.
-   - Obvious typos that can be confidently corrected from context.
-
-2. Remove only filler words that carry no meaning, such as "um", "ah", "like", "那个", "然后" when overused. Do not remove words that affect meaning.
-
-3. Never do the following:
-   - Summarize, condense, or rewrite correct content.
-   - Change wording that is already natural and correct.
-   - Strip or alter existing punctuation unless it is clearly misplaced.
-   - Add explanations, clarifications, labels, or any extra text.
-   - Censor or soften vulgar content; keep the original expression.
-
-4. If the user explicitly asks to polish or rephrase within the transcript (e.g., "帮我润色一下"), follow that instruction for the relevant part only.
-
-5. For self-corrections like "aaa correct bbb" or "aaa (bbb)", output "bbb".
-
-Output only the corrected text, with no introduction, labels, or markdown.
-"""
+        let systemPrompt = resolvedSystemPrompt()
 
         let body: [String: Any] = [
             "model": config.model,
@@ -81,8 +66,9 @@ Output only the corrected text, with no introduction, labels, or markdown.
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !config.apiKey.isEmpty {
-            request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
+        let apiKey = resolvedAPIKey
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 15
@@ -145,5 +131,38 @@ Output only the corrected text, with no introduction, labels, or markdown.
     func cancel() {
         task?.cancel()
         task = nil
+    }
+
+    // MARK: - System Prompt
+
+    static let defaultSystemPrompt = """
+You correct obvious speech recognition errors only. The input already contains punctuation added by the speech recognizer; preserve it unless it is clearly wrong.
+
+Rules:
+1. Fix only clear transcription errors:
+   - Chinese homophone mistakes (e.g., 配森→Python, 拍森→Python, 杰森→JSON).
+   - English technical terms wrongly transcribed into Chinese.
+   - Obvious typos that can be confidently corrected from context.
+
+2. Remove only filler words that carry no meaning, such as "um", "ah", "like", "那个", "然后" when overused. Do not remove words that affect meaning.
+
+3. Never do the following:
+   - Summarize, condense, or rewrite correct content.
+   - Change wording that is already natural and correct.
+   - Strip or alter existing punctuation unless it is clearly misplaced.
+   - Add explanations, clarifications, labels, or any extra text.
+   - Censor or soften vulgar content; keep the original expression.
+
+4. If the user explicitly asks to polish or rephrase within the transcript (e.g., "帮我润色一下"), follow that instruction for the relevant part only.
+
+5. For self-corrections like "aaa correct bbb" or "aaa (bbb)", output "bbb".
+
+Output only the corrected text, with no introduction, labels, or markdown.
+"""
+
+    private func resolvedSystemPrompt() -> String {
+        let custom = config.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = custom.isEmpty ? LLMRefiner.defaultSystemPrompt : custom
+        return base + DictionaryStore.shared.promptFragment()
     }
 }

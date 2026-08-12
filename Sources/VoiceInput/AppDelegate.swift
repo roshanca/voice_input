@@ -2,26 +2,25 @@ import Cocoa
 import Carbon
 @preconcurrency import ApplicationServices
 
-@MainActor private var appDelegateRef: AppDelegate?
-
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var settingsWindowController: SettingsWindowController?
     private var logsWindowController: LogsWindowController?
-    private var tapActive = false
+
+    private var tapActive: Bool { HotkeyManager.shared.isTapActive }
 
     private let floatingPanel = FloatingPanel()
     private let speechRecognizer = SpeechRecognizer()
     private let llmRefiner = LLMRefiner()
 
-    private var isFnHeld = false
+    private var isHotkeyHeld = false
     private var rawText = ""
     private var annotatedText = ""
     private var resultTimeout: Timer?
     private var recordingAnimationTimer: Timer?
+    private var recordingStart: Date?
+    private var pendingRawText = ""
+    private var pendingDuration: Double = 0
 
     private let idleImage = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Voice Input")
     private var recordingImage: NSImage?
@@ -29,18 +28,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appDelegateRef = self
         AppLogger.shared.info("App launched")
+        if UserDefaults.standard.migrateLLMAPIKeysToKeychain() {
+            AppLogger.shared.info("Migrated LLM API keys to Keychain")
+        }
         setupImages()
         setupMenuBar()
+        // Warm up MainActor singletons on the main thread before SwiftUI touches them.
+        _ = SettingsStore.shared
+        _ = HistoryStore.shared
+        _ = DictionaryStore.shared
         speechRecognizer.delegate = self
         llmRefiner.delegate = self
-        setupEventTap()
+        setupHotkey()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppLogger.shared.info("App terminating")
-        removeEventTap()
+        HistoryStore.shared.flush()
+        HotkeyManager.shared.stop()
     }
 
     // MARK: - Images
@@ -65,37 +71,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func createMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
+        populateMenu(menu)
+        return menu
+    }
 
-        // Language submenu
-        let langMenu = NSMenu()
-        for lang in RecognizedLanguage.allCases {
-            let item = NSMenuItem(title: lang.displayName, action: #selector(selectLanguage(_:)), keyEquivalent: "")
-            item.representedObject = lang.rawValue
-            item.state = LanguageManager.shared.current == lang ? .on : .off
-            langMenu.addItem(item)
-        }
-        let langItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
-        langItem.submenu = langMenu
-        menu.addItem(langItem)
+    private func populateMenu(_ menu: NSMenu) {
+        let openItem = NSMenuItem(title: "Open VoiceInput…", action: #selector(openMainWindow(_:)), keyEquivalent: "")
+        menu.addItem(openItem)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsPage(_:)), keyEquivalent: ",")
+        menu.addItem(settingsItem)
 
         menu.addItem(.separator())
 
-        // LLM submenu
-        let llmMenu = NSMenu()
-        let toggleItem = NSMenuItem(title: "Enable LLM Refinement", action: #selector(toggleLLM(_:)), keyEquivalent: "")
-        toggleItem.state = UserDefaults.standard.llmEnabled ? .on : .off
-        llmMenu.addItem(toggleItem)
-        llmMenu.addItem(.separator())
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings(_:)), keyEquivalent: "")
-        llmMenu.addItem(settingsItem)
-        let llmItem = NSMenuItem(title: "LLM Refinement", action: nil, keyEquivalent: "")
-        llmItem.submenu = llmMenu
-        menu.addItem(llmItem)
-
-        menu.addItem(.separator())
         let copyItem = NSMenuItem(title: "Copy Result to Clipboard", action: #selector(toggleCopyToClipboard(_:)), keyEquivalent: "")
         copyItem.state = UserDefaults.standard.copyToClipboard ? .on : .off
         menu.addItem(copyItem)
+        let llmItem = NSMenuItem(title: "LLM Refinement", action: #selector(toggleLLM(_:)), keyEquivalent: "")
+        llmItem.state = UserDefaults.standard.llmEnabled ? .on : .off
+        menu.addItem(llmItem)
 
         if !tapActive {
             menu.addItem(.separator())
@@ -110,41 +104,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let logsItem = NSMenuItem(title: "View Logs", action: #selector(openLogs(_:)), keyEquivalent: "")
         menu.addItem(logsItem)
-        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-
-        return menu
-    }
-
-    @objc private func selectLanguage(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let lang = RecognizedLanguage(rawValue: raw) else { return }
-        LanguageManager.shared.current = lang
-        AppLogger.shared.info("Language changed to \(lang.displayName)")
-        statusItem.menu = createMenu()
+        menu.addItem(withTitle: "Quit VoiceInput", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     @objc private func toggleLLM(_ sender: NSMenuItem) {
         UserDefaults.standard.llmEnabled = !UserDefaults.standard.llmEnabled
         AppLogger.shared.info("LLM refinement toggled: \(UserDefaults.standard.llmEnabled)")
-        statusItem.menu = createMenu()
+        sender.state = UserDefaults.standard.llmEnabled ? .on : .off
     }
 
     @objc private func toggleCopyToClipboard(_ sender: NSMenuItem) {
         UserDefaults.standard.copyToClipboard = !UserDefaults.standard.copyToClipboard
         AppLogger.shared.info("Copy to clipboard toggled: \(UserDefaults.standard.copyToClipboard)")
-        statusItem.menu = createMenu()
+        sender.state = UserDefaults.standard.copyToClipboard ? .on : .off
     }
 
-    @objc private func openSettings(_ sender: NSMenuItem) {
-        if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController()
-            settingsWindowController?.window?.delegate = self
-        }
-        settingsWindowController?.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    @objc private func openMainWindow(_ sender: NSMenuItem) {
+        MainWindowController.shared.show(page: .home)
+    }
+
+    @objc private func openSettingsPage(_ sender: NSMenuItem) {
+        MainWindowController.shared.show(page: .settings)
     }
 
     @objc private func openLogs(_ sender: NSMenuItem) {
+        openLogsWindow()
+    }
+
+    func openLogsWindow() {
         if logsWindowController == nil {
             logsWindowController = LogsWindowController()
         }
@@ -152,87 +139,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: - CGEvent Tap
+    // MARK: - Hotkey
 
-    private func setupEventTap() {
-        AppLogger.shared.info("Setting up event tap…")
-        if !checkAccessibility(promptIfNeeded: true) {
-            AppLogger.shared.warning("Accessibility not granted")
-            tapActive = false
-            updateMenuBarIcon()
+    private func setupHotkey() {
+        let hotkeyManager = HotkeyManager.shared
+        hotkeyManager.onPress = { [weak self] in self?.hotkeyPressed() }
+        hotkeyManager.onRelease = { [weak self] in self?.hotkeyReleased() }
+        hotkeyManager.onTapStateChange = { [weak self] _ in
+            self?.updateMenuBarIcon()
+        }
+        hotkeyManager.update(hotkey: HotkeyManager.saved)
+
+        if !hotkeyManager.isTapActive {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.showAccessibilityAlert()
             }
-            return
         }
-
-        let eventMask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: eventMask,
-            callback: eventTapCallback,
-            userInfo: nil
-        ) else {
-            AppLogger.shared.error("CGEvent.tapCreate returned nil")
-            tapActive = false
-            updateMenuBarIcon()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.showAccessibilityAlert()
-            }
-            return
-        }
-
-        eventTap = tap
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        if let runLoopSource {
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        }
-        CGEvent.tapEnable(tap: tap, enable: true)
-        tapActive = true
-        AppLogger.shared.info("Event tap active")
-        updateMenuBarIcon()
-    }
-
-    private func removeEventTap() {
-        AppLogger.shared.info("Removing event tap")
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-        }
-        eventTap = nil
-        runLoopSource = nil
-        tapActive = false
-        updateMenuBarIcon()
-    }
-
-    private nonisolated func checkAccessibility(promptIfNeeded: Bool = false) -> Bool {
-        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let checkOptions = [key: false] as CFDictionary
-        if AXIsProcessTrustedWithOptions(checkOptions) {
-            return true
-        }
-        if promptIfNeeded {
-            let promptOptions = [key: true] as CFDictionary
-            AXIsProcessTrustedWithOptions(promptOptions)
-        }
-        return false
-    }
-
-    @objc private func retryEventTap() {
-        AppLogger.shared.info("Retrying event tap")
-        removeEventTap()
-        setupEventTap()
     }
 
     @objc private func showAccessibilityAlert() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Accessibility Access Required"
-        alert.informativeText = "VoiceInput needs Accessibility permission to monitor the Fn key globally. Please enable it in System Settings → Privacy & Security → Accessibility, then click Retry below."
+        alert.informativeText = "VoiceInput needs Accessibility permission to monitor the dictation hotkey globally. Please enable it in System Settings → Privacy & Security → Accessibility, then click Retry below."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Open Settings")
         alert.addButton(withTitle: "Retry")
@@ -244,7 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSWorkspace.shared.open(url)
             }
         case .alertSecondButtonReturn:
-            retryEventTap()
+            HotkeyManager.shared.start()
         default:
             break
         }
@@ -291,15 +220,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image = idleImage
     }
 
-    // MARK: - Fn Handling
+    // MARK: - Hotkey Handling
 
-    func fnPressed() {
-        guard !isFnHeld else { return }
-        isFnHeld = true
+    func hotkeyPressed() {
+        guard !isHotkeyHeld else { return }
+        isHotkeyHeld = true
         rawText = ""
+        annotatedText = ""
+        recordingStart = Date()
         resultTimeout?.invalidate()
-        AppLogger.shared.info("Fn pressed — starting recording")
+        AppLogger.shared.info("Hotkey pressed — starting recording")
         startRecordingAnimation()
+        SoundPlayer.recordStart()
 
         floatingPanel.setText("")
         floatingPanel.show()
@@ -313,19 +245,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 floatingPanel.setText("Error: \(error.localizedDescription)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     self.floatingPanel.hide()
-                    self.isFnHeld = false
+                    self.isHotkeyHeld = false
                     self.stopRecordingAnimation()
                 }
             }
         }
     }
 
-    func fnReleased() {
-        guard isFnHeld else { return }
-        isFnHeld = false
-        AppLogger.shared.info("Fn released — stopping recording")
+    func hotkeyReleased() {
+        guard isHotkeyHeld else { return }
+        isHotkeyHeld = false
+        AppLogger.shared.info("Hotkey released — stopping recording")
         speechRecognizer.stopRecording()
         stopRecordingAnimation()
+        SoundPlayer.recordStop()
 
         // Wait a bit for the final result
         resultTimeout?.invalidate()
@@ -346,55 +279,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !trimmed.isEmpty else {
             AppLogger.shared.warning("processFinalText — trimmed text is empty, hiding panel")
             floatingPanel.hide()
+            recordingStart = nil
             return
         }
+
+        pendingRawText = trimmed
+        pendingDuration = recordingStart.map { Date().timeIntervalSince($0) } ?? 0
+        recordingStart = nil
+
+        // Dictionary replacements apply to the text sent onward; history keeps the true ASR output.
+        let applyReplacements: (String) -> String = UserDefaults.standard.dictionaryDirectReplacement
+            ? DictionaryStore.shared.applyReplacements(to:)
+            : { $0 }
 
         let keep = UserDefaults.standard.copyToClipboard
         if UserDefaults.standard.llmEnabled && llmRefiner.isConfigured {
             AppLogger.shared.info("LLM enabled and configured — starting refinement")
             floatingPanel.setText("Refining…")
-            llmRefiner.refine(text: trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated)
+            llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated))
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
             floatingPanel.hide()
-            TextInjector.shared.inject(text: trimmed, keepInClipboard: keep)
+            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: keep, sendReturn: UserDefaults.standard.autoSend)
+            recordHistory(raw: trimmed, refined: nil)
         }
+    }
+
+    private func recordHistory(raw: String, refined: String?) {
+        let record = DictationRecord(
+            date: Date(),
+            durationSeconds: pendingDuration,
+            rawText: raw,
+            refinedText: refined,
+            language: LanguageManager.shared.current.rawValue
+        )
+        HistoryStore.shared.add(record)
     }
 }
 
-// MARK: - CGEvent Tap Callback
-
-private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard type == .flagsChanged else {
-        return Unmanaged.passUnretained(event)
-    }
-    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-    guard keyCode == 63 else {
-        return Unmanaged.passUnretained(event)
-    }
-    let fnDown = event.flags.contains(.maskSecondaryFn)
-    Task { @MainActor in
-        if fnDown {
-            appDelegateRef?.fnPressed()
-        } else {
-            appDelegateRef?.fnReleased()
-        }
-    }
-    return nil
-}
-
-// MARK: - SpeechRecognizerDelegate
+// MARK: - NSWindowDelegate
 
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        if notification.object as? NSWindow == settingsWindowController?.window {
-            settingsWindowController = nil
-        }
         if notification.object as? NSWindow == logsWindowController?.window {
             logsWindowController = nil
         }
     }
 }
+
+extension AppDelegate: NSMenuDelegate {
+    /// Rebuild items in place before the menu opens, so checkmarks and the
+    /// conditional accessibility item reflect changes made from the settings window.
+    func menuWillOpen(_ menu: NSMenu) {
+        menu.removeAllItems()
+        populateMenu(menu)
+    }
+}
+
+// MARK: - SpeechRecognizerDelegate
 
 extension AppDelegate: SpeechRecognizerDelegate {
     func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult) {
@@ -414,7 +356,7 @@ extension AppDelegate: SpeechRecognizerDelegate {
 
     func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error) {
         AppLogger.shared.error("Speech recognition error: \(error.localizedDescription)")
-        if isFnHeld {
+        if isHotkeyHeld {
             floatingPanel.setText("Error: \(error.localizedDescription)")
         }
     }
@@ -434,12 +376,17 @@ extension AppDelegate: LLMRefinerDelegate {
     func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String) {
         AppLogger.shared.info("LLM refinement finished — result: \(text)")
         floatingPanel.hide()
-        TextInjector.shared.inject(text: text, keepInClipboard: UserDefaults.standard.copyToClipboard)
+        TextInjector.shared.inject(text: text, keepInClipboard: UserDefaults.standard.copyToClipboard, sendReturn: UserDefaults.standard.autoSend)
+        recordHistory(raw: pendingRawText, refined: text)
     }
 
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error) {
         AppLogger.shared.error("LLM refinement failed: \(error.localizedDescription)")
         floatingPanel.hide()
-        TextInjector.shared.inject(text: rawText, keepInClipboard: UserDefaults.standard.copyToClipboard)
+        let fallback = UserDefaults.standard.dictionaryDirectReplacement
+            ? DictionaryStore.shared.applyReplacements(to: pendingRawText)
+            : pendingRawText
+        TextInjector.shared.inject(text: fallback, keepInClipboard: UserDefaults.standard.copyToClipboard, sendReturn: UserDefaults.standard.autoSend)
+        recordHistory(raw: pendingRawText, refined: nil)
     }
 }

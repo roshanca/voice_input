@@ -5,8 +5,8 @@ import Carbon
 final class TextInjector {
     static let shared = TextInjector()
 
-    func inject(text: String, keepInClipboard: Bool = false, completion: (() -> Void)? = nil) {
-        AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard)")
+    func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, completion: (() -> Void)? = nil) {
+        AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard), sendReturn: \(sendReturn)")
 
         let previousSource = InputMethodManager.shared.currentSource()
         let wasCJK = InputMethodManager.shared.isCJKInputMethod()
@@ -54,12 +54,28 @@ final class TextInjector {
                     DispatchQueue.main.asyncAfter(deadline: .now() + imeRestoreDelay) {
                         AppLogger.shared.info("Restoring original input method")
                         InputMethodManager.shared.restoreInputSource(previousSource)
+                        self.simulateReturnIfNeeded(sendReturn)
                         completion?()
                     }
                 } else {
+                    self.simulateReturnIfNeeded(sendReturn)
                     completion?()
                 }
             }
+        }
+    }
+
+    /// Auto-send: press Return after the paste settles (sends the message in chat apps).
+    private func simulateReturnIfNeeded(_ sendReturn: Bool) {
+        guard sendReturn else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            AppLogger.shared.info("Auto-send: simulating Return keypress")
+            guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+            let keyReturn = CGKeyCode(36)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: keyReturn, keyDown: true)
+            let up = CGEvent(keyboardEventSource: source, virtualKey: keyReturn, keyDown: false)
+            down?.post(tap: .cghidEventTap)
+            up?.post(tap: .cghidEventTap)
         }
     }
 
