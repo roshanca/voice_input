@@ -10,6 +10,10 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                Text("Speak, don't type")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
                 if history.records.isEmpty {
                     ContentUnavailableView {
                         Label("Speak, don't type", systemImage: "waveform")
@@ -24,7 +28,6 @@ struct HomeView: View {
             }
             .padding(24)
         }
-        .navigationTitle("Speak, don't type")
     }
 
     // MARK: - Stat cards

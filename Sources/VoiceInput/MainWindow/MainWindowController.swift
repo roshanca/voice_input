@@ -14,6 +14,13 @@ final class MainWindowController: NSWindowController {
         )
         window.title = "VoiceInput"
         window.minSize = NSSize(width: 860, height: 560)
+        // Hidden, transparent titlebar with full-size content: the sidebar
+        // background extends behind the traffic lights (settings-app look)
+        // and there is no toolbar at all.
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         window.contentViewController = NSHostingController(rootView: MainWindowView())
         window.center()
         window.setFrameAutosaveName("MainWindow")

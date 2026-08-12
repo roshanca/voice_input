@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject private var store = SettingsStore.shared
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
+    @State private var showLLMProfiles = false
 
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
@@ -11,6 +12,21 @@ struct SettingsView: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Settings")
+                .font(.title2)
+                .fontWeight(.bold)
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 6)
+            formContent
+        }
+        .sheet(isPresented: $showLLMProfiles) {
+            LLMProfilesView()
+        }
+    }
+
+    private var formContent: some View {
         Form {
             Section {
                 Picker("Recognition language", selection: $store.language) {
@@ -78,8 +94,8 @@ struct SettingsView: View {
                         }
                     }
                 }
-                NavigationLink("Manage Profiles…") {
-                    LLMProfilesView()
+                Button("Manage Profiles…") {
+                    showLLMProfiles = true
                 }
             } header: {
                 Label("LLM Refinement", systemImage: "sparkles")
@@ -144,6 +160,5 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Settings")
     }
 }

@@ -38,10 +38,11 @@ extension LLMProfileTester: LLMRefinerDelegate {
     }
 }
 
-/// Profile list + editor for LLM refinement configs.
+/// Profile list + editor for LLM refinement configs, presented as a sheet.
 struct LLMProfilesView: View {
     @ObservedObject private var store = SettingsStore.shared
     @StateObject private var tester = LLMProfileTester()
+    @Environment(\.dismiss) private var dismiss
 
     @State private var draft = LLMConfig.default
     @State private var apiKey = ""
@@ -49,15 +50,28 @@ struct LLMProfilesView: View {
     @State private var hasSelection = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            profileList
-                .frame(width: 200)
+        VStack(spacing: 0) {
+            HStack {
+                Text("LLM Profiles")
+                    .font(.title2)
+                    .fontWeight(.bold)
+                Spacer()
+                Button("Done") { dismiss() }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
             Divider()
-            editor
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HStack(spacing: 0) {
+                profileList
+                    .frame(width: 200)
+                Divider()
+                editor
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
-        .frame(minHeight: 420)
-        .navigationTitle("LLM Profiles")
+        .frame(minWidth: 720, minHeight: 500)
         .onAppear { selectProfile(id: store.selectedConfigID ?? store.llmConfigs.first?.id) }
     }
 

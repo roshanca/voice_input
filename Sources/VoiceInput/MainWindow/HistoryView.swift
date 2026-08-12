@@ -16,7 +16,26 @@ struct HistoryView: View {
     }
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            // No toolbar in this window (hidden titlebar) — header row hosts
+            // the search field and Clear All button.
+            HStack {
+                Text("History")
+                    .font(.title2)
+                    .fontWeight(.bold)
+                Spacer()
+                TextField("Search dictations", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 200)
+                Button("Clear All", role: .destructive) {
+                    showClearConfirmation = true
+                }
+                .disabled(history.records.isEmpty)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 10)
+
             if history.records.isEmpty {
                 ContentUnavailableView {
                     Label("No History", systemImage: "clock")
@@ -34,16 +53,6 @@ struct HistoryView: View {
                         }
                 }
                 .listStyle(.inset)
-            }
-        }
-        .navigationTitle("History")
-        .searchable(text: $searchText, prompt: "Search dictations")
-        .toolbar {
-            ToolbarItem {
-                Button("Clear All", role: .destructive) {
-                    showClearConfirmation = true
-                }
-                .disabled(history.records.isEmpty)
             }
         }
         .confirmationDialog("Clear all history?", isPresented: $showClearConfirmation) {

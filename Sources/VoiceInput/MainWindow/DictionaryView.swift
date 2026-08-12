@@ -10,6 +10,15 @@ struct DictionaryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Text("Dictionary")
+                    .font(.title2)
+                    .fontWeight(.bold)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+
             Form {
                 Section {
                     Toggle(isOn: $settings.dictionaryDirectReplacement) {
@@ -97,7 +106,6 @@ struct DictionaryView: View {
                 .listStyle(.inset)
             }
         }
-        .navigationTitle("Dictionary")
     }
 
     private func readingOrNil(_ string: String) -> String? {
