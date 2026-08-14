@@ -9,12 +9,19 @@ final class FloatingPanel: NSPanel {
     private let textLabel = NSTextField(labelWithString: "")
     private let contentStack = NSStackView()
 
-    private var widthConstraint: NSLayoutConstraint?
-    private var containerWidthConstraint: NSLayoutConstraint?
+    /// Bumped on every show/hide so a pending hide completion can't order the
+    /// panel out from underneath a later show.
+    private var visibilityGeneration = 0
+    private var boundsObserver: NSObjectProtocol?
+
+    private static let panelHeight: CGFloat = 56
+    private static let minWidth: CGFloat = 160
+    private static let maxWidth: CGFloat = 560
+    private static let bottomMargin: CGFloat = 24
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 160, height: 56),
+            contentRect: NSRect(x: 0, y: 0, width: Self.minWidth, height: Self.panelHeight),
             styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -53,7 +60,9 @@ final class FloatingPanel: NSPanel {
         contentView = containerView
         contentView?.wantsLayer = true
 
-        // Layout: shadow and effect fill container
+        // Layout: shadow and effect fill container. The panel's *window frame*
+        // is the single source of truth for size — no width/height constraints
+        // here, so layout can never fight an animated resize.
         shadowView.translatesAutoresizingMaskIntoConstraints = false
         visualEffectView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -67,6 +76,18 @@ final class FloatingPanel: NSPanel {
             visualEffectView.topAnchor.constraint(equalTo: containerView.topAnchor),
             visualEffectView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor)
         ])
+
+        // Keep the shadow path in sync while the window resizes.
+        shadowView.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: shadowView,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateShadowPath()
+            }
+        }
 
         // Content
         waveformView.translatesAutoresizingMaskIntoConstraints = false
@@ -96,16 +117,46 @@ final class FloatingPanel: NSPanel {
             waveformView.heightAnchor.constraint(equalToConstant: 32)
         ])
 
-        let width = contentStack.fittingSize.width
-        let clamped = min(max(width, 160), 560)
-        widthConstraint = visualEffectView.widthAnchor.constraint(equalToConstant: clamped)
-        widthConstraint?.isActive = true
-        containerWidthConstraint = containerView.widthAnchor.constraint(equalToConstant: clamped)
-        containerWidthConstraint?.isActive = true
-        visualEffectView.heightAnchor.constraint(equalToConstant: 56).isActive = true
-        containerView.heightAnchor.constraint(equalToConstant: 56).isActive = true
+        if let screen = screenUnderMouse() {
+            setFrame(centeredFrame(width: targetWidth(), on: screen), display: false)
+        }
+        updateShadowPath()
+    }
 
-        centerOnScreen()
+    deinit {
+        if let boundsObserver {
+            NotificationCenter.default.removeObserver(boundsObserver)
+        }
+    }
+
+    // MARK: - Geometry
+
+    private func targetWidth() -> CGFloat {
+        min(max(contentStack.fittingSize.width, Self.minWidth), Self.maxWidth)
+    }
+
+    private func screenUnderMouse() -> NSScreen? {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouseLocation) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
+    /// Screen the panel is currently on (used while resizing mid-recording so
+    /// the panel doesn't hop screens if the mouse moves).
+    private func currentScreen() -> NSScreen? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        return NSScreen.screens.first { $0.frame.contains(center) } ?? screenUnderMouse()
+    }
+
+    private func centeredFrame(width: CGFloat, on screen: NSScreen) -> NSRect {
+        let visible = screen.visibleFrame
+        return NSRect(
+            x: visible.midX - width / 2,
+            y: visible.minY + Self.bottomMargin,
+            width: width,
+            height: Self.panelHeight
+        )
     }
 
     private func updateShadowPath() {
@@ -120,21 +171,13 @@ final class FloatingPanel: NSPanel {
         }
     }
 
-    func centerOnScreen() {
-        let mouseLocation = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouseLocation) }
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        guard let screen else { return }
-        let frame = screen.visibleFrame
-        let size = self.frame.size
-        let x = frame.midX - size.width / 2
-        let y = frame.minY + 24
-        setFrameOrigin(NSPoint(x: x, y: y))
-    }
+    // MARK: - Visibility
 
     func show() {
-        centerOnScreen()
+        visibilityGeneration += 1
+        if let screen = screenUnderMouse() {
+            setFrame(centeredFrame(width: targetWidth(), on: screen), display: false)
+        }
         alphaValue = 0
         containerView.layer?.transform = CATransform3DMakeScale(0.8, 0.8, 1)
         updateShadowPath()
@@ -149,6 +192,8 @@ final class FloatingPanel: NSPanel {
     }
 
     func hide() {
+        visibilityGeneration += 1
+        let generation = visibilityGeneration
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.22
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -156,24 +201,27 @@ final class FloatingPanel: NSPanel {
             self.containerView.layer?.transform = CATransform3DMakeScale(0.9, 0.9, 1)
         } completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
-                self?.orderOut(nil)
+                guard let self, self.visibilityGeneration == generation else { return }
+                self.orderOut(nil)
             }
         }
     }
 
+    // MARK: - Content
+
     func setText(_ text: String) {
         textLabel.stringValue = text
-        let newWidth = contentStack.fittingSize.width
-        let clamped = min(max(newWidth, 160), 560)
+        let newWidth = targetWidth()
+        guard abs(newWidth - frame.width) > 0.5, isVisible, let screen = currentScreen() else { return }
 
+        // Animate the window frame itself, centered — width and position move
+        // in the same animation, so the panel stays centered without jumping.
+        let target = centeredFrame(width: newWidth, on: screen)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.25
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            widthConstraint?.animator().constant = clamped
-            containerWidthConstraint?.animator().constant = clamped
+            animator().setFrame(target, display: true)
         }
-        updateShadowPath()
-        centerOnScreen()
     }
 
     func setWaveformRMS(_ rms: CGFloat) {

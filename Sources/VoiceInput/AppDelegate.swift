@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = DictionaryStore.shared
         speechRecognizer.delegate = self
         llmRefiner.delegate = self
+        speechRecognizer.warmUp()
         setupHotkey()
     }
 

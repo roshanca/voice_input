@@ -26,8 +26,12 @@ final class SpeechRecognizer: NSObject {
 
     private var finalResult = ""
     private var isRecording = false
+    private var stopRequested = false
     private var rmsLogCounter = 0
     private var audioConverter: AVAudioConverter?
+    /// Set when on-device recognition fails at runtime — fall back to the
+    /// server-based path for the rest of the session.
+    private var forceServerRecognition = false
 
     override init() {
         super.init()
@@ -64,10 +68,28 @@ final class SpeechRecognizer: NSObject {
         }
     }
 
+    /// Pre-establish the speech session (and load the on-device model, when
+    /// available) so the first hotkey press doesn't pay the setup cost.
+    func warmUp() {
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized else { return }
+        guard let speechRecognizer else { return }
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = false
+        request.requiresOnDeviceRecognition = speechRecognizer.supportsOnDeviceRecognition
+        let task = speechRecognizer.recognitionTask(with: request) { _, _ in }
+        request.endAudio()
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            task.cancel()
+        }
+        AppLogger.shared.info("Speech recognition warm-up started")
+    }
+
     func startRecording() async throws {
         guard !isRecording else { return }
         finalResult = ""
         rmsLogCounter = 0
+        stopRequested = false
 
         // Check microphone permission on macOS
         let micStatus = AVAudioApplication.shared.recordPermission
@@ -86,10 +108,22 @@ final class SpeechRecognizer: NSObject {
             }
         }
 
-        let authorized = await requestAuthorization()
-        guard authorized else {
+        // Authorization status is cached by the system — only prompt when
+        // undetermined, so a hotkey press doesn't pay an async round-trip.
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            break
+        case .notDetermined:
+            let authorized = await requestAuthorization()
+            guard authorized else {
+                throw RecognizerError.notAuthorized
+            }
+        default:
             throw RecognizerError.notAuthorized
         }
+
+        // The hotkey may have been released while permissions were pending.
+        guard !stopRequested else { return }
 
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest else {
@@ -97,13 +131,20 @@ final class SpeechRecognizer: NSObject {
             throw RecognizerError.audioEngineFailure
         }
         recognitionRequest.shouldReportPartialResults = true
-        recognitionRequest.requiresOnDeviceRecognition = false
         recognitionRequest.addsPunctuation = true
 
         guard let speechRecognizer else {
             AppLogger.shared.error("No SFSpeechRecognizer available")
             throw RecognizerError.recognizerUnavailable
         }
+
+        // Prefer on-device recognition: no server session to establish, so the
+        // first partial result arrives much sooner (and it works offline).
+        // On-device assets are tied to system Dictation, so if it is disabled
+        // the task fails at runtime — we detect that below and fall back.
+        let onDevice = !forceServerRecognition && speechRecognizer.supportsOnDeviceRecognition
+        recognitionRequest.requiresOnDeviceRecognition = onDevice
+        AppLogger.shared.info("Recognition mode: \(onDevice ? "on-device" : "server")")
 
         recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor [weak self] in
@@ -113,6 +154,27 @@ final class SpeechRecognizer: NSObject {
                     let nsError = error as NSError
                     if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
                         AppLogger.shared.debug("Speech recognition task canceled (expected on stop)")
+                        return
+                    }
+                    // kLSRErrorDomain 201: on-device recognition can't run because
+                    // Siri/Dictation is disabled in System Settings. Fall back to
+                    // server-based recognition and restart transparently.
+                    if nsError.domain == "kLSRErrorDomain" && nsError.code == 201,
+                       self.recognitionRequest?.requiresOnDeviceRecognition == true {
+                        AppLogger.shared.warning("On-device recognition unavailable (Siri/Dictation disabled) — falling back to server recognition")
+                        self.forceServerRecognition = true
+                        let wasRecording = self.isRecording
+                        self.teardown()
+                        if wasRecording, !self.stopRequested {
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                do {
+                                    try await self.startRecording()
+                                } catch {
+                                    self.delegate?.speechRecognizer(self, didFailWithError: error)
+                                }
+                            }
+                        }
                         return
                     }
                     AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
@@ -224,9 +286,29 @@ final class SpeechRecognizer: NSObject {
         try engine.start()
         isRecording = true
         AppLogger.shared.info("Audio engine started, recording from hardware format")
+
+        // The hotkey was released while the engine/task were still starting —
+        // shut everything back down instead of leaking a running engine.
+        if stopRequested {
+            AppLogger.shared.info("Stop was requested during startup — tearing down")
+            teardown()
+        }
+    }
+
+    /// Synchronously stop the engine and discard the recognition task/request.
+    private func teardown() {
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine?.stop()
+        audioEngine = nil
+        audioConverter = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest = nil
+        isRecording = false
     }
 
     func stopRecording() {
+        stopRequested = true
         guard isRecording else { return }
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
