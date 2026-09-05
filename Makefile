@@ -20,7 +20,7 @@ build:
 	cp Info.plist $(APP_CONTENTS)/Info.plist
 	cp VoiceInput.entitlements $(APP_RESOURCES)/VoiceInput.entitlements || true
 	@echo "Signing app bundle..."
-	codesign --force --deep --sign - \
+	codesign --force --deep --sign "VoiceInput Dev" \
 		--entitlements VoiceInput.entitlements \
 		$(APP_BUNDLE)
 	@echo "Build complete: $(APP_BUNDLE)"

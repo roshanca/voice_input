@@ -68,21 +68,53 @@ final class SpeechRecognizer: NSObject {
         }
     }
 
+    /// Ask for speech recognition authorization at launch (not on the first
+    /// hotkey press) so the warm-up probe can run right after the grant.
+    func warmUp() {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            beginWarmUp()
+        case .notDetermined:
+            Task { @MainActor in
+                if await self.requestAuthorization() {
+                    self.beginWarmUp()
+                }
+            }
+        default:
+            AppLogger.shared.warning("Speech recognition not authorized at launch (status: \(SFSpeechRecognizer.authorizationStatus().rawValue))")
+        }
+    }
+
     /// Pre-establish the speech session (and load the on-device model, when
     /// available) so the first hotkey press doesn't pay the setup cost.
-    func warmUp() {
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else { return }
+    /// Also probes whether on-device recognition actually works: its assets are
+    /// tied to system Dictation, and if disabled the task fails at runtime with
+    /// kLSRErrorDomain 201. Detecting that here means the first real recording
+    /// goes straight to the server path.
+    private func beginWarmUp() {
         guard let speechRecognizer else { return }
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = false
-        request.requiresOnDeviceRecognition = speechRecognizer.supportsOnDeviceRecognition
-        let task = speechRecognizer.recognitionTask(with: request) { _, _ in }
+        request.requiresOnDeviceRecognition = !forceServerRecognition && speechRecognizer.supportsOnDeviceRecognition
+        let task = speechRecognizer.recognitionTask(with: request) { [weak self] _, error in
+            guard let error else { return }
+            let nsError = error as NSError
+            guard nsError.domain == "kLSRErrorDomain", nsError.code == 201,
+                  request.requiresOnDeviceRecognition else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                AppLogger.shared.warning("On-device recognition unavailable (Siri/Dictation disabled) — using server recognition for this session")
+                self.forceServerRecognition = true
+                // Re-warm with the server path so its session is also pre-established.
+                self.beginWarmUp()
+            }
+        }
         request.endAudio()
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
             task.cancel()
         }
-        AppLogger.shared.info("Speech recognition warm-up started")
+        AppLogger.shared.info("Speech recognition warm-up started (mode: \(request.requiresOnDeviceRecognition ? "on-device" : "server"))")
     }
 
     func startRecording() async throws {
@@ -93,7 +125,7 @@ final class SpeechRecognizer: NSObject {
 
         // Check microphone permission on macOS
         let micStatus = AVAudioApplication.shared.recordPermission
-        AppLogger.shared.info("Microphone permission status: \(micStatus.rawValue)")
+        AppLogger.shared.info("Microphone permission status: \(Self.permissionName(micStatus))")
         if micStatus == .denied {
             throw RecognizerError.microphoneDenied
         }
@@ -125,14 +157,6 @@ final class SpeechRecognizer: NSObject {
         // The hotkey may have been released while permissions were pending.
         guard !stopRequested else { return }
 
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest else {
-            AppLogger.shared.error("Failed to create SFSpeechAudioBufferRecognitionRequest")
-            throw RecognizerError.audioEngineFailure
-        }
-        recognitionRequest.shouldReportPartialResults = true
-        recognitionRequest.addsPunctuation = true
-
         guard let speechRecognizer else {
             AppLogger.shared.error("No SFSpeechRecognizer available")
             throw RecognizerError.recognizerUnavailable
@@ -140,69 +164,15 @@ final class SpeechRecognizer: NSObject {
 
         // Prefer on-device recognition: no server session to establish, so the
         // first partial result arrives much sooner (and it works offline).
-        // On-device assets are tied to system Dictation, so if it is disabled
-        // the task fails at runtime — we detect that below and fall back.
+        // On-device assets are tied to system Dictation; if it is disabled the
+        // warm-up probe has already set forceServerRecognition, so we normally
+        // never hit the runtime fallback below — it stays as a safety net.
         let onDevice = !forceServerRecognition && speechRecognizer.supportsOnDeviceRecognition
-        recognitionRequest.requiresOnDeviceRecognition = onDevice
         AppLogger.shared.info("Recognition mode: \(onDevice ? "on-device" : "server")")
-
-        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-
-                if let error {
-                    let nsError = error as NSError
-                    if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
-                        AppLogger.shared.debug("Speech recognition task canceled (expected on stop)")
-                        return
-                    }
-                    // kLSRErrorDomain 201: on-device recognition can't run because
-                    // Siri/Dictation is disabled in System Settings. Fall back to
-                    // server-based recognition and restart transparently.
-                    if nsError.domain == "kLSRErrorDomain" && nsError.code == 201,
-                       self.recognitionRequest?.requiresOnDeviceRecognition == true {
-                        AppLogger.shared.warning("On-device recognition unavailable (Siri/Dictation disabled) — falling back to server recognition")
-                        self.forceServerRecognition = true
-                        let wasRecording = self.isRecording
-                        self.teardown()
-                        if wasRecording, !self.stopRequested {
-                            Task { @MainActor [weak self] in
-                                guard let self else { return }
-                                do {
-                                    try await self.startRecording()
-                                } catch {
-                                    self.delegate?.speechRecognizer(self, didFailWithError: error)
-                                }
-                            }
-                        }
-                        return
-                    }
-                    AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
-                    self.delegate?.speechRecognizer(self, didFailWithError: error)
-                    return
-                }
-
-                guard let result else { return }
-                let text = result.bestTranscription.formattedString
-                let annotated = Self.annotatedText(from: result.bestTranscription)
-                let transcription = TranscriptionResult(text: text, annotatedText: annotated)
-                if result.isFinal {
-                    self.finalResult = text
-                    AppLogger.shared.info("Final speech result: \(text)")
-                    AppLogger.shared.info("Annotated speech result: \(annotated)")
-                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription)
-                } else {
-                    AppLogger.shared.debug("Partial result: \(text)")
-                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription)
-                }
-            }
-        }
-
-        guard recognitionTask != nil else {
+        guard startRecognitionTask(onDevice: onDevice) else {
             AppLogger.shared.error("Failed to create SFSpeechRecognitionTask")
             throw RecognizerError.recognizerUnavailable
         }
-        AppLogger.shared.info("SFSpeechRecognitionTask created")
 
         let engine = AVAudioEngine()
         audioEngine = engine
@@ -212,22 +182,25 @@ final class SpeechRecognizer: NSObject {
         // Apply the user's preferred input device, if any. Must happen before
         // reading outputFormat / installing the tap so the converter sees the
         // right source format.
-        if let uid = UserDefaults.standard.selectedMicUID,
-           let deviceID = AudioDeviceManager.audioDeviceID(forUID: uid),
-           let audioUnit = inputNode.audioUnit {
-            var id = deviceID
-            let status = AudioUnitSetProperty(
-                audioUnit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &id,
-                UInt32(MemoryLayout<AudioDeviceID>.size)
-            )
-            if status == noErr {
-                AppLogger.shared.info("Using selected input device UID: \(uid)")
+        if let uid = UserDefaults.standard.selectedMicUID {
+            if let deviceID = AudioDeviceManager.audioDeviceID(forUID: uid),
+               let audioUnit = inputNode.audioUnit {
+                var id = deviceID
+                let status = AudioUnitSetProperty(
+                    audioUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &id,
+                    UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+                if status == noErr {
+                    AppLogger.shared.info("Using selected input device UID: \(uid)")
+                } else {
+                    AppLogger.shared.warning("Failed to set input device (status \(status)); falling back to system default")
+                }
             } else {
-                AppLogger.shared.warning("Failed to set input device (status \(status)); falling back to system default")
+                AppLogger.shared.warning("Selected input device UID not present: \(uid); using system default")
             }
         }
 
@@ -315,16 +288,102 @@ final class SpeechRecognizer: NSObject {
         audioEngine = nil
         audioConverter = nil
         recognitionRequest?.endAudio()
+        // Capture this session's task/request: if the user starts a new
+        // recording within 3s, the delayed cleanup must not cancel the NEW
+        // task — only one that is still this session's.
+        let stoppedTask = recognitionTask
+        let stoppedRequest = recognitionRequest
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }
-            if self.recognitionTask != nil {
-                AppLogger.shared.debug("Speech recognition task still alive after 3s, forcing cancel")
-                self.recognitionTask?.cancel()
+            guard self.recognitionTask === stoppedTask, stoppedTask != nil else { return }
+            AppLogger.shared.debug("Speech recognition task still alive after 3s, forcing cancel")
+            stoppedTask?.cancel()
+            if self.recognitionRequest === stoppedRequest {
                 self.recognitionTask = nil
+                self.recognitionRequest = nil
             }
-            self.recognitionRequest = nil
         }
         isRecording = false
+    }
+
+    /// Create the recognition request + task. On the kLSRErrorDomain 201
+    /// fallback this is called again with onDevice=false while the audio
+    /// engine keeps running: the tap reads `recognitionRequest` dynamically,
+    /// so buffers simply start flowing into the new request. That loses a few
+    /// hundred ms of audio instead of the seconds a full engine restart costs.
+    @discardableResult
+    private func startRecognitionTask(onDevice: Bool) -> Bool {
+        guard let speechRecognizer else { return false }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.addsPunctuation = true
+        request.requiresOnDeviceRecognition = onDevice
+        recognitionRequest = request
+
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                if let error {
+                    let nsError = error as NSError
+                    if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216 {
+                        AppLogger.shared.debug("Speech recognition task canceled (expected on stop)")
+                        return
+                    }
+                    // kAFAssistantErrorDomain 1110: nothing recognizable was said.
+                    // Benign — the empty-result path in the delegate handles the UX.
+                    if nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 1110 {
+                        AppLogger.shared.debug("No speech detected (kAFAssistantErrorDomain 1110)")
+                        return
+                    }
+                    // kLSRErrorDomain 201: on-device recognition can't run because
+                    // Siri/Dictation is disabled in System Settings. Swap in a
+                    // server-based task without touching the audio engine.
+                    if nsError.domain == "kLSRErrorDomain" && nsError.code == 201,
+                       request.requiresOnDeviceRecognition {
+                        AppLogger.shared.warning("On-device recognition unavailable (Siri/Dictation disabled) — switching to server recognition, audio keeps flowing")
+                        self.forceServerRecognition = true
+                        if self.isRecording, !self.stopRequested {
+                            self.startRecognitionTask(onDevice: false)
+                        }
+                        return
+                    }
+                    AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
+                    self.delegate?.speechRecognizer(self, didFailWithError: error)
+                    return
+                }
+
+                guard let result else { return }
+                let text = result.bestTranscription.formattedString
+                let annotated = Self.annotatedText(from: result.bestTranscription)
+                let transcription = TranscriptionResult(text: text, annotatedText: annotated)
+                if result.isFinal {
+                    self.finalResult = text
+                    AppLogger.shared.info("Final speech result: \(text)", sensitive: true)
+                    AppLogger.shared.info("Annotated speech result: \(annotated)", sensitive: true)
+                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription)
+                } else {
+                    AppLogger.shared.debug("Partial result: \(text)", sensitive: true)
+                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription)
+                }
+            }
+        }
+
+        guard recognitionTask != nil else { return false }
+        AppLogger.shared.info("SFSpeechRecognitionTask created")
+        return true
+    }
+
+    /// The record-permission enum's raw values are fourccs
+    /// ('grnt' = 1735552628) — unreadable in logs, so map them to names.
+    private static func permissionName(_ status: AVAudioApplication.recordPermission) -> String {
+        switch status {
+        case .granted: return "granted"
+        case .denied: return "denied"
+        case .undetermined: return "undetermined"
+        @unknown default: return "unknown(\(status.rawValue))"
+        }
     }
 
     static func annotatedText(from transcription: SFTranscription) -> String {

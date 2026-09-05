@@ -7,10 +7,15 @@ protocol LLMRefinerDelegate: AnyObject {
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error)
 }
 
+extension LLMRefinerDelegate {
+    /// Streamed in-progress text while the model is generating (stream: true).
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String) {}
+}
+
 @MainActor
 final class LLMRefiner {
     weak var delegate: LLMRefinerDelegate?
-    private var task: URLSessionDataTask?
+    private var task: Task<Void, Never>?
 
     private let overrideConfig: LLMConfig?
     /// Explicit key for ad-hoc configs (e.g. testing an unsaved profile);
@@ -54,14 +59,21 @@ final class LLMRefiner {
 
         let systemPrompt = resolvedSystemPrompt()
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": config.model,
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": text]
             ],
-            "temperature": 0.0
+            "temperature": 0.0,
+            "stream": true
         ]
+        // Reasoning models (e.g. DeepSeek flash/reasoner variants) think before
+        // answering — pure latency for a mechanical correction task. Disable
+        // thinking where the provider supports it; unknown keys are ignored by
+        // OpenAI-compatible servers.
+        body["chat_template_kwargs"] = ["enable_thinking": false]
+        body["thinking"] = ["type": "disabled"]
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -73,25 +85,21 @@ final class LLMRefiner {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 15
 
-        AppLogger.shared.info("Sending LLM request to \(urlString)")
-        task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let error {
-                    AppLogger.shared.error("LLM request error: \(error.localizedDescription)")
-                    self.delegate?.llmRefiner(self, didFailWith: error)
-                    return
-                }
-                guard let data else {
-                    AppLogger.shared.error("LLM request returned no data")
-                    self.delegate?.llmRefiner(self, didFinishWith: text)
-                    return
-                }
+        AppLogger.shared.info("Sending streaming LLM request to \(urlString)")
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+
                 if let httpResponse = response as? HTTPURLResponse {
                     AppLogger.shared.info("LLM HTTP status: \(httpResponse.statusCode)")
                     guard (200...299).contains(httpResponse.statusCode) else {
-                        let bodyString = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-                        AppLogger.shared.error("LLM request failed — status: \(httpResponse.statusCode), body: \(bodyString)")
+                        var bodyString = ""
+                        for try await line in bytes.lines {
+                            bodyString += line
+                            if bodyString.count > 2000 { break }
+                        }
+                        AppLogger.shared.error("LLM request failed — status: \(httpResponse.statusCode), body: \(bodyString)", sensitive: true)
                         let message: String
                         switch httpResponse.statusCode {
                         case 401:
@@ -105,27 +113,41 @@ final class LLMRefiner {
                         return
                     }
                 }
-                do {
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let choices = json["choices"] as? [[String: Any]],
-                       let first = choices.first,
-                       let message = first["message"] as? [String: Any],
-                       let content = message["content"] as? String {
-                        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                        AppLogger.shared.info("LLM response parsed successfully")
-                        self.delegate?.llmRefiner(self, didFinishWith: trimmed)
-                    } else {
-                        let bodyString = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-                        AppLogger.shared.warning("LLM response parse failed — body: \(bodyString)")
-                        self.delegate?.llmRefiner(self, didFinishWith: text)
-                    }
-                } catch {
-                    AppLogger.shared.error("LLM JSON parse error: \(error.localizedDescription)")
-                    self.delegate?.llmRefiner(self, didFinishWith: text)
+
+                // Parse the SSE stream: "data: {json}" lines, terminated by
+                // "data: [DONE]". Accumulate delta content and mirror it to the
+                // floating panel so generation is visible in real time.
+                var accumulated = ""
+                for try await line in bytes.lines {
+                    try Task.checkCancellation()
+                    guard line.hasPrefix("data:") else { continue }
+                    let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                    if payload == "[DONE]" { break }
+                    guard let payloadData = payload.data(using: .utf8),
+                          let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+                          let choices = json["choices"] as? [[String: Any]],
+                          let first = choices.first,
+                          let delta = first["delta"] as? [String: Any],
+                          let content = delta["content"] as? String else { continue }
+                    accumulated += content
+                    self.delegate?.llmRefiner(self, didStreamPartial: accumulated)
                 }
+
+                let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    AppLogger.shared.warning("LLM stream completed with empty content — using raw text")
+                    self.delegate?.llmRefiner(self, didFinishWith: text)
+                    return
+                }
+                AppLogger.shared.info("LLM response parsed successfully")
+                self.delegate?.llmRefiner(self, didFinishWith: trimmed)
+            } catch is CancellationError {
+                AppLogger.shared.info("LLM request canceled")
+            } catch {
+                AppLogger.shared.error("LLM request error: \(error.localizedDescription)")
+                self.delegate?.llmRefiner(self, didFailWith: error)
             }
         }
-        task?.resume()
     }
 
     func cancel() {

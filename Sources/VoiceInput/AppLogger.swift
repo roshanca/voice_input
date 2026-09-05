@@ -11,34 +11,44 @@ final class AppLogger {
 
     private init() {}
 
-    func debug(_ message: String) {
-        log(level: "DEBUG", message: message)
+    func debug(_ message: String, sensitive: Bool = false) {
+        log(level: "DEBUG", message: message, sensitive: sensitive)
     }
 
-    func info(_ message: String) {
-        log(level: "INFO", message: message)
+    func info(_ message: String, sensitive: Bool = false) {
+        log(level: "INFO", message: message, sensitive: sensitive)
     }
 
-    func warning(_ message: String) {
-        log(level: "WARN", message: message)
+    func warning(_ message: String, sensitive: Bool = false) {
+        log(level: "WARN", message: message, sensitive: sensitive)
     }
 
-    func error(_ message: String) {
-        log(level: "ERROR", message: message)
+    func error(_ message: String, sensitive: Bool = false) {
+        log(level: "ERROR", message: message, sensitive: sensitive)
     }
 
-    private func log(level: String, message: String) {
+    /// OSLog marks interpolated strings private by default, which renders
+    /// diagnostic values as `<private>` in `log show`. Non-sensitive messages
+    /// are emitted with explicit public privacy so they survive in the log;
+    /// sensitive ones (e.g. transcribed speech) stay redacted.
+    private func log(level: String, message: String, sensitive: Bool) {
         let now = Date()
         entries.append((now, level, message))
         if entries.count > maxEntries {
             entries.removeFirst(entries.count - maxEntries)
         }
 
+        let osLevel: OSLogType
         switch level {
-        case "ERROR": osLog.error("\(message)")
-        case "WARN": osLog.warning("\(message)")
-        case "DEBUG": osLog.debug("\(message)")
-        default: osLog.info("\(message)")
+        case "ERROR": osLevel = .error
+        case "WARN": osLevel = .default
+        case "DEBUG": osLevel = .debug
+        default: osLevel = .info
+        }
+        if sensitive {
+            osLog.log(level: osLevel, "\(message)")
+        } else {
+            osLog.log(level: osLevel, "\(message, privacy: .public)")
         }
     }
 

@@ -211,26 +211,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var accessibilityPollTimer: Timer?
+    private var accessibilityAlert: NSAlert?
+
     @objc private func showAccessibilityAlert() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Accessibility Access Required"
-        alert.informativeText = "VoiceInput needs Accessibility permission to monitor the dictation hotkey globally. Please enable it in System Settings → Privacy & Security → Accessibility, then click Retry below."
+        alert.informativeText = "VoiceInput needs Accessibility permission to monitor the dictation hotkey globally. Enable it in System Settings → Privacy & Security → Accessibility — VoiceInput will pick it up automatically, no need to come back and retry."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Open Settings")
-        alert.addButton(withTitle: "Retry")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Later")
+        accessibilityAlert = alert
+        startAccessibilityPolling()
         let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn:
+        accessibilityAlert = nil
+        if response == .alertFirstButtonReturn {
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                 NSWorkspace.shared.open(url)
             }
-        case .alertSecondButtonReturn:
-            HotkeyManager.shared.start()
-        default:
-            break
+            // Keep polling: once the user flips the switch in Settings the
+            // hotkey tap starts by itself.
+        } else {
+            stopAccessibilityPolling()
         }
+    }
+
+    /// Polls until Accessibility is granted, then starts the hotkey tap and
+    /// dismisses the alert if it is still up. AX trust changes have no
+    /// notification mechanism, so polling is the only option; 1 Hz is cheap.
+    private func startAccessibilityPolling() {
+        accessibilityPollTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard !self.tapActive else {
+                    self.stopAccessibilityPolling()
+                    return
+                }
+                guard HotkeyManager.checkAccessibility() else { return }
+                AppLogger.shared.info("Accessibility access granted — starting hotkey tap")
+                HotkeyManager.shared.start()
+                self.stopAccessibilityPolling()
+                if let alert = self.accessibilityAlert {
+                    alert.window.close()
+                    NSApp.stopModal()
+                }
+            }
+        }
+        // .common so the timer keeps firing while the alert's modal session runs.
+        RunLoop.main.add(timer, forMode: .common)
+        accessibilityPollTimer = timer
+    }
+
+    private func stopAccessibilityPolling() {
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
     }
 
     private func updateMenuBarIcon() {
@@ -396,15 +432,15 @@ extension AppDelegate: SpeechRecognizerDelegate {
     func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult) {
         rawText = result.text
         floatingPanel.setText(result.text)
-        AppLogger.shared.debug("Partial result: \(result.text)")
+        AppLogger.shared.debug("Partial result: \(result.text)", sensitive: true)
     }
 
     func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult) {
         rawText = result.text
         annotatedText = result.annotatedText
         floatingPanel.setText(result.text)
-        AppLogger.shared.info("Final result: \(result.text)")
-        AppLogger.shared.info("Annotated result: \(result.annotatedText)")
+        AppLogger.shared.info("Final result: \(result.text)", sensitive: true)
+        AppLogger.shared.info("Annotated result: \(result.annotatedText)", sensitive: true)
         processFinalText()
     }
 
@@ -427,8 +463,13 @@ extension AppDelegate: LLMRefinerDelegate {
         AppLogger.shared.info("LLM refinement started")
     }
 
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String) {
+        // Show tokens as they arrive — turns a multi-second wait into live feedback.
+        floatingPanel.setText(text)
+    }
+
     func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String) {
-        AppLogger.shared.info("LLM refinement finished — result: \(text)")
+        AppLogger.shared.info("LLM refinement finished — result: \(text)", sensitive: true)
         floatingPanel.hide()
         TextInjector.shared.inject(text: text, keepInClipboard: UserDefaults.standard.copyToClipboard, sendReturn: UserDefaults.standard.autoSend)
         recordHistory(raw: pendingRawText, refined: text)
