@@ -29,6 +29,13 @@ final class SpeechRecognizer: NSObject {
     private var stopRequested = false
     private var rmsLogCounter = 0
     private var audioConverter: AVAudioConverter?
+    /// Snapshot of the input route taken at recording start, so a
+    /// configuration-change notification can be checked against reality:
+    /// macOS posts it liberally — including right after engine.start() as the
+    /// engine adopts the device we set — and most firings are spurious.
+    private var recordingDeviceID: AudioDeviceID?
+    private var recordingSampleRate: Double = 0
+    private var recordingChannelCount: UInt32 = 0
     /// Set when on-device recognition fails at runtime — fall back to the
     /// server-based path for the rest of the session.
     private var forceServerRecognition = false
@@ -42,8 +49,35 @@ final class SpeechRecognizer: NSObject {
 
     @objc private func handleConfigurationChange(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            guard let self, self.isRecording else { return }
-            AppLogger.shared.warning("Audio engine configuration changed, stopping recognition")
+            guard let self, self.isRecording, let engine = self.audioEngine else { return }
+
+            // Only tear down if the input route actually changed. The engine
+            // keeps running through spurious notifications, so ignoring them
+            // costs nothing; a real device/format change would break the tap.
+            var deviceChanged = true
+            if let expectedID = self.recordingDeviceID, let audioUnit = engine.inputNode.audioUnit {
+                var currentID = AudioDeviceID(0)
+                var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+                let status = AudioUnitGetProperty(
+                    audioUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &currentID,
+                    &size
+                )
+                deviceChanged = status != noErr || currentID != expectedID
+            }
+            let format = engine.inputNode.outputFormat(forBus: 0)
+            let formatChanged = format.sampleRate != self.recordingSampleRate
+                || format.channelCount != self.recordingChannelCount
+
+            guard deviceChanged || formatChanged else {
+                AppLogger.shared.debug("Audio configuration change was spurious (device/format unchanged) — continuing recording")
+                return
+            }
+
+            AppLogger.shared.warning("Audio input route changed mid-recording (deviceChanged: \(deviceChanged), formatChanged: \(formatChanged)), stopping recognition")
             self.stopRecording()
             self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged)
         }
@@ -258,6 +292,28 @@ final class SpeechRecognizer: NSObject {
         engine.prepare()
         try engine.start()
         isRecording = true
+
+        // Snapshot the route the engine actually adopted, for comparison in
+        // handleConfigurationChange. Must happen after start(): adopting the
+        // selected device is itself what posts the (spurious) first
+        // configuration-change notification.
+        recordingSampleRate = hardwareFormat.sampleRate
+        recordingChannelCount = hardwareFormat.channelCount
+        recordingDeviceID = nil
+        if let audioUnit = inputNode.audioUnit {
+            var id = AudioDeviceID(0)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            if AudioUnitGetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &id,
+                &size
+            ) == noErr {
+                recordingDeviceID = id
+            }
+        }
         AppLogger.shared.info("Audio engine started, recording from hardware format")
 
         // The hotkey was released while the engine/task were still starting —

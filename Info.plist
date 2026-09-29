@@ -10,6 +10,8 @@
     <string>com.voiceinput.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>VoiceInput</string>
     <key>CFBundlePackageType</key>

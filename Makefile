@@ -6,6 +6,8 @@ APP_BUNDLE = $(APP_NAME).app
 APP_CONTENTS = $(APP_BUNDLE)/Contents
 APP_MACOS = $(APP_CONTENTS)/MacOS
 APP_RESOURCES = $(APP_CONTENTS)/Resources
+ICON_SOURCE = Assets/AppIcon.png
+ICONSET_DIR = $(BUILD_DIR)/AppIcon.iconset
 
 .PHONY: build run install clean
 
@@ -19,6 +21,19 @@ build:
 	cp $(RELEASE_DIR)/$(APP_NAME) $(APP_MACOS)/$(APP_NAME)
 	cp Info.plist $(APP_CONTENTS)/Info.plist
 	cp VoiceInput.entitlements $(APP_RESOURCES)/VoiceInput.entitlements || true
+	@echo "Generating app icon..."
+	mkdir -p $(ICONSET_DIR)
+	sips -z 16 16     $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_16x16.png
+	sips -z 32 32     $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_16x16@2x.png
+	sips -z 32 32     $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_32x32.png
+	sips -z 64 64     $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_32x32@2x.png
+	sips -z 128 128   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_128x128.png
+	sips -z 256 256   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_128x128@2x.png
+	sips -z 256 256   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_256x256.png
+	sips -z 512 512   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_256x256@2x.png
+	sips -z 512 512   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_512x512.png
+	cp $(ICON_SOURCE) $(ICONSET_DIR)/icon_512x512@2x.png
+	iconutil -c icns $(ICONSET_DIR) -o $(APP_RESOURCES)/AppIcon.icns
 	@echo "Signing app bundle..."
 	codesign --force --deep --sign "VoiceInput Dev" \
 		--entitlements VoiceInput.entitlements \
