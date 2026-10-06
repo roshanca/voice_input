@@ -8,6 +8,8 @@ APP_MACOS = $(APP_CONTENTS)/MacOS
 APP_RESOURCES = $(APP_CONTENTS)/Resources
 ICON_SOURCE = Assets/AppIcon.png
 ICONSET_DIR = $(BUILD_DIR)/AppIcon.iconset
+# Auto-stamped into the bundle's CFBundleVersion on every build.
+BUILD_VERSION = $(shell date +%Y%m%d.%H%M)
 
 .PHONY: build run install clean
 
@@ -20,6 +22,8 @@ build:
 	mkdir -p $(APP_RESOURCES)
 	cp $(RELEASE_DIR)/$(APP_NAME) $(APP_MACOS)/$(APP_NAME)
 	cp Info.plist $(APP_CONTENTS)/Info.plist
+	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(BUILD_VERSION)" $(APP_CONTENTS)/Info.plist
+	@echo "Version: $$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' $(APP_CONTENTS)/Info.plist) ($(BUILD_VERSION))"
 	cp VoiceInput.entitlements $(APP_RESOURCES)/VoiceInput.entitlements || true
 	@echo "Generating app icon..."
 	mkdir -p $(ICONSET_DIR)
