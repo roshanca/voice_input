@@ -9,10 +9,10 @@ struct TranscriptionResult {
 
 @MainActor
 protocol SpeechRecognizerDelegate: AnyObject {
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float, sessionID: UUID)
 }
 
 @MainActor
@@ -27,6 +27,10 @@ final class SpeechRecognizer: NSObject {
     private var finalResult = ""
     private var isRecording = false
     private var stopRequested = false
+    /// Identifies the dictation session the current task belongs to — the
+    /// delegate sets it on every startRecording so callbacks from a previous
+    /// session's still-finishing task can be told apart and dropped.
+    private var sessionID = UUID()
     private var rmsLogCounter = 0
     private var audioConverter: AVAudioConverter?
     /// Snapshot of the input route taken at recording start, so a
@@ -79,7 +83,7 @@ final class SpeechRecognizer: NSObject {
 
             AppLogger.shared.warning("Audio input route changed mid-recording (deviceChanged: \(deviceChanged), formatChanged: \(formatChanged)), stopping recognition")
             self.stopRecording()
-            self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged)
+            self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged, sessionID: self.sessionID)
         }
     }
 
@@ -151,8 +155,12 @@ final class SpeechRecognizer: NSObject {
         AppLogger.shared.info("Speech recognition warm-up started (mode: \(request.requiresOnDeviceRecognition ? "on-device" : "server"))")
     }
 
-    func startRecording() async throws {
+    /// sessionID comes from the delegate's dictation session — every callback
+    /// this recording produces is tagged with it, so stale results from a
+    /// previous session can be dropped downstream.
+    func startRecording(sessionID: UUID) async throws {
         guard !isRecording else { return }
+        self.sessionID = sessionID
         finalResult = ""
         rmsLogCounter = 0
         stopRequested = false
@@ -377,9 +385,15 @@ final class SpeechRecognizer: NSObject {
         request.requiresOnDeviceRecognition = onDevice
         recognitionRequest = request
 
+        // Capture the session this task belongs to: after stopRecording its
+        // cancel may still be in flight when a new session starts, and this
+        // closure must not feed the old session's results (or error handling)
+        // into the new one.
+        let sessionID = self.sessionID
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.sessionID == sessionID else { return }
 
                 if let error {
                     let nsError = error as NSError
@@ -406,7 +420,7 @@ final class SpeechRecognizer: NSObject {
                         return
                     }
                     AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
-                    self.delegate?.speechRecognizer(self, didFailWithError: error)
+                    self.delegate?.speechRecognizer(self, didFailWithError: error, sessionID: sessionID)
                     return
                 }
 
@@ -418,10 +432,10 @@ final class SpeechRecognizer: NSObject {
                     self.finalResult = text
                     AppLogger.shared.info("Final speech result: \(text)", sensitive: true)
                     AppLogger.shared.info("Annotated speech result: \(annotated)", sensitive: true)
-                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription)
+                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription, sessionID: sessionID)
                 } else {
                     AppLogger.shared.debug("Partial result: \(text)", sensitive: true)
-                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription)
+                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription, sessionID: sessionID)
                 }
             }
         }
@@ -464,7 +478,7 @@ final class SpeechRecognizer: NSObject {
         }
 
         Task { @MainActor in
-            self.delegate?.speechRecognizer(self, didUpdateRMS: normalized)
+            self.delegate?.speechRecognizer(self, didUpdateRMS: normalized, sessionID: self.sessionID)
         }
     }
 

@@ -16,21 +16,21 @@ final class LLMProfileTester: ObservableObject {
         let refiner = LLMRefiner(config: config, apiKeyOverride: apiKey)
         refiner.delegate = self
         self.refiner = refiner
-        refiner.refine(text: "hello")
+        refiner.refine(text: "hello", requestID: UUID())
     }
 }
 
 extension LLMProfileTester: LLMRefinerDelegate {
-    func llmRefinerDidStart(_ refiner: LLMRefiner) {}
+    func llmRefinerDidStart(_ refiner: LLMRefiner, requestID: UUID) {}
 
-    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String) {
+    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String, requestID: UUID) {
         status = "Success — response: \(text)"
         succeeded = true
         isTesting = false
         self.refiner = nil
     }
 
-    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error) {
+    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID) {
         status = "Failed: \(error.localizedDescription)"
         succeeded = false
         isTesting = false
