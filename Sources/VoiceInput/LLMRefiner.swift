@@ -5,10 +5,11 @@ protocol LLMRefinerDelegate: AnyObject {
     func llmRefinerDidStart(_ refiner: LLMRefiner)
     func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String)
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error)
+    /// Streamed in-progress text while the model is generating (stream: true).
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String)
 }
 
 extension LLMRefinerDelegate {
-    /// Streamed in-progress text while the model is generating (stream: true).
     func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String) {}
 }
 
