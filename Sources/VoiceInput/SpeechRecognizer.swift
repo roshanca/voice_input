@@ -55,6 +55,19 @@ private final class AudioTapContext: @unchecked Sendable {
         state.withLock { $0.active = false }
     }
 
+    /// Ordered stop for the tap, atomic under the lock: deactivate first so
+    /// in-flight process() calls finish and new buffers are rejected, then
+    /// end audio on the request — no buffer can be appended after endAudio.
+    /// Returns the request that was ended, for delayed-cleanup identity checks.
+    @discardableResult
+    func deactivateAndEndAudio() -> SFSpeechAudioBufferRecognitionRequest? {
+        state.withLock {
+            $0.active = false
+            $0.request?.endAudio()
+            return $0.request
+        }
+    }
+
     /// Convert (when needed) and append one buffer to this session's
     /// request; returns the normalized waveform RMS, or nil once the
     /// context has been deactivated.
@@ -464,15 +477,14 @@ final class SpeechRecognizer: NSObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
-        audioTap?.request?.endAudio()
+        // Atomically reject further buffers and end audio on this session's
+        // request — deactivating before endAudio means an in-flight process()
+        // finishes under the lock and no append can land afterwards.
+        let stoppedRequest = audioTap?.deactivateAndEndAudio()
         // Capture this session's task/request: if the user starts a new
         // recording within 3s, the delayed cleanup must not cancel the NEW
         // task — only one that is still this session's.
         let stoppedTask = recognitionTask
-        let stoppedRequest = audioTap?.request
-        // Buffers still in flight on the render thread now hit a deactivated
-        // context and drop instead of appending to an ended request.
-        audioTap?.deactivate()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }
             guard self.recognitionTask === stoppedTask, stoppedTask != nil else { return }
