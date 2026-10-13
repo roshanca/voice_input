@@ -5,6 +5,44 @@ import Carbon
 final class TextInjector {
     static let shared = TextInjector()
 
+    /// Full backup of the pasteboard: every item, every declared type.
+    private struct ClipboardSnapshot {
+        let items: [[String: Data]]
+
+        static func capture(from pasteboard: NSPasteboard) -> ClipboardSnapshot {
+            let items = (pasteboard.pasteboardItems ?? []).map { item in
+                Dictionary(uniqueKeysWithValues: item.types.compactMap { type in
+                    item.data(forType: type).map { (type.rawValue, $0) }
+                })
+            }
+            return ClipboardSnapshot(items: items)
+        }
+
+        func restore(to pasteboard: NSPasteboard) {
+            pasteboard.clearContents()
+            guard !items.isEmpty else { return }
+            pasteboard.writeObjects(items.map { types in
+                let item = NSPasteboardItem()
+                for (type, data) in types {
+                    item.setData(data, forType: NSPasteboard.PasteboardType(type))
+                }
+                return item
+            })
+        }
+    }
+
+    /// Latest write whose delayed restore hasn't run yet. If the clipboard still
+    /// holds it when the next injection starts, that injection reuses this
+    /// snapshot so consecutive dictations restore the original clipboard instead
+    /// of the previously dictated text.
+    private struct PendingRestore {
+        let id = UUID()
+        let changeCount: Int
+        let snapshot: ClipboardSnapshot
+    }
+
+    private var pendingRestore: PendingRestore?
+
     func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, completion: (() -> Void)? = nil) {
         AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard), sendReturn: \(sendReturn)")
 
@@ -18,12 +56,22 @@ final class TextInjector {
         }
 
         let pasteboard = NSPasteboard.general
-        let oldContent = pasteboard.string(forType: .string)
-        AppLogger.shared.debug("Saved old clipboard content — length: \(oldContent?.count ?? 0)")
+
+        let snapshot: ClipboardSnapshot
+        if let pending = pendingRestore, pasteboard.changeCount == pending.changeCount {
+            snapshot = pending.snapshot
+            AppLogger.shared.debug("Clipboard still holds previous injection — reusing its pre-dictation snapshot")
+        } else {
+            snapshot = ClipboardSnapshot.capture(from: pasteboard)
+            AppLogger.shared.debug("Saved old clipboard content — items: \(snapshot.items.count)")
+        }
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-        AppLogger.shared.info("Set new text to clipboard")
+        let writeChangeCount = pasteboard.changeCount
+        let restore = PendingRestore(changeCount: writeChangeCount, snapshot: snapshot)
+        pendingRestore = restore
+        AppLogger.shared.info("Set new text to clipboard (changeCount: \(writeChangeCount))")
 
         let pasteDelay = wasCJK ? 0.25 : 0.15
         let restoreDelay: TimeInterval = 0.35
@@ -37,16 +85,17 @@ final class TextInjector {
 
             AppLogger.shared.debug("Scheduling clipboard restore in \(restoreDelay)s")
             DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-                if keepInClipboard {
+                if self.pendingRestore?.id == restore.id {
+                    self.pendingRestore = nil
+                }
+
+                if pasteboard.changeCount != writeChangeCount {
+                    AppLogger.shared.info("Clipboard changed since our write — preserving user's new content")
+                } else if keepInClipboard {
                     AppLogger.shared.info("Keeping result in clipboard (copyToClipboard enabled)")
-                    pasteboard.clearContents()
-                    pasteboard.setString(text, forType: .string)
                 } else {
                     AppLogger.shared.info("Restoring old clipboard content")
-                    pasteboard.clearContents()
-                    if let oldContent {
-                        pasteboard.setString(oldContent, forType: .string)
-                    }
+                    snapshot.restore(to: pasteboard)
                 }
 
                 if wasCJK {
