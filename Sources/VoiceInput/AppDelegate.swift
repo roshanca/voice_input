@@ -369,8 +369,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 AppLogger.shared.info("Speech recording started successfully")
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
-                floatingPanel.setText("Error: \(error.localizedDescription)")
                 let sessionID = session.id
+                // This catch can land after a newer dictation already owns
+                // the panel — only the session that started this recording
+                // may surface its startup error.
+                guard self.activeSession?.id == sessionID else { return }
+                floatingPanel.setText("Error: \(error.localizedDescription)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     // Session-guarded: if a newer dictation is already
                     // underway, its panel and hotkey state must not be
