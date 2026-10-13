@@ -1,6 +1,7 @@
 import Speech
 import AVFoundation
-import AVFAudio
+@preconcurrency import AVFAudio
+import os
 
 struct TranscriptionResult {
     let text: String
@@ -9,10 +10,138 @@ struct TranscriptionResult {
 
 @MainActor
 protocol SpeechRecognizerDelegate: AnyObject {
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error)
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error, sessionID: UUID)
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float, sessionID: UUID)
+}
+
+/// Render-thread state owned by one recording session. The audio tap
+/// callback does not run on the main actor, so everything it can touch —
+/// the session's recognition request (swapped by the on-device→server
+/// fallback), its lazily created converter, the RMS counter, and the
+/// liveness flag — lives behind a single lock. Buffer processing is then
+/// atomic against stopRecording/teardown and the request swap, and because
+/// each session gets a fresh context object, an obsolete engine's tap can
+/// never reach a newer session's resources at all.
+private final class AudioTapContext: @unchecked Sendable {
+    let sessionID: UUID
+    let targetFormat: AVAudioFormat
+
+    private struct State {
+        var request: SFSpeechAudioBufferRecognitionRequest?
+        var converter: AVAudioConverter?
+        var rmsLogCounter = 0
+        /// Flipped by stopRecording/teardown: drained or in-flight buffers
+        /// are dropped instead of touching released state.
+        var active = true
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(sessionID: UUID, targetFormat: AVAudioFormat) {
+        self.sessionID = sessionID
+        self.targetFormat = targetFormat
+    }
+
+    /// The request this session's tap appends to. Set at task creation and
+    /// swapped by the on-device→server fallback — both under the lock, so a
+    /// tap buffer can never observe a half-replaced request.
+    var request: SFSpeechAudioBufferRecognitionRequest? {
+        get { state.withLock { $0.request } }
+        set { state.withLock { $0.request = newValue } }
+    }
+
+    func deactivate() {
+        state.withLock { $0.active = false }
+    }
+
+    /// Ordered stop for the tap, atomic under the lock: deactivate first so
+    /// in-flight process() calls finish and new buffers are rejected, then
+    /// end audio on the request — no buffer can be appended after endAudio.
+    /// Returns the request that was ended, for delayed-cleanup identity checks.
+    @discardableResult
+    func deactivateAndEndAudio() -> SFSpeechAudioBufferRecognitionRequest? {
+        state.withLock {
+            $0.active = false
+            $0.request?.endAudio()
+            return $0.request
+        }
+    }
+
+    /// Convert (when needed) and append one buffer to this session's
+    /// request; returns the normalized waveform RMS, or nil once the
+    /// context has been deactivated.
+    func process(buffer: AVAudioPCMBuffer) -> Float? {
+        logDebug("Audio buffer received - frameLength: \(buffer.frameLength), format: \(buffer.format)")
+        return state.withLock { state in
+            guard state.active, let request = state.request else { return nil }
+
+            if state.converter == nil {
+                state.converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+                if state.converter == nil {
+                    logError("Failed to create AVAudioConverter from \(buffer.format) to \(targetFormat)")
+                }
+            }
+
+            guard let converter = state.converter else {
+                request.append(buffer)
+                return normalizedRMS(of: buffer, state: &state)
+            }
+
+            let capacity = UInt32(Double(buffer.frameLength) * Double(targetFormat.sampleRate) / Double(buffer.format.sampleRate)) + 1
+            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+                logError("Failed to create converted AVAudioPCMBuffer")
+                request.append(buffer)
+                return normalizedRMS(of: buffer, state: &state)
+            }
+
+            var error: NSError?
+            converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
+                outStatus.pointee = .haveData
+                return buffer
+            }
+
+            if let error {
+                logError("Audio conversion error: \(error)")
+                request.append(buffer)
+                return normalizedRMS(of: buffer, state: &state)
+            }
+
+            convertedBuffer.frameLength = convertedBuffer.frameCapacity
+            logDebug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
+            request.append(convertedBuffer)
+            return normalizedRMS(of: convertedBuffer, state: &state)
+        }
+    }
+
+    private func normalizedRMS(of buffer: AVAudioPCMBuffer, state: inout State) -> Float {
+        guard let data = buffer.floatChannelData?[0] else { return 0 }
+        let frameLength = Int(buffer.frameLength)
+
+        var sum: Float = 0
+        for i in 0..<frameLength {
+            sum += data[i] * data[i]
+        }
+        let rms = sqrt(sum / Float(frameLength))
+        let db = 20 * log10(max(rms, 1e-10))
+        let normalized = min(max((db + 60) / 60, 0), 1)
+
+        state.rmsLogCounter += 1
+        if state.rmsLogCounter <= 5 || normalized > 0.1 {
+            logDebug("RMS: \(String(format: "%.4f", rms)), normalized: \(String(format: "%.3f", normalized))")
+        }
+        return normalized
+    }
+
+    /// AppLogger is @MainActor — hop instead of touching it (or its entries
+    /// buffer) from the render thread.
+    private func logDebug(_ message: String) {
+        Task { @MainActor in AppLogger.shared.debug(message) }
+    }
+
+    private func logError(_ message: String) {
+        Task { @MainActor in AppLogger.shared.error(message) }
+    }
 }
 
 @MainActor
@@ -20,15 +149,25 @@ final class SpeechRecognizer: NSObject {
     weak var delegate: SpeechRecognizerDelegate?
 
     private var speechRecognizer: SFSpeechRecognizer?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioEngine: AVAudioEngine?
 
     private var finalResult = ""
     private var isRecording = false
     private var stopRequested = false
-    private var rmsLogCounter = 0
-    private var audioConverter: AVAudioConverter?
+    /// Session-owned render-thread state; replaced on every startRecording
+    /// and deactivated on stop/teardown, so a stale tap can never reach a
+    /// newer session's request or converter. MainActor-managed lifecycle,
+    /// lock-guarded contents.
+    private var audioTap: AudioTapContext?
+    /// Identifies the dictation session the current task belongs to — the
+    /// delegate sets it on every startRecording so callbacks from a previous
+    /// session's still-finishing task can be told apart and dropped.
+    private var sessionID = UUID()
+    /// Lock-protected copy of sessionID, readable off-actor: the nonisolated
+    /// availabilityDidChange callback tags its MainActor hop with the session
+    /// that owned the recognizer at dispatch time.
+    private let dispatchedSessionID = OSAllocatedUnfairLock<UUID>(initialState: UUID())
     /// Snapshot of the input route taken at recording start, so a
     /// configuration-change notification can be checked against reality:
     /// macOS posts it liberally — including right after engine.start() as the
@@ -79,7 +218,7 @@ final class SpeechRecognizer: NSObject {
 
             AppLogger.shared.warning("Audio input route changed mid-recording (deviceChanged: \(deviceChanged), formatChanged: \(formatChanged)), stopping recognition")
             self.stopRecording()
-            self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged)
+            self.delegate?.speechRecognizer(self, didFailWithError: RecognizerError.audioEngineConfigurationChanged, sessionID: self.sessionID)
         }
     }
 
@@ -151,10 +290,14 @@ final class SpeechRecognizer: NSObject {
         AppLogger.shared.info("Speech recognition warm-up started (mode: \(request.requiresOnDeviceRecognition ? "on-device" : "server"))")
     }
 
-    func startRecording() async throws {
+    /// sessionID comes from the delegate's dictation session — every callback
+    /// this recording produces is tagged with it, so stale results from a
+    /// previous session can be dropped downstream.
+    func startRecording(sessionID: UUID) async throws {
         guard !isRecording else { return }
+        self.sessionID = sessionID
+        dispatchedSessionID.withLock { $0 = sessionID }
         finalResult = ""
-        rmsLogCounter = 0
         stopRequested = false
 
         // Check microphone permission on macOS
@@ -172,6 +315,10 @@ final class SpeechRecognizer: NSObject {
             guard granted else {
                 throw RecognizerError.microphoneDenied
             }
+            // Revalidate after the await: the hotkey may have been released
+            // (stopRequested) or a newer session's own startup may have
+            // replaced sessionID while this one was suspended.
+            guard startupIsCurrent(sessionID) else { return }
         }
 
         // Authorization status is cached by the system — only prompt when
@@ -188,13 +335,23 @@ final class SpeechRecognizer: NSObject {
             throw RecognizerError.notAuthorized
         }
 
-        // The hotkey may have been released while permissions were pending.
-        guard !stopRequested else { return }
+        // The hotkey may have been released while permissions were pending,
+        // or a newer session may have superseded this startup — in that case
+        // this session must not create a task/engine tagged with the new
+        // session's id.
+        guard startupIsCurrent(sessionID) else { return }
 
         guard let speechRecognizer else {
             AppLogger.shared.error("No SFSpeechRecognizer available")
             throw RecognizerError.recognizerUnavailable
         }
+
+        // Everything the render-thread tap touches lives in this
+        // session-owned, lock-guarded context — created before the
+        // recognition task so the task can publish its request through it.
+        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+        let tapContext = AudioTapContext(sessionID: sessionID, targetFormat: targetFormat)
+        audioTap = tapContext
 
         // Prefer on-device recognition: no server session to establish, so the
         // first partial result arrives much sooner (and it works offline).
@@ -240,53 +397,20 @@ final class SpeechRecognizer: NSObject {
 
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         AppLogger.shared.info("Hardware input format: \(hardwareFormat)")
-
-        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         AppLogger.shared.info("Target recognition format: \(targetFormat)")
 
-        audioConverter = nil
+        // The tap captures only this session's context: process() serializes
+        // request/converter access against teardown and the on-device→server
+        // fallback, and returns nil once deactivated — so an obsolete engine's
+        // drained buffers can't reach a newer session's state. On the same
+        // session the fallback's swapped request is picked up automatically.
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: hardwareFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-            AppLogger.shared.debug("Audio buffer received - frameLength: \(buffer.frameLength), format: \(buffer.format)")
-
-            if self.audioConverter == nil {
-                self.audioConverter = AVAudioConverter(from: buffer.format, to: targetFormat)
-                if self.audioConverter == nil {
-                    AppLogger.shared.error("Failed to create AVAudioConverter from \(buffer.format) to \(targetFormat)")
-                }
+            guard let rms = tapContext.process(buffer: buffer) else { return }
+            let sessionID = tapContext.sessionID
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.delegate?.speechRecognizer(self, didUpdateRMS: rms, sessionID: sessionID)
             }
-
-            guard let converter = self.audioConverter else {
-                self.recognitionRequest?.append(buffer)
-                self.processRMS(buffer: buffer)
-                return
-            }
-
-            let capacity = UInt32(Double(buffer.frameLength) * Double(targetFormat.sampleRate) / Double(buffer.format.sampleRate)) + 1
-            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
-                AppLogger.shared.error("Failed to create converted AVAudioPCMBuffer")
-                self.recognitionRequest?.append(buffer)
-                self.processRMS(buffer: buffer)
-                return
-            }
-
-            var error: NSError?
-            converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
-                outStatus.pointee = .haveData
-                return buffer
-            }
-
-            if let error {
-                AppLogger.shared.error("Audio conversion error: \(error)")
-                self.recognitionRequest?.append(buffer)
-                self.processRMS(buffer: buffer)
-                return
-            }
-
-            convertedBuffer.frameLength = convertedBuffer.frameCapacity
-            AppLogger.shared.debug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
-            self.recognitionRequest?.append(convertedBuffer)
-            self.processRMS(buffer: convertedBuffer)
         }
 
         engine.prepare()
@@ -318,10 +442,21 @@ final class SpeechRecognizer: NSObject {
 
         // The hotkey was released while the engine/task were still starting —
         // shut everything back down instead of leaking a running engine.
-        if stopRequested {
+        // (Reaching this point means sessionID still matched at resource
+        // creation, so a mismatch here can only come from stopRequested —
+        // but check both to be safe.)
+        if !startupIsCurrent(sessionID) {
             AppLogger.shared.info("Stop was requested during startup — tearing down")
             teardown()
         }
+    }
+
+    /// True while a startup still owns the recognizer: the hotkey release
+    /// sets stopRequested, and a newer session's startRecording replaces
+    /// sessionID — either makes a suspended startup stale, and it must bail
+    /// before creating or touching any shared resources.
+    private func startupIsCurrent(_ sessionID: UUID) -> Bool {
+        self.sessionID == sessionID && !stopRequested
     }
 
     /// Synchronously stop the engine and discard the recognition task/request.
@@ -329,10 +464,10 @@ final class SpeechRecognizer: NSObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
-        audioConverter = nil
+        audioTap?.deactivate()
+        audioTap = nil
         recognitionTask?.cancel()
         recognitionTask = nil
-        recognitionRequest = nil
         isRecording = false
     }
 
@@ -342,21 +477,22 @@ final class SpeechRecognizer: NSObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
-        audioConverter = nil
-        recognitionRequest?.endAudio()
+        // Atomically reject further buffers and end audio on this session's
+        // request — deactivating before endAudio means an in-flight process()
+        // finishes under the lock and no append can land afterwards.
+        let stoppedRequest = audioTap?.deactivateAndEndAudio()
         // Capture this session's task/request: if the user starts a new
         // recording within 3s, the delayed cleanup must not cancel the NEW
         // task — only one that is still this session's.
         let stoppedTask = recognitionTask
-        let stoppedRequest = recognitionRequest
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }
             guard self.recognitionTask === stoppedTask, stoppedTask != nil else { return }
             AppLogger.shared.debug("Speech recognition task still alive after 3s, forcing cancel")
             stoppedTask?.cancel()
-            if self.recognitionRequest === stoppedRequest {
+            if self.audioTap?.request === stoppedRequest {
                 self.recognitionTask = nil
-                self.recognitionRequest = nil
+                self.audioTap?.request = nil
             }
         }
         isRecording = false
@@ -364,9 +500,9 @@ final class SpeechRecognizer: NSObject {
 
     /// Create the recognition request + task. On the kLSRErrorDomain 201
     /// fallback this is called again with onDevice=false while the audio
-    /// engine keeps running: the tap reads `recognitionRequest` dynamically,
-    /// so buffers simply start flowing into the new request. That loses a few
-    /// hundred ms of audio instead of the seconds a full engine restart costs.
+    /// engine keeps running: publishing the request through the tap context
+    /// means buffers simply start flowing into the new request. That loses a
+    /// few hundred ms of audio instead of the seconds a full restart costs.
     @discardableResult
     private func startRecognitionTask(onDevice: Bool) -> Bool {
         guard let speechRecognizer else { return false }
@@ -375,11 +511,17 @@ final class SpeechRecognizer: NSObject {
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
         request.requiresOnDeviceRecognition = onDevice
-        recognitionRequest = request
+        audioTap?.request = request
 
+        // Capture the session this task belongs to: after stopRecording its
+        // cancel may still be in flight when a new session starts, and this
+        // closure must not feed the old session's results (or error handling)
+        // into the new one.
+        let sessionID = self.sessionID
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.sessionID == sessionID else { return }
 
                 if let error {
                     let nsError = error as NSError
@@ -406,7 +548,7 @@ final class SpeechRecognizer: NSObject {
                         return
                     }
                     AppLogger.shared.error("Speech recognition error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
-                    self.delegate?.speechRecognizer(self, didFailWithError: error)
+                    self.delegate?.speechRecognizer(self, didFailWithError: error, sessionID: sessionID)
                     return
                 }
 
@@ -418,10 +560,10 @@ final class SpeechRecognizer: NSObject {
                     self.finalResult = text
                     AppLogger.shared.info("Final speech result: \(text)", sensitive: true)
                     AppLogger.shared.info("Annotated speech result: \(annotated)", sensitive: true)
-                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription)
+                    self.delegate?.speechRecognizer(self, didFinishWithResult: transcription, sessionID: sessionID)
                 } else {
                     AppLogger.shared.debug("Partial result: \(text)", sensitive: true)
-                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription)
+                    self.delegate?.speechRecognizer(self, didReceivePartialResult: transcription, sessionID: sessionID)
                 }
             }
         }
@@ -446,28 +588,6 @@ final class SpeechRecognizer: NSObject {
         transcription.formattedString
     }
 
-    private func processRMS(buffer: AVAudioPCMBuffer) {
-        guard let data = buffer.floatChannelData?[0] else { return }
-        let frameLength = Int(buffer.frameLength)
-
-        var sum: Float = 0
-        for i in 0..<frameLength {
-            sum += data[i] * data[i]
-        }
-        let rms = sqrt(sum / Float(frameLength))
-        let db = 20 * log10(max(rms, 1e-10))
-        let normalized = min(max((db + 60) / 60, 0), 1)
-
-        rmsLogCounter += 1
-        if rmsLogCounter <= 5 || normalized > 0.1 {
-            AppLogger.shared.debug("RMS: \(String(format: "%.4f", rms)), normalized: \(String(format: "%.3f", normalized))")
-        }
-
-        Task { @MainActor in
-            self.delegate?.speechRecognizer(self, didUpdateRMS: normalized)
-        }
-    }
-
     enum RecognizerError: Error {
         case notAuthorized
         case microphoneDenied
@@ -489,10 +609,19 @@ final class SpeechRecognizer: NSObject {
 
 extension SpeechRecognizer: SFSpeechRecognizerDelegate {
     nonisolated func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer, availabilityDidChange available: Bool) {
-        if !available {
-            Task { @MainActor [weak self] in
-                self?.stopRecording()
-            }
+        guard !available else { return }
+        // This callback can arrive late and off the main actor. Tag the hop
+        // with the session that owned the recognizer at dispatch time, then
+        // re-check on the MainActor: a stale callback — dispatched under a
+        // previous recording, or from a recognizer updateLocale replaced —
+        // must not tear down a newer session's recording.
+        let dispatchedID = dispatchedSessionID.withLock { $0 }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.speechRecognizer === speechRecognizer,
+                  self.sessionID == dispatchedID,
+                  self.isRecording else { return }
+            self.stopRecording()
         }
     }
 }

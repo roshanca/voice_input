@@ -14,13 +14,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let llmRefiner = LLMRefiner()
 
     private var isHotkeyHeld = false
-    private var rawText = ""
-    private var annotatedText = ""
+    /// State for one hotkey press → submit cycle. Its id is stamped onto every
+    /// async callback the dictation can produce — recognition results, the
+    /// result timeout, the LLM refinement — so stale work from a previous
+    /// dictation is recognized and dropped instead of leaking into this one.
+    private struct DictationSession {
+        let id = UUID()
+        let startDate = Date()
+        /// Language and settings snapshot taken at session start, so changes
+        /// made while a result is in flight can't cross session boundaries.
+        let language: String
+        let llmEnabled: Bool
+        let copyToClipboard: Bool
+        let autoSend: Bool
+        let dictionaryDirectReplacement: Bool
+        var rawText = ""
+        var annotatedText = ""
+        /// Set at submission on the LLM path: the committed text and the
+        /// recording length, kept until the refinement result writes history.
+        var submittedText = ""
+        var duration: TimeInterval = 0
+        /// Once-only submission guard — whichever of the final result or the
+        /// result timeout arrives first owns the commit; the loser backs off.
+        var submitted = false
+    }
+
+    /// Session currently recording or awaiting its final result / timeout.
+    private var activeSession: DictationSession?
+    /// Session whose text was submitted and is waiting on LLM refinement.
+    private var pendingSession: DictationSession?
     private var resultTimeout: Timer?
     private var recordingAnimationTimer: Timer?
-    private var recordingStart: Date?
-    private var pendingRawText = ""
-    private var pendingDuration: Double = 0
 
     private let idleImage = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Voice Input")
     private var recordingImage: NSImage?
@@ -315,10 +339,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func hotkeyPressed() {
         guard !isHotkeyHeld else { return }
         isHotkeyHeld = true
-        rawText = ""
-        annotatedText = ""
-        recordingStart = Date()
         resultTimeout?.invalidate()
+        // A new dictation supersedes whatever the previous one left pending:
+        // cancel an in-flight refinement so its callbacks can't inject text
+        // or write history for a session the user has already moved on from.
+        if pendingSession != nil {
+            AppLogger.shared.info("New dictation started — canceling pending refinement")
+            llmRefiner.cancel()
+            pendingSession = nil
+        }
+        let session = DictationSession(
+            language: LanguageManager.shared.current.rawValue,
+            llmEnabled: UserDefaults.standard.llmEnabled,
+            copyToClipboard: UserDefaults.standard.copyToClipboard,
+            autoSend: UserDefaults.standard.autoSend,
+            dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement
+        )
+        activeSession = session
         AppLogger.shared.info("Hotkey pressed — starting recording")
         startRecordingAnimation()
         SoundPlayer.recordStart()
@@ -328,14 +365,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                try await speechRecognizer.startRecording()
+                try await speechRecognizer.startRecording(sessionID: session.id)
                 AppLogger.shared.info("Speech recording started successfully")
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
+                let sessionID = session.id
+                // This catch can land after a newer dictation already owns
+                // the panel — only the session that started this recording
+                // may surface its startup error.
+                guard self.activeSession?.id == sessionID else { return }
                 floatingPanel.setText("Error: \(error.localizedDescription)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    // Session-guarded: if a newer dictation is already
+                    // underway, its panel and hotkey state must not be
+                    // torn down by this stale cleanup.
+                    guard self.activeSession?.id == sessionID else { return }
                     self.floatingPanel.hide()
                     self.isHotkeyHeld = false
+                    self.activeSession = nil
                     self.stopRecordingAnimation()
                 }
             }
@@ -351,57 +398,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SoundPlayer.recordStop()
 
         // Wait a bit for the final result
+        guard let sessionID = activeSession?.id else { return }
         resultTimeout?.invalidate()
         resultTimeout = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 AppLogger.shared.info("Result timeout fired — processing final text")
-                processFinalText()
+                self.submitSession(sessionID)
             }
         }
     }
 
-    private func processFinalText() {
+    /// Commit the session's text exactly once. The first of the final
+    /// recognition result or the 1.5s result timeout to arrive wins and owns
+    /// the submission; the loser finds the session already gone (or flagged
+    /// submitted) and does nothing — no double insert, no double history.
+    private func submitSession(_ sessionID: UUID) {
+        guard var session = activeSession, session.id == sessionID, !session.submitted else { return }
+        session.submitted = true
+        activeSession = nil
         resultTimeout?.invalidate()
-        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedAnnotated = annotatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        AppLogger.shared.info("processFinalText called — raw length: \(rawText.count), trimmed length: \(trimmed.count)")
+
+        let trimmed = session.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAnnotated = session.annotatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        AppLogger.shared.info("submitSession called — raw length: \(session.rawText.count), trimmed length: \(trimmed.count)")
         guard !trimmed.isEmpty else {
-            AppLogger.shared.warning("processFinalText — trimmed text is empty, hiding panel")
+            AppLogger.shared.warning("submitSession — trimmed text is empty, hiding panel")
             floatingPanel.hide()
-            recordingStart = nil
             return
         }
 
-        pendingRawText = trimmed
-        pendingDuration = recordingStart.map { Date().timeIntervalSince($0) } ?? 0
-        recordingStart = nil
+        session.duration = Date().timeIntervalSince(session.startDate)
 
         // Dictionary replacements apply to the text sent onward; history keeps the true ASR output.
-        let applyReplacements: (String) -> String = UserDefaults.standard.dictionaryDirectReplacement
+        let applyReplacements: (String) -> String = session.dictionaryDirectReplacement
             ? DictionaryStore.shared.applyReplacements(to:)
             : { $0 }
 
-        let keep = UserDefaults.standard.copyToClipboard
-        if UserDefaults.standard.llmEnabled && llmRefiner.isConfigured {
+        if session.llmEnabled && llmRefiner.isConfigured {
             AppLogger.shared.info("LLM enabled and configured — starting refinement")
             floatingPanel.setText("Refining…")
-            llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated))
+            session.submittedText = trimmed
+            pendingSession = session
+            llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated), requestID: session.id)
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
             floatingPanel.hide()
-            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: keep, sendReturn: UserDefaults.standard.autoSend)
-            recordHistory(raw: trimmed, refined: nil)
+            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+            recordHistory(raw: trimmed, refined: nil, session: session)
         }
     }
 
-    private func recordHistory(raw: String, refined: String?) {
+    private func recordHistory(raw: String, refined: String?, session: DictationSession) {
         let record = DictationRecord(
             date: Date(),
-            durationSeconds: pendingDuration,
+            durationSeconds: session.duration,
             rawText: raw,
             refinedText: refined,
-            language: LanguageManager.shared.current.rawValue
+            language: session.language
         )
         HistoryStore.shared.add(record)
     }
@@ -429,29 +483,41 @@ extension AppDelegate: NSMenuDelegate {
 // MARK: - SpeechRecognizerDelegate
 
 extension AppDelegate: SpeechRecognizerDelegate {
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult) {
-        rawText = result.text
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult, sessionID: UUID) {
+        guard var session = activeSession, session.id == sessionID, !session.submitted else { return }
+        session.rawText = result.text
+        activeSession = session
         floatingPanel.setText(result.text)
         AppLogger.shared.debug("Partial result: \(result.text)", sensitive: true)
     }
 
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult) {
-        rawText = result.text
-        annotatedText = result.annotatedText
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFinishWithResult result: TranscriptionResult, sessionID: UUID) {
+        guard var session = activeSession, session.id == sessionID, !session.submitted else {
+            AppLogger.shared.info("Dropped stale final result from a previous session")
+            return
+        }
+        session.rawText = result.text
+        session.annotatedText = result.annotatedText
+        activeSession = session
         floatingPanel.setText(result.text)
         AppLogger.shared.info("Final result: \(result.text)", sensitive: true)
         AppLogger.shared.info("Annotated result: \(result.annotatedText)", sensitive: true)
-        processFinalText()
+        submitSession(sessionID)
     }
 
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error) {
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error, sessionID: UUID) {
+        guard activeSession?.id == sessionID else {
+            AppLogger.shared.debug("Dropped stale recognition error from a previous session: \(error.localizedDescription)")
+            return
+        }
         AppLogger.shared.error("Speech recognition error: \(error.localizedDescription)")
         if isHotkeyHeld {
             floatingPanel.setText("Error: \(error.localizedDescription)")
         }
     }
 
-    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float) {
+    func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float, sessionID: UUID) {
+        guard activeSession?.id == sessionID else { return }
         floatingPanel.setWaveformRMS(CGFloat(rms))
     }
 }
@@ -459,29 +525,38 @@ extension AppDelegate: SpeechRecognizerDelegate {
 // MARK: - LLMRefinerDelegate
 
 extension AppDelegate: LLMRefinerDelegate {
-    func llmRefinerDidStart(_ refiner: LLMRefiner) {
+    func llmRefinerDidStart(_ refiner: LLMRefiner, requestID: UUID) {
+        guard pendingSession?.id == requestID else { return }
         AppLogger.shared.info("LLM refinement started")
     }
 
-    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String) {
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String, requestID: UUID) {
         // Show tokens as they arrive — turns a multi-second wait into live feedback.
+        guard pendingSession?.id == requestID else { return }
         floatingPanel.setText(text)
     }
 
-    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String) {
+    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String, requestID: UUID) {
+        guard let session = pendingSession, session.id == requestID else {
+            AppLogger.shared.info("Dropped stale LLM result from a previous session")
+            return
+        }
+        pendingSession = nil
         AppLogger.shared.info("LLM refinement finished — result: \(text)", sensitive: true)
         floatingPanel.hide()
-        TextInjector.shared.inject(text: text, keepInClipboard: UserDefaults.standard.copyToClipboard, sendReturn: UserDefaults.standard.autoSend)
-        recordHistory(raw: pendingRawText, refined: text)
+        TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+        recordHistory(raw: session.submittedText, refined: text, session: session)
     }
 
-    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error) {
+    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID) {
+        guard let session = pendingSession, session.id == requestID else { return }
+        pendingSession = nil
         AppLogger.shared.error("LLM refinement failed: \(error.localizedDescription)")
         floatingPanel.hide()
-        let fallback = UserDefaults.standard.dictionaryDirectReplacement
-            ? DictionaryStore.shared.applyReplacements(to: pendingRawText)
-            : pendingRawText
-        TextInjector.shared.inject(text: fallback, keepInClipboard: UserDefaults.standard.copyToClipboard, sendReturn: UserDefaults.standard.autoSend)
-        recordHistory(raw: pendingRawText, refined: nil)
+        let fallback = session.dictionaryDirectReplacement
+            ? DictionaryStore.shared.applyReplacements(to: session.submittedText)
+            : session.submittedText
+        TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+        recordHistory(raw: session.submittedText, refined: nil, session: session)
     }
 }

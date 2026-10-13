@@ -2,15 +2,15 @@ import Foundation
 
 @MainActor
 protocol LLMRefinerDelegate: AnyObject {
-    func llmRefinerDidStart(_ refiner: LLMRefiner)
-    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String)
-    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error)
+    func llmRefinerDidStart(_ refiner: LLMRefiner, requestID: UUID)
+    func llmRefiner(_ refiner: LLMRefiner, didFinishWith text: String, requestID: UUID)
+    func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID)
     /// Streamed in-progress text while the model is generating (stream: true).
-    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String)
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String, requestID: UUID)
 }
 
 extension LLMRefinerDelegate {
-    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String) {}
+    func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String, requestID: UUID) {}
 }
 
 @MainActor
@@ -41,20 +41,28 @@ final class LLMRefiner {
         self.apiKeyOverride = apiKeyOverride
     }
 
-    func refine(text: String) {
+    /// requestID binds every callback of this request to the dictation
+    /// session that issued it — the delegate drops callbacks whose id no
+    /// longer matches its current session.
+    func refine(text: String, requestID: UUID) {
         AppLogger.shared.info("LLMRefiner.refine called — provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
+        // A new request supersedes one still in flight: cancel it so its late
+        // callbacks can't clobber the new session's result. Cancellation is
+        // not instant, so the delegate must still check requestID.
+        task?.cancel()
+        task = nil
         guard isConfigured else {
             AppLogger.shared.warning("LLMRefiner not configured — skipping refinement")
-            delegate?.llmRefiner(self, didFinishWith: text)
+            delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
             return
         }
 
-        delegate?.llmRefinerDidStart(self)
+        delegate?.llmRefinerDidStart(self, requestID: requestID)
 
         let urlString = config.baseURL.hasSuffix("/") ? config.baseURL + "chat/completions" : config.baseURL + "/chat/completions"
         guard let url = URL(string: urlString) else {
             AppLogger.shared.error("Invalid URL: \(urlString)")
-            delegate?.llmRefiner(self, didFinishWith: text)
+            delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
             return
         }
 
@@ -114,7 +122,7 @@ final class LLMRefiner {
                         default:
                             message = "LLM request failed with status \(httpResponse.statusCode)."
                         }
-                        self.delegate?.llmRefiner(self, didFailWith: NSError(domain: "LLMRefiner", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message]))
+                        self.delegate?.llmRefiner(self, didFailWith: NSError(domain: "LLMRefiner", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message]), requestID: requestID)
                         return
                     }
                 }
@@ -135,22 +143,22 @@ final class LLMRefiner {
                           let delta = first["delta"] as? [String: Any],
                           let content = delta["content"] as? String else { continue }
                     accumulated += content
-                    self.delegate?.llmRefiner(self, didStreamPartial: accumulated)
+                    self.delegate?.llmRefiner(self, didStreamPartial: accumulated, requestID: requestID)
                 }
 
                 let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else {
                     AppLogger.shared.warning("LLM stream completed with empty content — using raw text")
-                    self.delegate?.llmRefiner(self, didFinishWith: text)
+                    self.delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
                     return
                 }
                 AppLogger.shared.info("LLM response parsed successfully")
-                self.delegate?.llmRefiner(self, didFinishWith: trimmed)
+                self.delegate?.llmRefiner(self, didFinishWith: trimmed, requestID: requestID)
             } catch is CancellationError {
                 AppLogger.shared.info("LLM request canceled")
             } catch {
                 AppLogger.shared.error("LLM request error: \(error.localizedDescription)")
-                self.delegate?.llmRefiner(self, didFailWith: error)
+                self.delegate?.llmRefiner(self, didFailWith: error, requestID: requestID)
             }
         }
     }
