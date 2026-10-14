@@ -57,29 +57,12 @@ final class DictionaryStore: ObservableObject {
 
     /// Appended to the LLM system prompt when entries exist.
     func promptFragment() -> String {
-        guard !entries.isEmpty else { return "" }
-        var lines = ["", "Custom vocabulary (prefer these exact forms when the audio suggests them):"]
-        for entry in entries {
-            var line = "- \(entry.term)"
-            if let replacement = entry.replacement, !replacement.isEmpty, replacement != entry.term {
-                line += " → \(replacement)"
-            }
-            if let reading = entry.reading, !reading.isEmpty {
-                line += " (reading: \(reading))"
-            }
-            lines.append(line)
-        }
-        return lines.joined(separator: "\n")
+        DictionaryRules.promptFragment(entries: entries)
     }
 
     /// Literal case-insensitive term → replacement applied to raw ASR text.
     func applyReplacements(to text: String) -> String {
-        var result = text
-        for entry in entries {
-            guard let replacement = entry.replacement, !replacement.isEmpty, replacement != entry.term else { continue }
-            result = result.replacingOccurrences(of: entry.term, with: replacement, options: .caseInsensitive)
-        }
-        return result
+        DictionaryRules.applyReplacements(to: text, entries: entries)
     }
 
     // MARK: - Persistence
@@ -108,5 +91,36 @@ final class DictionaryStore: ObservableObject {
         } catch {
             AppLogger.shared.error("Failed to save dictionary: \(error.localizedDescription)")
         }
+    }
+}
+
+/// Pure matching/formatting rules over dictionary entries, kept separate from
+/// the persisted store so they can be exercised without touching disk.
+enum DictionaryRules {
+    /// Appended to the LLM system prompt when entries exist.
+    static func promptFragment(entries: [DictionaryEntry]) -> String {
+        guard !entries.isEmpty else { return "" }
+        var lines = ["", "Custom vocabulary (prefer these exact forms when the audio suggests them):"]
+        for entry in entries {
+            var line = "- \(entry.term)"
+            if let replacement = entry.replacement, !replacement.isEmpty, replacement != entry.term {
+                line += " → \(replacement)"
+            }
+            if let reading = entry.reading, !reading.isEmpty {
+                line += " (reading: \(reading))"
+            }
+            lines.append(line)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Literal case-insensitive term → replacement applied to raw ASR text.
+    static func applyReplacements(to text: String, entries: [DictionaryEntry]) -> String {
+        var result = text
+        for entry in entries {
+            guard let replacement = entry.replacement, !replacement.isEmpty, replacement != entry.term else { continue }
+            result = result.replacingOccurrences(of: entry.term, with: replacement, options: .caseInsensitive)
+        }
+        return result
     }
 }
