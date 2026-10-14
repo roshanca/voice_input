@@ -57,6 +57,13 @@ extension UserDefaults {
         set { set(newValue, forKey: Keys.dictionaryDirectReplacement) }
     }
 
+    /// Legacy accessor: raw scalar hotkey payload. Superseded by
+    /// `dictationHotkeyBindings` and kept in sync with its first binding.
+    var hotkeyData: Data? {
+        get { data(forKey: Keys.hotkeyData) }
+        set { set(newValue, forKey: Keys.hotkeyData) }
+    }
+
     /// Dictation hotkey bindings. Reads migrate the legacy scalar `hotkeyData`
     /// into a one-element `.hold` list; writes keep `hotkeyData` in sync with
     /// the first binding so older builds still see a valid hotkey.
@@ -67,7 +74,7 @@ extension UserDefaults {
                !decoded.isEmpty {
                 return decoded
             }
-            if let data = data(forKey: Keys.hotkeyData),
+            if let data = hotkeyData,
                let hotkey = try? JSONDecoder().decode(Hotkey.self, from: data) {
                 let migrated = [HotkeyBinding(hotkey: hotkey, behavior: .hold)]
                 self.dictationHotkeyBindings = migrated
@@ -78,7 +85,7 @@ extension UserDefaults {
         set {
             set(try? JSONEncoder().encode(newValue), forKey: Keys.dictationHotkeyBindings)
             if let first = newValue.first {
-                set(try? JSONEncoder().encode(first.hotkey), forKey: Keys.hotkeyData)
+                hotkeyData = try? JSONEncoder().encode(first.hotkey)
             }
         }
     }

@@ -49,8 +49,9 @@ final class HotkeyRoutingTests: XCTestCase {
     func testFnKeyMatchesFlagsChangedOnly() {
         let fn = Hotkey.fnKey
         XCTAssertTrue(fn.matches(event: flagsChanged(keyCode: 63, flags: .maskSecondaryFn)!))
-        let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 63, keyDown: true)!
-        XCTAssertFalse(fn.matches(event: keyDown))
+        // Same event family, different keycode — note a CGEvent for Fn can
+        // never be keyDown: the system always reports it as flagsChanged.
+        XCTAssertFalse(fn.matches(event: flagsChanged(keyCode: 62, flags: .maskSecondaryFn)!))
     }
 
     func testFKeyMatchesKeyDownAndKeyUpNotFlagsChanged() {
@@ -58,6 +59,7 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertTrue(f5.matches(event: CGEvent(keyboardEventSource: nil, virtualKey: 96, keyDown: true)!))
         XCTAssertTrue(f5.matches(event: CGEvent(keyboardEventSource: nil, virtualKey: 96, keyDown: false)!))
         XCTAssertFalse(f5.matches(event: flagsChanged(keyCode: 96, flags: [])!))
+        XCTAssertFalse(f5.matches(event: CGEvent(keyboardEventSource: nil, virtualKey: 97, keyDown: true)!))
     }
 
     func testIsPressPhases() {
