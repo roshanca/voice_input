@@ -226,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
         }
-        hotkeyManager.update(hotkey: HotkeyManager.saved)
+        hotkeyManager.update(dictation: HotkeyManager.savedDictation)
 
         if !hotkeyManager.isTapActive {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
