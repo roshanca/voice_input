@@ -73,6 +73,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLogger.shared.info("App terminating")
         HistoryStore.shared.flush()
         HotkeyManager.shared.stop()
+        // Cancel outstanding work, then give it a bounded runloop window to
+        // really unwind — cancelling alone does not mean resources are free.
+        let taskStore = TrackedTaskStore.shared
+        taskStore.cancelAll()
+        let deadline = Date().addingTimeInterval(1)
+        while !taskStore.outstanding.isEmpty, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        if !taskStore.outstanding.isEmpty {
+            AppLogger.shared.warning("Exiting with tasks still unwinding: \(taskStore.outstanding.joined(separator: ", "))")
+        }
     }
 
     // MARK: - Images
@@ -363,7 +374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingPanel.setText("")
         floatingPanel.show()
 
-        Task {
+        let startTask = Task {
             do {
                 try await speechRecognizer.startRecording(sessionID: session.id)
                 AppLogger.shared.info("Speech recording started successfully")
@@ -387,6 +398,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        // Startup can still be suspended on permission prompts when a newer
+        // dictation supersedes it — track it so its exit is observable rather
+        // than dropped.
+        TrackedTaskStore.shared.track(startTask, label: "recording-start")
     }
 
     func hotkeyReleased() {
