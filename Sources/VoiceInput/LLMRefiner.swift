@@ -99,7 +99,7 @@ final class LLMRefiner {
         request.timeoutInterval = 15
 
         AppLogger.shared.info("Sending streaming LLM request to \(urlString)")
-        task = Task { [weak self] in
+        let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let (bytes, response) = try await URLSession.shared.bytes(for: request)
@@ -161,8 +161,15 @@ final class LLMRefiner {
                 self.delegate?.llmRefiner(self, didFailWith: error, requestID: requestID)
             }
         }
+        task = requestTask
+        // A cancelled request keeps running until its awaits unwind — track
+        // it so shutdown (and any future caller reusing the connection) can
+        // observe the real exit instead of assuming cancel() finished it.
+        TrackedTaskStore.shared.track(requestTask, label: "llm-refine")
     }
 
+    /// Cancellation is a request, not completion: the tracked task stays
+    /// observable in TrackedTaskStore until its body actually exits.
     func cancel() {
         task?.cancel()
         task = nil
