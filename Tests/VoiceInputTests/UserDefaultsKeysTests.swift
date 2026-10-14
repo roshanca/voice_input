@@ -1,0 +1,72 @@
+import XCTest
+@testable import VoiceInput
+
+/// Exercises the UserDefaults key accessors against an isolated suite so the
+/// app's real preferences are never touched.
+final class UserDefaultsKeysTests: XCTestCase {
+    func testSelectedLanguageDefaultsToSimplifiedChinese() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.selectedLanguage, "zh-CN")
+        isolated.defaults.selectedLanguage = "en-US"
+        XCTAssertEqual(isolated.defaults.selectedLanguage, "en-US")
+    }
+
+    func testDictionaryDirectReplacementDefaultsToTrue() {
+        let isolated = IsolatedDefaults()
+        XCTAssertTrue(isolated.defaults.dictionaryDirectReplacement)
+        isolated.defaults.dictionaryDirectReplacement = false
+        XCTAssertFalse(isolated.defaults.dictionaryDirectReplacement)
+    }
+
+    func testBooleanFlagsDefaultToFalse() {
+        let isolated = IsolatedDefaults()
+        XCTAssertFalse(isolated.defaults.llmEnabled)
+        XCTAssertFalse(isolated.defaults.copyToClipboard)
+        XCTAssertFalse(isolated.defaults.autoSend)
+        XCTAssertFalse(isolated.defaults.interactionSounds)
+        XCTAssertNil(isolated.defaults.selectedMicUID)
+        XCTAssertNil(isolated.defaults.hotkeyData)
+    }
+
+    func testSelectedConfigIDRoundTrip() {
+        let isolated = IsolatedDefaults()
+        XCTAssertNil(isolated.defaults.selectedConfigID)
+        let id = UUID()
+        isolated.defaults.selectedConfigID = id
+        XCTAssertEqual(isolated.defaults.selectedConfigID, id)
+        isolated.defaults.selectedConfigID = nil
+        XCTAssertNil(isolated.defaults.selectedConfigID)
+    }
+
+    func testCurrentLLMConfigNilWhenNoProfiles() {
+        let isolated = IsolatedDefaults()
+        XCTAssertNil(isolated.defaults.currentLLMConfig)
+    }
+
+    func testLLMConfigsRoundTripBlanksAPIKey() {
+        let isolated = IsolatedDefaults()
+        let config = LLMConfig(
+            id: UUID(), name: "Local", providerType: .ollama,
+            baseURL: "http://localhost:11434/v1", apiKey: "secret", model: "llama3.1"
+        )
+        isolated.defaults.llmConfigs = [config]
+        let decoded = isolated.defaults.llmConfigs
+        XCTAssertEqual(decoded.count, 1)
+        XCTAssertEqual(decoded.first?.id, config.id)
+        // The API key is never persisted — it lives in the Keychain.
+        XCTAssertEqual(decoded.first?.apiKey, "")
+    }
+
+    func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
+        let isolated = IsolatedDefaults()
+        let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,
+                              baseURL: "http://a", model: "m1")
+        let second = LLMConfig(id: UUID(), name: "B", providerType: .openAICompatible,
+                               baseURL: "http://b", model: "m2")
+        isolated.defaults.llmConfigs = [first, second]
+
+        XCTAssertEqual(isolated.defaults.currentLLMConfig?.id, first.id)
+        isolated.defaults.selectedConfigID = second.id
+        XCTAssertEqual(isolated.defaults.currentLLMConfig?.id, second.id)
+    }
+}

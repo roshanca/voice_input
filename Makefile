@@ -11,7 +11,7 @@ ICONSET_DIR = $(BUILD_DIR)/AppIcon.iconset
 # Auto-stamped into the bundle's CFBundleVersion on every build.
 BUILD_VERSION = $(shell date +%Y%m%d.%H%M)
 
-.PHONY: build run install clean
+.PHONY: build run install clean test
 
 build:
 	@echo "Building $(APP_NAME)..."
@@ -43,6 +43,9 @@ build:
 		--entitlements VoiceInput.entitlements \
 		$(APP_BUNDLE)
 	@echo "Build complete: $(APP_BUNDLE)"
+
+test:
+	swift test
 
 run: build
 	open $(APP_BUNDLE)
