@@ -5,6 +5,75 @@ import Carbon
 final class TextInjector {
     static let shared = TextInjector()
 
+    /// Full backup of the pasteboard: every item, every declared type.
+    private struct ClipboardSnapshot {
+        let items: [[String: Data]]
+
+        /// Declared types whose data is supplied lazily by the source app
+        /// (file promises and promise metadata). Raw Data captured for them
+        /// does not reconstruct a working promise on restore, so a clipboard
+        /// containing them cannot be fully snapshotted. Promise types surface
+        /// under several native identifiers — including dynamic UTIs for the
+        /// legacy NSFilesPromisePboardType — so the canonical
+        /// NSFilePromiseReceiver.readableDraggedTypes list is the base.
+        private static let unrestorableTypes: Set<String> = {
+            var types = Set(NSFilePromiseReceiver.readableDraggedTypes)
+            types.formUnion([
+                "com.apple.pasteboard.promised-file-url",
+                "com.apple.pasteboard.promised-file-content-type",
+                "com.apple.pasteboard.NSFilesPromisePboardType",
+                "com.apple.NSFilePromiseItemMetaData",
+                "NSFilesPromisePboardType",
+                "Apple files promise pasteboard type",
+                "com.apple.pasteboard.file-promise",
+                "com.apple.pasteboard.file-promise-destination",
+            ])
+            return types
+        }()
+
+        /// Returns nil when any declared type cannot be materialized — a
+        /// partial snapshot would silently lose data on restore.
+        static func capture(from pasteboard: NSPasteboard) -> ClipboardSnapshot? {
+            var items: [[String: Data]] = []
+            for item in pasteboard.pasteboardItems ?? [] {
+                var types: [String: Data] = [:]
+                for type in item.types {
+                    if unrestorableTypes.contains(type.rawValue) { return nil }
+                    guard let data = item.data(forType: type) else { return nil }
+                    types[type.rawValue] = data
+                }
+                items.append(types)
+            }
+            return ClipboardSnapshot(items: items)
+        }
+
+        /// Pasteboard items reconstructed from the snapshot, ready for
+        /// `writeObjects`. Built ahead of the ownership check so the
+        /// check-to-clear window stays minimal.
+        func pasteboardItems() -> [NSPasteboardItem] {
+            items.map { types in
+                let item = NSPasteboardItem()
+                for (type, data) in types {
+                    item.setData(data, forType: NSPasteboard.PasteboardType(type))
+                }
+                return item
+            }
+        }
+    }
+
+    /// The latest write whose delayed restore hasn't run yet.
+    private struct PendingRestore {
+        let id = UUID()
+        let changeCount: Int
+        /// A keepInClipboard write leaves its result on the clipboard, so a
+        /// later injection must snapshot that result rather than reuse the
+        /// earlier pre-dictation snapshot.
+        let requiresRestore: Bool
+        let snapshot: ClipboardSnapshot
+    }
+
+    private var pendingRestore: PendingRestore?
+
     func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, completion: (() -> Void)? = nil) {
         AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard), sendReturn: \(sendReturn)")
 
@@ -18,12 +87,60 @@ final class TextInjector {
         }
 
         let pasteboard = NSPasteboard.general
-        let oldContent = pasteboard.string(forType: .string)
-        AppLogger.shared.debug("Saved old clipboard content — length: \(oldContent?.count ?? 0)")
 
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        AppLogger.shared.info("Set new text to clipboard")
+        var snapshot: ClipboardSnapshot?
+        var snapshotBaseCount: Int?
+        if let pending = pendingRestore, pending.requiresRestore,
+           pasteboard.changeCount == pending.changeCount {
+            snapshot = pending.snapshot
+            snapshotBaseCount = pending.changeCount
+            AppLogger.shared.debug("Clipboard still holds previous injection — reusing its pre-dictation snapshot")
+        } else {
+            // Capture must be complete and the clipboard must stay untouched
+            // while it runs — a partial or stale snapshot can't be restored.
+            for _ in 0..<2 {
+                let countBeforeCapture = pasteboard.changeCount
+                guard let captured = ClipboardSnapshot.capture(from: pasteboard) else { break }
+                guard pasteboard.changeCount == countBeforeCapture else { continue }
+                snapshot = captured
+                snapshotBaseCount = countBeforeCapture
+                break
+            }
+            if let snapshot {
+                AppLogger.shared.debug("Saved old clipboard content — items: \(snapshot.items.count)")
+            }
+        }
+
+        guard let snapshot, let snapshotBaseCount else {
+            AppLogger.shared.error("Could not fully snapshot the clipboard — preserving its contents, skipping injection")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            return
+        }
+
+        // The snapshot is only valid while the clipboard stays untouched —
+        // re-check immediately before clearing so a copy that landed during
+        // capture/setup aborts the injection instead of being destroyed.
+        guard pasteboard.changeCount == snapshotBaseCount else {
+            AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            return
+        }
+
+        // clearContents returns the ownership count for the new contents.
+        // Check ownership before and after setString: a competing copy that
+        // lands between the clear and the write must not be overwritten.
+        let writeChangeCount = pasteboard.clearContents()
+        guard pasteboard.changeCount == writeChangeCount,
+              pasteboard.setString(text, forType: .string),
+              pasteboard.changeCount == writeChangeCount else {
+            AppLogger.shared.error("Lost clipboard ownership while writing — aborting injection")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            return
+        }
+
+        let restore = PendingRestore(changeCount: writeChangeCount, requiresRestore: !keepInClipboard, snapshot: snapshot)
+        pendingRestore = restore
+        AppLogger.shared.info("Set new text to clipboard (changeCount: \(writeChangeCount))")
 
         let pasteDelay = wasCJK ? 0.25 : 0.15
         let restoreDelay: TimeInterval = 0.35
@@ -37,15 +154,24 @@ final class TextInjector {
 
             AppLogger.shared.debug("Scheduling clipboard restore in \(restoreDelay)s")
             DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
+                if self.pendingRestore?.id == restore.id {
+                    self.pendingRestore = nil
+                }
+
                 if keepInClipboard {
                     AppLogger.shared.info("Keeping result in clipboard (copyToClipboard enabled)")
-                    pasteboard.clearContents()
-                    pasteboard.setString(text, forType: .string)
                 } else {
+                    // Build the items and log before the ownership check so the
+                    // check-to-clear window is as small as possible.
+                    let restoredItems = snapshot.pasteboardItems()
                     AppLogger.shared.info("Restoring old clipboard content")
-                    pasteboard.clearContents()
-                    if let oldContent {
-                        pasteboard.setString(oldContent, forType: .string)
+                    if pasteboard.changeCount == writeChangeCount {
+                        pasteboard.clearContents()
+                        if !restoredItems.isEmpty, !pasteboard.writeObjects(restoredItems) {
+                            AppLogger.shared.error("writeObjects failed while restoring clipboard")
+                        }
+                    } else {
+                        AppLogger.shared.info("Clipboard changed since our write — preserving user's new content")
                     }
                 }
 
@@ -63,6 +189,15 @@ final class TextInjector {
                 }
             }
         }
+    }
+
+    /// Restores the input method and invokes completion when injection is
+    /// aborted before the paste — nothing was pasted, so no Return is sent.
+    private func finishWithoutPaste(previousSource: TISInputSource?, wasCJK: Bool, completion: (() -> Void)?) {
+        if wasCJK {
+            InputMethodManager.shared.restoreInputSource(previousSource)
+        }
+        completion?()
     }
 
     /// Auto-send: press Return after the paste settles (sends the message in chat apps).
