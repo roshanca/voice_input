@@ -12,14 +12,24 @@ final class TextInjector {
         /// Declared types whose data is supplied lazily by the source app
         /// (file promises and promise metadata). Raw Data captured for them
         /// does not reconstruct a working promise on restore, so a clipboard
-        /// containing them cannot be fully snapshotted.
-        private static let unrestorableTypes: Set<String> = [
-            "com.apple.pasteboard.promised-file-url",
-            "com.apple.pasteboard.promised-file-content-type",
-            "com.apple.pasteboard.NSFilesPromisePboardType",
-            "com.apple.pasteboard.file-promise",
-            "com.apple.pasteboard.file-promise-destination",
-        ]
+        /// containing them cannot be fully snapshotted. Promise types surface
+        /// under several native identifiers — including dynamic UTIs for the
+        /// legacy NSFilesPromisePboardType — so the canonical
+        /// NSFilePromiseReceiver.readableDraggedTypes list is the base.
+        private static let unrestorableTypes: Set<String> = {
+            var types = Set(NSFilePromiseReceiver.readableDraggedTypes)
+            types.formUnion([
+                "com.apple.pasteboard.promised-file-url",
+                "com.apple.pasteboard.promised-file-content-type",
+                "com.apple.pasteboard.NSFilesPromisePboardType",
+                "com.apple.NSFilePromiseItemMetaData",
+                "NSFilesPromisePboardType",
+                "Apple files promise pasteboard type",
+                "com.apple.pasteboard.file-promise",
+                "com.apple.pasteboard.file-promise-destination",
+            ])
+            return types
+        }()
 
         /// Returns nil when any declared type cannot be materialized — a
         /// partial snapshot would silently lose data on restore.
@@ -79,9 +89,11 @@ final class TextInjector {
         let pasteboard = NSPasteboard.general
 
         var snapshot: ClipboardSnapshot?
+        var snapshotBaseCount: Int?
         if let pending = pendingRestore, pending.requiresRestore,
            pasteboard.changeCount == pending.changeCount {
             snapshot = pending.snapshot
+            snapshotBaseCount = pending.changeCount
             AppLogger.shared.debug("Clipboard still holds previous injection — reusing its pre-dictation snapshot")
         } else {
             // Capture must be complete and the clipboard must stay untouched
@@ -91,6 +103,7 @@ final class TextInjector {
                 guard let captured = ClipboardSnapshot.capture(from: pasteboard) else { break }
                 guard pasteboard.changeCount == countBeforeCapture else { continue }
                 snapshot = captured
+                snapshotBaseCount = countBeforeCapture
                 break
             }
             if let snapshot {
@@ -98,17 +111,27 @@ final class TextInjector {
             }
         }
 
-        guard let snapshot else {
+        guard let snapshot, let snapshotBaseCount else {
             AppLogger.shared.error("Could not fully snapshot the clipboard — preserving its contents, skipping injection")
             finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
             return
         }
 
-        // clearContents returns the ownership count for the new contents;
-        // any competing write before or during setString is detected by the
-        // count check below.
+        // The snapshot is only valid while the clipboard stays untouched —
+        // re-check immediately before clearing so a copy that landed during
+        // capture/setup aborts the injection instead of being destroyed.
+        guard pasteboard.changeCount == snapshotBaseCount else {
+            AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            return
+        }
+
+        // clearContents returns the ownership count for the new contents.
+        // Check ownership before and after setString: a competing copy that
+        // lands between the clear and the write must not be overwritten.
         let writeChangeCount = pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string),
+        guard pasteboard.changeCount == writeChangeCount,
+              pasteboard.setString(text, forType: .string),
               pasteboard.changeCount == writeChangeCount else {
             AppLogger.shared.error("Lost clipboard ownership while writing — aborting injection")
             finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
