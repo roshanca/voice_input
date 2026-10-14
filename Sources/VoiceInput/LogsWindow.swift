@@ -4,6 +4,7 @@ import Cocoa
 final class LogsWindowController: NSWindowController {
     private let textView = NSTextView()
     private let scrollView = NSScrollView()
+    private let exportButton = NSButton(title: "Export Diagnostics…", target: nil, action: nil)
     private var refreshTimer: Timer?
 
     init() {
@@ -49,15 +50,37 @@ final class LogsWindowController: NSWindowController {
         textView.autoresizingMask = [.width, .height]
         textView.frame = scrollView.bounds
 
+        let bar = NSView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+
+        exportButton.bezelStyle = .rounded
+        exportButton.target = self
+        exportButton.action = #selector(exportDiagnostics)
+        exportButton.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(exportButton)
+
         contentView.addSubview(scrollView)
+        contentView.addSubview(bar)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+            scrollView.bottomAnchor.constraint(equalTo: bar.topAnchor),
+
+            bar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            exportButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+            exportButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 40)
         ])
 
         reload()
+    }
+
+    @objc private func exportDiagnostics() {
+        DiagnosticsExporter.exportViaSavePanel()
     }
 
     private func reload() {
