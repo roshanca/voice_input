@@ -11,6 +11,9 @@ extension UserDefaults {
         static let interactionSounds = "interactionSounds"
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
+        static let dictationHotkeyBindings = "dictationHotkeyBindings"
+        // Legacy key: single scalar hotkey, superseded by the binding list
+        // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
         // Legacy keys for migration
         static let legacyLLMBaseURL = "llmBaseURL"
@@ -54,9 +57,30 @@ extension UserDefaults {
         set { set(newValue, forKey: Keys.dictionaryDirectReplacement) }
     }
 
-    var hotkeyData: Data? {
-        get { data(forKey: Keys.hotkeyData) }
-        set { set(newValue, forKey: Keys.hotkeyData) }
+    /// Dictation hotkey bindings. Reads migrate the legacy scalar `hotkeyData`
+    /// into a one-element `.hold` list; writes keep `hotkeyData` in sync with
+    /// the first binding so older builds still see a valid hotkey.
+    var dictationHotkeyBindings: [HotkeyBinding] {
+        get {
+            if let data = data(forKey: Keys.dictationHotkeyBindings),
+               let decoded = try? JSONDecoder().decode([HotkeyBinding].self, from: data),
+               !decoded.isEmpty {
+                return decoded
+            }
+            if let data = data(forKey: Keys.hotkeyData),
+               let hotkey = try? JSONDecoder().decode(Hotkey.self, from: data) {
+                let migrated = [HotkeyBinding(hotkey: hotkey, behavior: .hold)]
+                self.dictationHotkeyBindings = migrated
+                return migrated
+            }
+            return [HotkeyBinding(hotkey: .fnKey, behavior: .hold)]
+        }
+        set {
+            set(try? JSONEncoder().encode(newValue), forKey: Keys.dictationHotkeyBindings)
+            if let first = newValue.first {
+                set(try? JSONEncoder().encode(first.hotkey), forKey: Keys.hotkeyData)
+            }
+        }
     }
 
     var llmConfigs: [LLMConfig] {

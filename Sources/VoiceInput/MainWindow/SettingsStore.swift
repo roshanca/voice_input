@@ -34,11 +34,14 @@ final class SettingsStore: ObservableObject {
     @Published var dictionaryDirectReplacement: Bool {
         didSet { UserDefaults.standard.dictionaryDirectReplacement = dictionaryDirectReplacement }
     }
+    /// The first dictation binding's hotkey — the settings UI edits a single
+    /// binding today, but persistence already stores a binding list.
     @Published var hotkey: Hotkey {
         didSet {
             guard hotkey != oldValue else { return }
-            HotkeyManager.persist(hotkey)
-            HotkeyManager.shared.update(hotkey: hotkey)
+            let bindings = [HotkeyBinding(hotkey: hotkey, behavior: .hold)]
+            HotkeyManager.persistDictation(bindings)
+            HotkeyManager.shared.update(dictation: bindings)
         }
     }
 
@@ -59,7 +62,7 @@ final class SettingsStore: ObservableObject {
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
-        hotkey = HotkeyManager.saved
+        hotkey = HotkeyManager.savedDictation.first?.hotkey ?? .fnKey
         llmConfigs = defaults.llmConfigs
         selectedConfigID = defaults.selectedConfigID
     }
