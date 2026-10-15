@@ -9,6 +9,8 @@ final class HotkeyManager {
 
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
+    /// Esc pressed while a dictation session is active (cancel request).
+    var onEscape: (() -> Void)?
     /// Called whenever the tap becomes active/inactive (menu bar icon dimming).
     var onTapStateChange: ((Bool) -> Void)?
 
@@ -19,6 +21,13 @@ final class HotkeyManager {
     /// Nonisolated mirror of the routed bindings for the C event-tap callback.
     /// Updated only in `update(dictation:)` (main actor); read on the tap thread.
     nonisolated(unsafe) fileprivate static var activeRoutedBindings: [RoutedBinding] = []
+    /// Nonisolated mirror of "a dictation session is active", consulted by
+    /// the tap callback on every Esc event: while false Esc passes through
+    /// to the focused app untouched.
+    nonisolated(unsafe) fileprivate static var interceptEscape = false
+    /// Which side owns the current physical Esc press — decided at keyDown,
+    /// held until keyUp so auto-repeats never switch owners mid-press.
+    nonisolated(unsafe) fileprivate static var escapeOwnership: EscapeRouting.PressOwnership = .none
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -47,6 +56,12 @@ final class HotkeyManager {
         start()
     }
 
+    /// Called by the delegate whenever session activity changes so the tap's
+    /// `interceptEscape` mirror is current the next time Esc arrives.
+    func setEscapeInterception(_ active: Bool) {
+        Self.interceptEscape = active
+    }
+
     func start() {
         stop()
         guard !dictationBindings.isEmpty else {
@@ -63,14 +78,12 @@ final class HotkeyManager {
 
         // Union of every binding's event family: modifier-only hotkeys arrive
         // as flagsChanged, ordinary keys as keyDown/keyUp.
-        var eventMask: CGEventMask = 0
-        for binding in dictationBindings {
-            if binding.hotkey.usesFlagsChanged {
-                eventMask |= CGEventMask(1 << CGEventType.flagsChanged.rawValue)
-            } else {
-                eventMask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
-                    | CGEventMask(1 << CGEventType.keyUp.rawValue)
-            }
+        // keyDown/keyUp are always in the mask for Esc cancellation — the
+        // push-to-talk binding itself may only need flagsChanged.
+        var eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << CGEventType.keyUp.rawValue)
+        for binding in dictationBindings where binding.hotkey.usesFlagsChanged {
+            eventMask |= CGEventMask(1 << CGEventType.flagsChanged.rawValue)
         }
 
         guard let tap = CGEvent.tapCreate(
@@ -142,6 +155,38 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
             HotkeyManager.shared.handleTapDisabled()
         }
         return Unmanaged.passUnretained(event)
+    }
+
+    // Esc is routed separately from the push-to-talk key: while a dictation
+    // session is active it cancels the session and is swallowed; with no
+    // session it passes through so the focused app's own Esc handling —
+    // and system chords like ⌘⌥⎋ — are untouched.
+    if type == .keyDown || type == .keyUp,
+       event.getIntegerValueField(.keyboardEventKeycode) == EscapeRouting.keyCode {
+        switch EscapeRouting.action(
+            type: type,
+            flags: event.flags,
+            sessionActive: HotkeyManager.interceptEscape,
+            ownership: HotkeyManager.escapeOwnership
+        ) {
+        case .consume:
+            if type == .keyDown {
+                // Only a fresh press cancels — auto-repeat keyDowns of an
+                // owned press stay swallowed but must not re-fire.
+                if HotkeyManager.escapeOwnership == .none {
+                    Task { @MainActor in
+                        HotkeyManager.shared.onEscape?()
+                    }
+                }
+                HotkeyManager.escapeOwnership = .consumed
+            } else {
+                HotkeyManager.escapeOwnership = .none
+            }
+            return nil
+        case .passThrough:
+            HotkeyManager.escapeOwnership = type == .keyDown ? .passed : .none
+            return Unmanaged.passUnretained(event)
+        }
     }
 
     // First routed binding whose hotkey matches this physical event.

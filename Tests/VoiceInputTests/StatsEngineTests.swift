@@ -7,7 +7,7 @@ final class StatsEngineTests: XCTestCase {
     private func record(daysAgo: Int, wordCount: Int = 10, duration: Double = 60) -> DictationRecord {
         let date = Calendar.current.date(byAdding: .day, value: -daysAgo, to: now)!
         let rawText = (0..<wordCount).map { "w\($0)" }.joined(separator: " ")
-        return DictationRecord(date: date, durationSeconds: duration, rawText: rawText, refinedText: nil, language: "en-US")
+        return DictationRecord(date: date, durationSeconds: duration, rawText: rawText, refinedText: nil, outputText: rawText, language: "en-US")
     }
 
     func testEmptyRecordsProduceZeroSummary() {
