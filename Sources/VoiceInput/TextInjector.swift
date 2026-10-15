@@ -1,6 +1,22 @@
 import Cocoa
 import Carbon
 
+/// How a dictated result was delivered — reported through `inject`'s
+/// completion so the caller can surface clear status feedback.
+enum InjectionOutcome {
+    /// Paste posted; Return also posted when auto-send was requested.
+    case inserted
+    /// Paste posted, but the target moved before auto-send — Return suppressed.
+    case insertedSendSuppressed(DictationTarget.Mismatch)
+    /// Nothing was sent to the target. The result was left on the clipboard
+    /// for manual pasting when `onClipboard` is true; otherwise it exists
+    /// only in History.
+    case parked(DictationTarget.Mismatch, onClipboard: Bool)
+    /// The user's clipboard could not be fully snapshotted or ownership was
+    /// lost — nothing was pasted; the result lives in History only.
+    case clipboardNotDelivered
+}
+
 @MainActor
 final class TextInjector {
     static let shared = TextInjector()
@@ -74,8 +90,17 @@ final class TextInjector {
 
     private var pendingRestore: PendingRestore?
 
-    func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, completion: (() -> Void)? = nil) {
+    func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, target: DictationTarget? = nil, completion: ((InjectionOutcome) -> Void)? = nil) {
         AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard), sendReturn: \(sendReturn)")
+
+        // Verify the recorded target before touching the clipboard or the
+        // input method — parking the result is cheap, pasting into the wrong
+        // app is not.
+        if let mismatch = Self.mismatch(for: target) {
+            AppLogger.shared.warning("Injection skipped — target mismatch: \(mismatch); parking result")
+            park(text: text, mismatch: mismatch, completion: completion)
+            return
+        }
 
         let previousSource = InputMethodManager.shared.currentSource()
         let wasCJK = InputMethodManager.shared.isCJKInputMethod()
@@ -117,9 +142,22 @@ final class TextInjector {
             return
         }
 
+        // The target is still checked once more right before the paste below —
+        // this early check only avoids clobbering the clipboard for nothing.
+        // It runs before the final ownership re-check on purpose: the AX
+        // round-trip can take a moment, and a copy landing during it must
+        // still abort the injection.
+        if let mismatch = Self.mismatch(for: target) {
+            AppLogger.shared.warning("Injection skipped — target mismatch: \(mismatch); parking result")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: nil)
+            park(text: text, mismatch: mismatch, completion: completion)
+            return
+        }
+
         // The snapshot is only valid while the clipboard stays untouched —
         // re-check immediately before clearing so a copy that landed during
-        // capture/setup aborts the injection instead of being destroyed.
+        // capture/setup or the AX validation above aborts the injection
+        // instead of being destroyed.
         guard pasteboard.changeCount == snapshotBaseCount else {
             AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
             finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
@@ -149,6 +187,23 @@ final class TextInjector {
         AppLogger.shared.debug("Scheduling paste in \(pasteDelay)s")
         DispatchQueue.main.asyncAfter(deadline: .now() + pasteDelay) { [weak self] in
             guard let self else { return }
+
+            // Focus may have moved while the paste was queued — when it did,
+            // the result stays on the clipboard for manual pasting and the
+            // scheduled restore is cancelled so it can't clobber the result.
+            if let mismatch = Self.mismatch(for: target) {
+                if self.pendingRestore?.id == restore.id {
+                    self.pendingRestore = nil
+                }
+                if wasCJK {
+                    InputMethodManager.shared.restoreInputSource(previousSource)
+                }
+                let stillOurs = pasteboard.changeCount == writeChangeCount
+                AppLogger.shared.warning("Paste aborted — target mismatch: \(mismatch); result parked on clipboard: \(stillOurs)")
+                completion?(.parked(mismatch, onClipboard: stillOurs))
+                return
+            }
+
             AppLogger.shared.info("Simulating Cmd+V paste")
             self.simulatePaste()
 
@@ -180,37 +235,78 @@ final class TextInjector {
                     DispatchQueue.main.asyncAfter(deadline: .now() + imeRestoreDelay) {
                         AppLogger.shared.info("Restoring original input method")
                         InputMethodManager.shared.restoreInputSource(previousSource)
-                        self.simulateReturnIfNeeded(sendReturn)
-                        completion?()
+                        self.simulateReturnIfNeeded(sendReturn, target: target, completion: completion)
                     }
                 } else {
-                    self.simulateReturnIfNeeded(sendReturn)
-                    completion?()
+                    self.simulateReturnIfNeeded(sendReturn, target: target, completion: completion)
                 }
             }
         }
     }
 
+    /// The clipboard could not be used safely, so nothing is sent anywhere.
+    /// The dictated text is left on the clipboard for manual pasting when
+    /// possible — it stays recoverable through History either way.
+    private func park(text: String, mismatch: DictationTarget.Mismatch, completion: ((InjectionOutcome) -> Void)?) {
+        let pasteboard = NSPasteboard.general
+        let parkCount = pasteboard.clearContents()
+        let parked = pasteboard.changeCount == parkCount
+            && pasteboard.setString(text, forType: .string)
+            && pasteboard.changeCount == parkCount
+        if parked {
+            // The parked result owns the board now — a pending restore from a
+            // previous injection would destroy it.
+            pendingRestore = nil
+            AppLogger.shared.info("Result parked on clipboard for manual paste")
+        } else {
+            AppLogger.shared.error("Could not park result on clipboard — recoverable via History")
+        }
+        completion?(.parked(mismatch, onClipboard: parked))
+    }
+
     /// Restores the input method and invokes completion when injection is
     /// aborted before the paste — nothing was pasted, so no Return is sent.
-    private func finishWithoutPaste(previousSource: TISInputSource?, wasCJK: Bool, completion: (() -> Void)?) {
+    private func finishWithoutPaste(previousSource: TISInputSource?, wasCJK: Bool, completion: ((InjectionOutcome) -> Void)?) {
         if wasCJK {
             InputMethodManager.shared.restoreInputSource(previousSource)
         }
-        completion?()
+        completion?(.clipboardNotDelivered)
+    }
+
+    /// Validates the recorded dictation target. A missing capture means the
+    /// target can never be verified, which is reported as `.unverifiable`.
+    private static func mismatch(for target: DictationTarget?, includeGeometry: Bool = true) -> DictationTarget.Mismatch? {
+        guard let target else { return .unverifiable }
+        return target.mismatch(includeGeometry: includeGeometry)
     }
 
     /// Auto-send: press Return after the paste settles (sends the message in chat apps).
-    private func simulateReturnIfNeeded(_ sendReturn: Bool) {
-        guard sendReturn else { return }
+    /// The target is verified one final time inside the delay — a focus change
+    /// between paste and Return must not submit into the new focus.
+    private func simulateReturnIfNeeded(_ sendReturn: Bool, target: DictationTarget?, completion: ((InjectionOutcome) -> Void)?) {
+        guard sendReturn else {
+            completion?(.inserted)
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Geometry is excluded here: multi-line inputs grow when the paste
+            // lands, and a moved frame is not evidence of a focus change.
+            if let mismatch = Self.mismatch(for: target, includeGeometry: false) {
+                AppLogger.shared.warning("Auto-send suppressed — target mismatch: \(mismatch)")
+                completion?(.insertedSendSuppressed(mismatch))
+                return
+            }
             AppLogger.shared.info("Auto-send: simulating Return keypress")
-            guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+            guard let source = CGEventSource(stateID: .hidSystemState) else {
+                completion?(.inserted)
+                return
+            }
             let keyReturn = CGKeyCode(36)
             let down = CGEvent(keyboardEventSource: source, virtualKey: keyReturn, keyDown: true)
             let up = CGEvent(keyboardEventSource: source, virtualKey: keyReturn, keyDown: false)
             down?.post(tap: .cghidEventTap)
             up?.post(tap: .cghidEventTap)
+            completion?(.inserted)
         }
     }
 
