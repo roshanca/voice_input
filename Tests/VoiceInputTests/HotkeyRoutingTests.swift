@@ -146,6 +146,51 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .rePaste)
     }
 
+    /// All five businesses on the same chord + behavior: the selection
+    /// actions win in translate > rewrite > dictionary order, then rePaste,
+    /// and dictation stays last so anything else can preempt it (#21).
+    func testSelectionBusinessesOutrankEverythingOnFullTie() {
+        let chord = Hotkey.chord(keyCode: 9, modifiers: [.control, .command])
+        let entries = [
+            routedBinding(chord, .hold, .dictation),
+            routedBinding(chord, .hold, .addToDictionary),
+            routedBinding(chord, .hold, .rePaste),
+            routedBinding(chord, .hold, .selectionRewrite),
+            routedBinding(chord, .hold, .selectionTranslate),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).map(\.business),
+                       [.selectionTranslate, .selectionRewrite, .addToDictionary, .rePaste, .dictation])
+    }
+
+    /// Each new business still loses to a more specific hotkey — business
+    /// priority is only the last tie-breaker.
+    func testSelectionBusinessDoesNotBeatMoreSpecificHotkey() {
+        let entries = [
+            routedBinding(.chord(keyCode: 17, modifiers: [.control, .option]), .hold, .dictation),
+            routedBinding(.fnKey, .hold, .selectionTranslate),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .dictation)
+    }
+
+    /// The persisted default chords must not collide: ⌃⌥T/⌃⌥R/⌃⌥D each
+    /// match only their own key, and none shadow the ⌃⌘V re-paste chord.
+    func testSelectionChordsDoNotCollideWithRePaste() {
+        let translate = Hotkey.chord(keyCode: 17, modifiers: [.control, .option])   // T
+        let rewrite = Hotkey.chord(keyCode: 15, modifiers: [.control, .option])    // R
+        let dictionary = Hotkey.chord(keyCode: 2, modifiers: [.control, .option])  // D
+        let ctrlOpt: CGEventFlags = [.maskControl, .maskAlternate]
+
+        XCTAssertFalse(translate.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand])!))
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 17, keyDown: true, flags: ctrlOpt)!))
+        XCTAssertFalse(translate.matches(event: keyEvent(keyCode: 15, keyDown: true, flags: ctrlOpt)!))
+        XCTAssertFalse(rewrite.matches(event: keyEvent(keyCode: 2, keyDown: true, flags: ctrlOpt)!))
+        XCTAssertFalse(dictionary.matches(event: keyEvent(keyCode: 17, keyDown: true, flags: ctrlOpt)!))
+
+        XCTAssertTrue(translate.matches(event: keyEvent(keyCode: 17, keyDown: true, flags: ctrlOpt)!))
+        XCTAssertTrue(rewrite.matches(event: keyEvent(keyCode: 15, keyDown: true, flags: ctrlOpt)!))
+        XCTAssertTrue(dictionary.matches(event: keyEvent(keyCode: 2, keyDown: true, flags: ctrlOpt)!))
+    }
+
     func testChordBindingCodableRoundTrip() throws {
         let bindings = [
             HotkeyBinding(hotkey: .chord(keyCode: 9, modifiers: [.control, .command]), behavior: .hold),

@@ -37,6 +37,11 @@ final class SettingsStore: ObservableObject {
     @Published var dictionaryDirectReplacement: Bool {
         didSet { UserDefaults.standard.dictionaryDirectReplacement = dictionaryDirectReplacement }
     }
+    /// Target language for the translate-selection action — free text fed
+    /// into the prompt, so any language name works.
+    @Published var translateTargetLanguage: String {
+        didSet { UserDefaults.standard.translateTargetLanguage = translateTargetLanguage }
+    }
     /// The first dictation binding's hotkey — the settings UI edits a single
     /// binding today, but persistence already stores a binding list.
     @Published var hotkey: Hotkey {
@@ -56,7 +61,28 @@ final class SettingsStore: ObservableObject {
     private func persistDictationBinding() {
         let bindings = [HotkeyBinding(hotkey: hotkey, behavior: hotkeyBehavior)]
         HotkeyManager.persistDictation(bindings)
-        HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste)
+        HotkeyManager.shared.update(
+            dictation: bindings,
+            rePaste: HotkeyManager.savedRePaste,
+            selectionTranslate: HotkeyManager.savedSelectionTranslate,
+            selectionRewrite: HotkeyManager.savedSelectionRewrite,
+            addToDictionary: HotkeyManager.savedAddToDictionary
+        )
+    }
+
+    /// Display names of the persisted selection-action chords. Read-only —
+    /// the settings UI has no chord editor yet, and nothing else writes
+    /// these keys, so there's nothing to publish.
+    var selectionTranslateChordLabel: String {
+        HotkeyManager.savedSelectionTranslate.first?.hotkey.displayName ?? "—"
+    }
+
+    var selectionRewriteChordLabel: String {
+        HotkeyManager.savedSelectionRewrite.first?.hotkey.displayName ?? "—"
+    }
+
+    var addToDictionaryChordLabel: String {
+        HotkeyManager.savedAddToDictionary.first?.hotkey.displayName ?? "—"
     }
 
     /// Available audio input devices; refreshed when the settings window appears.
@@ -77,6 +103,7 @@ final class SettingsStore: ObservableObject {
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
+        translateTargetLanguage = defaults.translateTargetLanguage
         hotkey = HotkeyManager.savedDictation.first?.hotkey ?? .fnKey
         hotkeyBehavior = HotkeyManager.savedDictation.first?.behavior ?? .hold
         llmConfigs = defaults.llmConfigs
@@ -95,6 +122,7 @@ final class SettingsStore: ObservableObject {
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
+        translateTargetLanguage = defaults.translateTargetLanguage
         inputDevices = AudioDeviceManager.inputDevices()
         llmConfigs = defaults.llmConfigs
         if let id = defaults.selectedConfigID, llmConfigs.contains(where: { $0.id == id }) {

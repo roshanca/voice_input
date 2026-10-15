@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let floatingPanel = FloatingPanel()
     private let speechRecognizer = SpeechRecognizer()
     private let llmRefiner = LLMRefiner()
+    /// Selection transforms get their own client — sharing `llmRefiner`
+    /// would let a translate/rewrite cancel a refinement in flight.
+    private let selectionTransformer = SelectionTransformer()
 
     private var isHotkeyHeld = false
     /// State for one hotkey press → submit cycle. Its id is stamped onto every
@@ -59,16 +62,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keeps Esc's "session active" window open until each delivery resolves.
     private var inFlightInjections = 0
 
-    /// Whether Esc currently means "cancel the dictation": recording,
-    /// awaiting the final result, refining, or delivering. Mirrored into
-    /// HotkeyManager so the event tap can decide synchronously whether the
-    /// keypress belongs to us or to the focused app.
-    private var isDictationSessionActive: Bool {
-        isHotkeyHeld || activeSession != nil || pendingSession != nil || inFlightInjections > 0
+    /// Where one selection-action press stands between its keyDown and
+    /// keyUp. Keyed by business so the three chords can't cross-talk;
+    /// entries are created on the press edge and removed on the release
+    /// edge (or as soon as the press resolves to nothing).
+    private enum SelectionPressState {
+        /// Press seen, probe still running — the press is undecided.
+        case probing
+        /// The keyUp arrived while the probe ran. The press can no longer
+        /// become dictation, but a found selection still runs its action.
+        case releasedEarly
+        /// Probe found a selection and the action ran — the release just
+        /// cleans the entry up.
+        case handled
+        /// Probe found nothing; the press became a dictation — its release
+        /// must route to `hotkeyReleased()`.
+        case fellBack
+    }
+    private var selectionPresses: [HotkeyBusiness: SelectionPressState] = [:]
+    /// A translate/rewrite request is in flight — Esc should cancel it.
+    private var selectionTransformInFlight = false
+
+    /// Whether Esc currently means "cancel in-flight work": recording,
+    /// awaiting the final result, refining, delivering, or transforming a
+    /// selection. Mirrored into HotkeyManager so the event tap can decide
+    /// synchronously whether the keypress belongs to us or to the focused app.
+    private var isSessionActive: Bool {
+        isHotkeyHeld || activeSession != nil || pendingSession != nil
+            || inFlightInjections > 0 || selectionTransformInFlight
     }
 
     private func syncEscapeInterception() {
-        HotkeyManager.shared.setEscapeInterception(isDictationSessionActive)
+        HotkeyManager.shared.setEscapeInterception(isSessionActive)
     }
 
     private let idleImage = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Voice Input")
@@ -279,10 +304,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.onToggle = { [weak self] in self?.toggleDictation() }
         hotkeyManager.onEscape = { [weak self] in self?.cancelActiveDictation() }
         hotkeyManager.onRePaste = { [weak self] in self?.rePasteLastResult() }
+        hotkeyManager.onSelectionAction = { [weak self] business, edge in
+            switch edge {
+            case .press: self?.selectionActionPressed(business)
+            case .release: self?.selectionActionReleased(business)
+            }
+        }
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
         }
-        hotkeyManager.update(dictation: HotkeyManager.savedDictation, rePaste: HotkeyManager.savedRePaste)
+        hotkeyManager.update(
+            dictation: HotkeyManager.savedDictation,
+            rePaste: HotkeyManager.savedRePaste,
+            selectionTranslate: HotkeyManager.savedSelectionTranslate,
+            selectionRewrite: HotkeyManager.savedSelectionRewrite,
+            addToDictionary: HotkeyManager.savedAddToDictionary
+        )
 
         if !hotkeyManager.isTapActive {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -535,15 +572,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Esc during an active session: stop whichever stage the dictation is
-    /// in — recording, awaiting the final result, refining, or delivering —
-    /// close the panel, and let the session/request guards drop every late
-    /// callback. Nothing is injected, auto-sent, or recorded for a session
-    /// canceled this way.
+    /// Esc during an active session: stop whichever stage is in flight —
+    /// recording, awaiting the final result, refining, transforming a
+    /// selection, or delivering — close the panel, and let the session /
+    /// request guards drop every late callback. Nothing is injected,
+    /// auto-sent, or recorded for work canceled this way.
     func cancelActiveDictation() {
-        guard isDictationSessionActive else { return }
+        guard isSessionActive else { return }
         let wasRecording = isHotkeyHeld
-        AppLogger.shared.info("Esc pressed — canceling dictation session")
+        AppLogger.shared.info("Esc pressed — canceling active work")
         isHotkeyHeld = false
         resultTimeout?.invalidate()
         resultTimeout = nil
@@ -553,6 +590,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             llmRefiner.cancel()
             pendingSession = nil
         }
+        if selectionTransformInFlight {
+            selectionTransformer.cancel()
+            selectionTransformInFlight = false
+        }
         speechRecognizer.cancelRecording()
         stopRecordingAnimation()
         if wasRecording {
@@ -561,6 +602,199 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TextInjector.shared.cancelInFlight()
         floatingPanel.hide()
         syncEscapeInterception()
+    }
+
+    // MARK: - Selection Actions
+
+    /// Press edge of a selection chord: capture the injection target *before*
+    /// the probe — its ⌘C fallback writes the clipboard and the panel can
+    /// move focus — then probe on the main actor (bounded ~0.5 s worst
+    /// case). Auto-repeat keyDowns and a second press of the same business
+    /// find the entry already registered and are ignored.
+    private func selectionActionPressed(_ business: HotkeyBusiness) {
+        guard selectionPresses[business] == nil else { return }
+        selectionPresses[business] = .probing
+        let target = DictationTarget.capture()
+        AppLogger.shared.info("Selection chord pressed (\(business.rawValue)) — probing selection")
+        let probeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let selection = SelectedTextProbe.probeSelectedText()
+            self.selectionProbeResolved(business, selection: selection, target: target)
+        }
+        TrackedTaskStore.shared.track(probeTask, label: "selection-probe")
+    }
+
+    /// Release edge of a selection chord. Only a press that fell back to
+    /// dictation has work to do here — `hotkeyReleased()` is exactly the
+    /// dictation key's release path, which is the fallback contract.
+    private func selectionActionReleased(_ business: HotkeyBusiness) {
+        guard let state = selectionPresses[business] else { return }
+        switch state {
+        case .fellBack:
+            selectionPresses[business] = nil
+            hotkeyReleased()
+        case .handled:
+            selectionPresses[business] = nil
+        case .probing:
+            // Key up before the probe answered — mark it so the resolve
+            // knows a dictation started now could never be released.
+            selectionPresses[business] = .releasedEarly
+        case .releasedEarly:
+            break
+        }
+    }
+
+    /// The probe answered: act on a found selection, or decide what the
+    /// press means when there's nothing selected (see SelectionFallback).
+    private func selectionProbeResolved(_ business: HotkeyBusiness, selection: String?, target: DictationTarget?) {
+        guard let state = selectionPresses[business] else { return }
+        switch SelectionFallback.outcome(selection: selection, keyReleased: state == .releasedEarly) {
+        case .actOnSelection:
+            selectionPresses[business] = state == .releasedEarly ? nil : .handled
+            if let selection {
+                runSelectionAction(business, text: selection, target: target)
+            }
+        case .fallbackToDictation:
+            // A press may only fall back when it can actually own the
+            // session — with the dictation key already held this press
+            // resolves to "handled" so its release can't end the other
+            // hotkey's recording early.
+            if isHotkeyHeld {
+                selectionPresses[business] = .handled
+            } else {
+                selectionPresses[business] = .fellBack
+                AppLogger.shared.info("No selection — \(business.rawValue) falls back to dictation")
+                hotkeyPressed()
+            }
+        case .ignore:
+            selectionPresses[business] = nil
+        }
+    }
+
+    private func runSelectionAction(_ business: HotkeyBusiness, text: String, target: DictationTarget?) {
+        switch business {
+        case .addToDictionary:
+            addSelectionToDictionary(text)
+        case .selectionTranslate:
+            startSelectionTransform(.translate, text: text, target: target)
+        case .selectionRewrite:
+            startSelectionTransform(.rewrite, text: text, target: target)
+        case .dictation, .rePaste:
+            break
+        }
+    }
+
+    /// ⌃⌥D path: the probed selection must survive the term policy — a
+    /// paragraph isn't a dictionary entry and can't become one.
+    private func addSelectionToDictionary(_ text: String) {
+        guard let term = SelectionPolicy.dictionaryCandidate(from: text) else {
+            AppLogger.shared.info("Add-to-dictionary skipped — selection isn't a term")
+            flashIfPanelFree("Not a dictionary term")
+            return
+        }
+        // Duplicates add no information and would just grow the LLM prompt
+        // fragment.
+        guard !DictionaryStore.shared.entries.contains(where: {
+            $0.term.caseInsensitiveCompare(term) == .orderedSame
+        }) else {
+            AppLogger.shared.info("Add-to-dictionary skipped — term already present")
+            flashIfPanelFree("Already in dictionary")
+            return
+        }
+        DictionaryStore.shared.add(DictionaryEntry(term: term))
+        AppLogger.shared.info("Added selection to dictionary", metadata: ["term": SensitiveLogValue(term)])
+        flashIfPanelFree("Added to dictionary")
+    }
+
+    /// Translate/rewrite path: stream the transform into the panel, then
+    /// paste the result over the still-selected text — injecting while text
+    /// is selected replaces the selection naturally.
+    private func startSelectionTransform(_ kind: SelectionTransformer.Kind, text: String, target: DictationTarget?) {
+        // The panel and the injector's clipboard write belong to any
+        // in-flight dictation or delivery — a transform would fight both.
+        // A *running transform* is fair game though: the new request
+        // supersedes it.
+        guard !isHotkeyHeld, activeSession == nil, pendingSession == nil, inFlightInjections == 0 else {
+            AppLogger.shared.info("Selection transform suppressed — session or delivery in flight")
+            return
+        }
+        guard selectionTransformer.isConfigured else {
+            AppLogger.shared.warning("Selection transform (\(kind)) skipped — LLM not configured")
+            flashIfPanelFree("Set up an LLM profile to use selection actions")
+            return
+        }
+        selectionTransformInFlight = true
+        syncEscapeInterception()
+        floatingPanel.setText(kind.progressLabel)
+        floatingPanel.show()
+        AppLogger.shared.info("Selection transform started: \(kind)", metadata: ["selection": SensitiveLogValue(text)])
+        selectionTransformer.transform(kind: kind, text: text, onPartial: { [weak self] partial in
+            // A dictation started mid-request owns the panel — don't let
+            // late tokens overwrite its live transcript.
+            guard let self, !self.isHotkeyHeld, self.activeSession == nil, self.pendingSession == nil else { return }
+            self.floatingPanel.setText(partial)
+        }, completion: { [weak self] result in
+            self?.selectionTransformCompleted(kind: kind, result: result, target: target)
+        })
+    }
+
+    private func selectionTransformCompleted(kind: SelectionTransformer.Kind, result: Result<String, Error>, target: DictationTarget?) {
+        selectionTransformInFlight = false
+        switch result {
+        case .success(let text):
+            AppLogger.shared.info("Selection transform finished (\(kind)) — injecting", metadata: ["output": SensitiveLogValue(text)])
+            // A dictation started while the request was in flight owns the
+            // panel now — the result still delivers to its captured target.
+            if !isHotkeyHeld, activeSession == nil, pendingSession == nil {
+                floatingPanel.hide()
+            }
+            inFlightInjections += 1
+            syncEscapeInterception()
+            TextInjector.shared.inject(text: text, keepInClipboard: false, sendReturn: false, target: target) { [weak self] outcome in
+                guard let self else { return }
+                self.inFlightInjections -= 1
+                self.syncEscapeInterception()
+                // No history record exists for a transform — a canceled
+                // delivery needs no rollback; other outcomes get feedback.
+                if case .cancelled = outcome { return }
+                self.reportSelectionOutcome(outcome)
+            }
+        case .failure(let error):
+            AppLogger.shared.error("Selection transform (\(kind)) failed: \(error.localizedDescription)")
+            syncEscapeInterception()
+            if !isHotkeyHeld, activeSession == nil, pendingSession == nil {
+                floatingPanel.flash("\(kind.failureLabel): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Outcome feedback for a selection-transform injection. No history
+    /// record is written for transforms, so "parked" wording can't point
+    /// there — the clipboard is the only recovery path.
+    private func reportSelectionOutcome(_ outcome: InjectionOutcome) {
+        guard activeSession == nil, pendingSession == nil, !isHotkeyHeld else {
+            AppLogger.shared.info("Suppressing selection-action feedback — a newer dictation owns the panel")
+            return
+        }
+        switch outcome {
+        case .inserted, .insertedSendSuppressed, .cancelled:
+            // sendReturn is never requested for transforms, and cancel is
+            // silent — nothing to surface.
+            break
+        case .parked(let mismatch, let onClipboard):
+            floatingPanel.flash(onClipboard
+                ? "\(mismatch.userMessage) — result left on clipboard"
+                : mismatch.userMessage)
+        case .clipboardNotDelivered:
+            floatingPanel.flash("Couldn't replace the selection")
+        }
+    }
+
+    /// Panel flash for a selection action — suppressed while a dictation
+    /// owns the panel, same ownership rule as `reportInjectionOutcome`.
+    private func flashIfPanelFree(_ text: String) {
+        guard activeSession == nil, pendingSession == nil, !isHotkeyHeld else { return }
+        floatingPanel.flash(text)
     }
 
     /// Commit the session's text exactly once. The first of the final

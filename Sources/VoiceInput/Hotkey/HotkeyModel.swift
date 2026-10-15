@@ -245,6 +245,12 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
     case dictation
     /// Re-delivers the last committed dictation result (⌃⌘V by default).
     case rePaste
+    /// LLM-translates the current text selection in place (⌃⌥T by default).
+    case selectionTranslate
+    /// LLM-rewrites the current text selection in place (⌃⌥R by default).
+    case selectionRewrite
+    /// Adds the selected term to the custom dictionary — no LLM (⌃⌥D).
+    case addToDictionary
 
     /// Routing tie-breaker when two businesses share the same hotkey and
     /// behavior. Higher wins; dictation stays lowest so other actions
@@ -253,6 +259,9 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
         switch self {
         case .dictation: return 0
         case .rePaste: return 1
+        case .addToDictionary: return 2
+        case .selectionRewrite: return 3
+        case .selectionTranslate: return 4
         }
     }
 }

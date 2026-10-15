@@ -81,6 +81,53 @@ final class UserDefaultsKeysTests: XCTestCase {
                        .chord(keyCode: 9, modifiers: [.control, .command]))
     }
 
+    /// The selection actions ship with ⌃⌥T/⌃⌥R/⌃⌥D persisted defaults —
+    /// a brand-new install must decode exactly those bindings (#21).
+    func testSelectionHotkeyBindingsDefaults() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.selectionTranslateHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 17, modifiers: [.control, .option]), behavior: .hold)])
+        XCTAssertEqual(isolated.defaults.selectionRewriteHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 15, modifiers: [.control, .option]), behavior: .hold)])
+        XCTAssertEqual(isolated.defaults.addToDictionaryHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 2, modifiers: [.control, .option]), behavior: .hold)])
+    }
+
+    func testSelectionHotkeyBindingsRoundTrip() {
+        let isolated = IsolatedDefaults()
+        let custom = [HotkeyBinding(hotkey: .chord(keyCode: 12, modifiers: [.control, .option, .shift]), behavior: .hold)]
+        isolated.defaults.selectionTranslateHotkeyBindings = custom
+        isolated.defaults.selectionRewriteHotkeyBindings = custom
+        isolated.defaults.addToDictionaryHotkeyBindings = custom
+        XCTAssertEqual(isolated.defaults.selectionTranslateHotkeyBindings, custom)
+        XCTAssertEqual(isolated.defaults.selectionRewriteHotkeyBindings, custom)
+        XCTAssertEqual(isolated.defaults.addToDictionaryHotkeyBindings, custom)
+    }
+
+    /// A corrupted payload falls back to the default chord rather than
+    /// silently disabling the action.
+    func testSelectionHotkeyBindingsFallBackOnEmptyPayload() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.set(Data("[]".utf8), forKey: "selectionTranslateHotkeyBindings")
+        XCTAssertEqual(isolated.defaults.selectionTranslateHotkeyBindings.first?.hotkey,
+                       .chord(keyCode: 17, modifiers: [.control, .option]))
+    }
+
+    func testTranslateTargetLanguageDefaultsAndRoundTrip() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "English")
+        isolated.defaults.translateTargetLanguage = "日本語"
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "日本語")
+    }
+
+    /// A blank stored value would produce an instructionless prompt — the
+    /// accessor must fall back instead.
+    func testTranslateTargetLanguageBlankFallsBackToEnglish() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.translateTargetLanguage = "   "
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "English")
+    }
+
     func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
         let isolated = IsolatedDefaults()
         let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,

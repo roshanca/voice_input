@@ -34,6 +34,15 @@ Esc only while a session is active → AppDelegate.cancelActiveDictation()
 Re-paste: ⌃⌘V chord (Hotkey.chord — exact modifier match, swallowed whole)
 fires once per press → AppDelegate.rePasteLastResult() → TextInjector with
 a freshly captured target; text = HistoryStore's latest outputText
+Selection actions: ⌃⌥T / ⌃⌥R / ⌃⌥D chords send press+release edges to
+AppDelegate, which probes the selection on press (SelectedTextProbe):
+  - selection found → run the action on this press (no waiting for release):
+    translate/rewrite → SelectionTransformer (one-shot streamed LLM call,
+    no history) → TextInjector replaces the selection in place;
+    dictionary → SelectionPolicy.dictionaryCandidate → DictionaryStore
+  - nothing selected → the press falls back to hold-to-dictate and its
+    release routes to hotkeyReleased(); a key already released before the
+    probe answers resolves to a no-op (a dictation could never stop)
 ```
 
 **Session identity:** `AppDelegate` owns `activeSession: {id, generation,
@@ -47,9 +56,9 @@ cancels any in-flight refinement so late chunks can't inject text.
 |---|---|
 | `App.swift` | `@main` NSApplicationDelegateAdaptor shell |
 | `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
-| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation + `rePaste` |
-| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold) |
-| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (rePaste > dictation). First matching routed binding owns the event |
+| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation + `rePaste` + three selection actions (`selectionTranslate`, `selectionRewrite`, `addToDictionary`) |
+| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
+| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
 | `LLMRefiner.swift` | SSE streaming refine; task stored in `TrackedTaskStore` |
@@ -58,8 +67,11 @@ cancels any in-flight refinement so late chunks can't inject text.
 | `EscapeRouting.swift` | Pure Esc routing: consume only while a session is active; `PressOwnership` pins one decision per physical press (repeats + keyUp follow it); ⌘⌥⎋ always passes through |
 | `AutoSendRules.swift` | Pure per-app auto-send override resolution: `inherit` (absent entry) / on / off keyed by bundle ID; resolved once at session start |
 | `RefinementFallback.swift` | "Use Original" while LLM is pending: clears `pendingSession` before cancelling so racing callbacks fail the request-ID guard; exactly-one injection/history |
-| `Selection/SelectedTextProbe.swift` | Selected-text read: AX `AXSelectedText` (0.2 s timeout, caret-only early-exit) → ⌘C clipboard fallback with snapshot/restore + `changeCount` ownership check |
-| `Selection/SelectionPolicy.swift` | Pure policy deciding caret vs real selection; untested surface = system IO only |
+| `Selection/SelectedTextProbe.swift` | Selected-text read: AX `AXSelectedText` (0.2 s timeout, caret-only early-exit) → ⌘C clipboard fallback with snapshot/restore + `changeCount` ownership check; drives the selection-action chords |
+| `Selection/SelectionPolicy.swift` | Pure policy deciding caret vs real selection and dictionary-term validity; untested surface = system IO only |
+| `Selection/SelectionFallback.swift` | Pure press-outcome decision: act on selection / fall back to dictation / ignore when the key was released before the probe answered |
+| `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; writes no history |
+| `Selection/SelectionPrompts.swift` | Whole-instruction system prompts for the transforms — the selection itself is the user message |
 | `TrackedTaskStore.swift` | Retains tasks (incl. cancelled) until actual exit; drained in `applicationWillTerminate`. **Cancellation ≠ release** |
 | `AppLogger.swift` + `LogRedactor.swift` | In-memory ring buffer; all lines redacted before storage (sensitive-key suffix match + `SensitiveLogValue` + free-text secret scrub + `~` home shortening) |
 | `DiagnosticsExporter.swift` | `NSSavePanel` export: version, OS, permission tri-state, redacted logs |
@@ -69,7 +81,7 @@ cancels any in-flight refinement so late chunks can't inject text.
 | `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, selection-action bindings to ⌃⌥T/⌃⌥R/⌃⌥D, `translateTargetLanguage` to "English" |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing
@@ -93,7 +105,8 @@ Full workflow: `docs/Release.md`.
 
 - `AppDelegate` is the acknowledged refactor boundary (coordinator +
   session state + menu + panel wiring).
-- `SelectedTextProbe` exists but no feature consumes it yet (#21 will).
+- Selection-action bindings are persisted per business but have no editor
+  UI yet — settings shows them read-only (#21 added the actions).
 - `HotkeyManager` supports one binding per business for gesture purposes —
   two bindings on the same hotkey collapse to the routed winner; the
   settings UI edits a single dictation binding anyway.
