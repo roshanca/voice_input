@@ -373,17 +373,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             llmRefiner.cancel()
             pendingSession = nil
         }
+        let target = DictationTarget.capture()
+        // Auto-send resolves once, here, against the recorded target's own
+        // bundle ID — re-checking at send time could apply a different app's
+        // rule after the user switched focus mid-delivery.
         let session = DictationSession(
             language: LanguageManager.shared.current.rawValue,
             llmEnabled: UserDefaults.standard.llmEnabled,
             copyToClipboard: UserDefaults.standard.copyToClipboard,
-            autoSend: UserDefaults.standard.autoSend,
+            autoSend: AutoSendRules.shouldAutoSend(
+                bundleID: target?.bundleID,
+                overrides: UserDefaults.standard.autoSendOverrides,
+                globalDefault: UserDefaults.standard.autoSend
+            ),
             dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement,
-            target: DictationTarget.capture()
+            target: target
         )
         activeSession = session
         syncEscapeInterception()
-        AppLogger.shared.info("Hotkey pressed — starting recording")
+        AppLogger.shared.info("Hotkey pressed — starting recording (target: \(target?.appName ?? "unknown"), auto-send: \(session.autoSend))")
         startRecordingAnimation()
         SoundPlayer.recordStart()
 

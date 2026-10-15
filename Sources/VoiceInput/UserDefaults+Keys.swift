@@ -8,6 +8,7 @@ extension UserDefaults {
         static let selectedConfigID = "selectedConfigID"
         static let copyToClipboard = "copyToClipboard"
         static let autoSend = "autoSend"
+        static let autoSendOverrides = "autoSendOverrides"
         static let interactionSounds = "interactionSounds"
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
@@ -36,6 +37,14 @@ extension UserDefaults {
     var autoSend: Bool {
         get { bool(forKey: Keys.autoSend) }
         set { set(newValue, forKey: Keys.autoSend) }
+    }
+
+    /// Per-app auto-send rules: bundle identifier → forced on/off. An app
+    /// with no entry follows the global `autoSend` toggle — removing the
+    /// entry is how an override returns to inherit.
+    var autoSendOverrides: [String: Bool] {
+        get { dictionary(forKey: Keys.autoSendOverrides) as? [String: Bool] ?? [:] }
+        set { set(newValue, forKey: Keys.autoSendOverrides) }
     }
 
     var interactionSounds: Bool {

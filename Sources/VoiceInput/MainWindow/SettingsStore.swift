@@ -25,6 +25,9 @@ final class SettingsStore: ObservableObject {
     @Published var autoSend: Bool {
         didSet { UserDefaults.standard.autoSend = autoSend }
     }
+    @Published var autoSendOverrides: [String: Bool] {
+        didSet { UserDefaults.standard.autoSendOverrides = autoSendOverrides }
+    }
     @Published var interactionSounds: Bool {
         didSet { UserDefaults.standard.interactionSounds = interactionSounds }
     }
@@ -56,6 +59,7 @@ final class SettingsStore: ObservableObject {
         llmEnabled = defaults.llmEnabled
         copyToClipboard = defaults.copyToClipboard
         autoSend = defaults.autoSend
+        autoSendOverrides = defaults.autoSendOverrides
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
@@ -72,6 +76,7 @@ final class SettingsStore: ObservableObject {
         llmEnabled = defaults.llmEnabled
         copyToClipboard = defaults.copyToClipboard
         autoSend = defaults.autoSend
+        autoSendOverrides = defaults.autoSendOverrides
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
@@ -82,6 +87,20 @@ final class SettingsStore: ObservableObject {
         } else {
             selectedConfigID = llmConfigs.first?.id
         }
+    }
+
+    // MARK: - Per-app auto-send
+
+    /// Writes one app's rule; `.inherit` removes the entry so the app
+    /// follows the global toggle again.
+    func setAutoSendOverride(_ override: AutoSendRules.Override, for bundleID: String) {
+        var overrides = autoSendOverrides
+        switch override {
+        case .inherit: overrides.removeValue(forKey: bundleID)
+        case .on: overrides[bundleID] = true
+        case .off: overrides[bundleID] = false
+        }
+        autoSendOverrides = overrides
     }
 
     // MARK: - LLM profiles

@@ -55,8 +55,11 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                AutoSendOverridesView()
             } header: {
                 Label("Dictation", systemImage: "text.cursor")
+            } footer: {
+                Text("Per-app rules apply to the app you're dictating into. Apps without a rule follow the global setting above.")
             }
 
             Section {
