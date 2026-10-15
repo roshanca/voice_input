@@ -4,7 +4,7 @@ A lightweight macOS menu-bar app for **push-to-talk voice dictation**, anywhere 
 
 ## Features
 
-- **Push-to-talk dictation** — hold the hotkey to record, release to transcribe and insert. Default hotkey is `Fn (Globe)`; also supports right-side modifiers (⌃⌥⇧⌘) and `F5`–`F12`.
+- **Push-to-talk dictation** — hold the hotkey to record, release to transcribe and insert. Default hotkey is `Fn (Globe)`; also supports right-side modifiers (⌃⌥⇧⌘) and `F5`–`F12`. Press `Esc` at any stage to cancel the current dictation — recording, recognition, refinement, or a queued paste — nothing is inserted or recorded.
 - **Fast, on-device-first speech recognition** — powered by Apple's `SFSpeechRecognizer` with native punctuation. Prefers on-device recognition and automatically falls back to server-based recognition when Siri/Dictation is disabled; the speech session is warmed up at launch so the first recording starts instantly. Supports English, Simplified Chinese, and Traditional Chinese, switchable at any time.
 - **Optional LLM refinement, streamed live** — clean up filler words, fix punctuation, and polish phrasing with an LLM. Output is streamed (SSE) token-by-token and mirrored to the floating panel as it arrives. Works with any **OpenAI-compatible API** (OpenAI, DeepSeek, etc.) or a **local Ollama** instance. Multiple named profiles with per-profile base URL, model, and system prompt; API keys are stored securely in the macOS Keychain.
 - **Custom dictionary** — teach the app your vocabulary: term replacements are applied to transcripts and injected into the LLM prompt so names and jargon come out right.
@@ -71,7 +71,8 @@ Each profile has its own system prompt, so you can keep different styles (e.g. "
 ```
 Sources/VoiceInput/
 ├── App.swift / AppDelegate.swift      # Entry point, menu bar, dictation pipeline
-├── HotkeyManager.swift                # Global push-to-talk hotkey (CGEvent tap)
+├── HotkeyManager.swift                # Global push-to-talk hotkey (CGEvent tap), Esc-to-cancel routing
+├── EscapeRouting.swift                # Esc consume/pass-through policy (pure logic)
 ├── SpeechRecognizer.swift             # SFSpeechRecognizer wrapper, per-language locale
 ├── LLMRefiner.swift / LLMConfig.swift # Streaming (SSE) refinement pipeline & provider profiles
 ├── TextInjector.swift                 # Clipboard + simulated ⌘V insertion, auto-send

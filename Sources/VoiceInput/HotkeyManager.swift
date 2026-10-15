@@ -100,6 +100,8 @@ final class HotkeyManager {
 
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
+    /// Esc pressed while a dictation session is active (cancel request).
+    var onEscape: (() -> Void)?
     /// Called whenever the tap becomes active/inactive (menu bar icon dimming).
     var onTapStateChange: ((Bool) -> Void)?
 
@@ -109,6 +111,13 @@ final class HotkeyManager {
     /// Nonisolated mirror of `hotkey` for the C event-tap callback.
     /// Updated only in `update(hotkey:)` (main actor); read on the tap thread.
     nonisolated(unsafe) fileprivate static var activeHotkey: Hotkey = .fnKey
+    /// Nonisolated mirror of "a dictation session is active", consulted by
+    /// the tap callback on every Esc event: while false Esc passes through
+    /// to the focused app untouched.
+    nonisolated(unsafe) fileprivate static var interceptEscape = false
+    /// Whether the Esc keyDown was swallowed — its keyUp is then swallowed
+    /// too, so the focused app never sees half a keystroke.
+    nonisolated(unsafe) fileprivate static var escapePressSwallowed = false
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -137,6 +146,12 @@ final class HotkeyManager {
         start()
     }
 
+    /// Called by the delegate whenever session activity changes so the tap's
+    /// `interceptEscape` mirror is current the next time Esc arrives.
+    func setEscapeInterception(_ active: Bool) {
+        Self.interceptEscape = active
+    }
+
     func start() {
         stop()
         AppLogger.shared.info("Setting up event tap for hotkey \(hotkey.displayName)…")
@@ -146,12 +161,12 @@ final class HotkeyManager {
             return
         }
 
-        let eventMask: CGEventMask
+        // keyDown/keyUp are always in the mask for Esc cancellation — the
+        // push-to-talk key itself may only need flagsChanged.
+        var eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << CGEventType.keyUp.rawValue)
         if hotkey.usesFlagsChanged {
-            eventMask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
-        } else {
-            eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
-                | CGEventMask(1 << CGEventType.keyUp.rawValue)
+            eventMask |= CGEventMask(1 << CGEventType.flagsChanged.rawValue)
         }
 
         guard let tap = CGEvent.tapCreate(
@@ -223,6 +238,33 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
             HotkeyManager.shared.handleTapDisabled()
         }
         return Unmanaged.passUnretained(event)
+    }
+
+    // Esc is routed separately from the push-to-talk key: while a dictation
+    // session is active it cancels the session and is swallowed; with no
+    // session it passes through so the focused app's own Esc handling —
+    // and system chords like ⌘⌥⎋ — are untouched.
+    if type == .keyDown || type == .keyUp,
+       event.getIntegerValueField(.keyboardEventKeycode) == EscapeRouting.keyCode {
+        switch EscapeRouting.action(
+            type: type,
+            flags: event.flags,
+            sessionActive: HotkeyManager.interceptEscape,
+            pressSwallowed: HotkeyManager.escapePressSwallowed
+        ) {
+        case .consume:
+            if type == .keyDown {
+                HotkeyManager.escapePressSwallowed = true
+                Task { @MainActor in
+                    HotkeyManager.shared.onEscape?()
+                }
+            } else {
+                HotkeyManager.escapePressSwallowed = false
+            }
+            return nil
+        case .passThrough:
+            return Unmanaged.passUnretained(event)
+        }
     }
 
     let hotkey = HotkeyManager.activeHotkey

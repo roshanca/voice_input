@@ -498,6 +498,15 @@ final class SpeechRecognizer: NSObject {
         isRecording = false
     }
 
+    /// Esc cancellation: discard the task outright instead of ending audio
+    /// and waiting for a final result the canceled session would drop
+    /// anyway. Session-tagged callbacks from the torn-down task are
+    /// filtered by the delegate the same way stopRecording's are.
+    func cancelRecording() {
+        stopRequested = true
+        teardown()
+    }
+
     /// Create the recognition request + task. On the kLSRErrorDomain 201
     /// fallback this is called again with onDevice=false while the audio
     /// engine keeps running: publishing the request through the tap context

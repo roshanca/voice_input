@@ -15,6 +15,11 @@ enum InjectionOutcome {
     /// The user's clipboard could not be fully snapshotted or ownership was
     /// lost — nothing was pasted; the result lives in History only.
     case clipboardNotDelivered
+    /// Esc aborted the delivery before the paste posted — nothing was
+    /// inserted or sent and the user's clipboard was put back. A paste that
+    /// already landed can't be unsent, so cancellation after it reports the
+    /// normal `.inserted` with the queued auto-send suppressed instead.
+    case cancelled
 }
 
 @MainActor
@@ -90,15 +95,46 @@ final class TextInjector {
 
     private var pendingRestore: PendingRestore?
 
+    /// Cancellation token shared by every queued stage of one inject() call.
+    /// Esc marks it canceled; whichever delay fires next performs that
+    /// stage's cleanup (clipboard/IME restore) without delivering text or
+    /// auto-send.
+    private final class InjectionTicket {
+        var canceled = false
+    }
+
+    /// Injections whose queued stages haven't resolved yet — Esc cancels
+    /// all of them through `cancelInFlight`.
+    private var inFlightTickets: [InjectionTicket] = []
+
+    /// Esc pressed during the delivery window: every in-flight injection's
+    /// next queued stage runs cleanup-only — a queued paste never posts,
+    /// the user's clipboard is restored, auto-send never fires. A paste
+    /// that already landed stays delivered.
+    func cancelInFlight() {
+        for ticket in inFlightTickets {
+            ticket.canceled = true
+        }
+    }
+
     func inject(text: String, keepInClipboard: Bool = false, sendReturn: Bool = false, target: DictationTarget? = nil, completion: ((InjectionOutcome) -> Void)? = nil) {
         AppLogger.shared.info("TextInjector.inject called — text length: \(text.count), keepInClipboard: \(keepInClipboard), sendReturn: \(sendReturn)")
+
+        let ticket = InjectionTicket()
+        inFlightTickets.append(ticket)
+        /// Finishes the injection exactly once: retires the ticket so a late
+        /// cancel can't touch a resolved delivery, then reports the outcome.
+        let done: (InjectionOutcome) -> Void = { [weak self] outcome in
+            self?.inFlightTickets.removeAll { $0 === ticket }
+            completion?(outcome)
+        }
 
         // Verify the recorded target before touching the clipboard or the
         // input method — parking the result is cheap, pasting into the wrong
         // app is not.
         if let mismatch = Self.mismatch(for: target) {
             AppLogger.shared.warning("Injection skipped — target mismatch: \(mismatch); parking result")
-            park(text: text, mismatch: mismatch, completion: completion)
+            park(text: text, mismatch: mismatch, completion: done)
             return
         }
 
@@ -138,7 +174,7 @@ final class TextInjector {
 
         guard let snapshot, let snapshotBaseCount else {
             AppLogger.shared.error("Could not fully snapshot the clipboard — preserving its contents, skipping injection")
-            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: done)
             return
         }
 
@@ -150,7 +186,7 @@ final class TextInjector {
         if let mismatch = Self.mismatch(for: target) {
             AppLogger.shared.warning("Injection skipped — target mismatch: \(mismatch); parking result")
             finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: nil)
-            park(text: text, mismatch: mismatch, completion: completion)
+            park(text: text, mismatch: mismatch, completion: done)
             return
         }
 
@@ -160,7 +196,7 @@ final class TextInjector {
         // instead of being destroyed.
         guard pasteboard.changeCount == snapshotBaseCount else {
             AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
-            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: done)
             return
         }
 
@@ -172,7 +208,7 @@ final class TextInjector {
               pasteboard.setString(text, forType: .string),
               pasteboard.changeCount == writeChangeCount else {
             AppLogger.shared.error("Lost clipboard ownership while writing — aborting injection")
-            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: done)
             return
         }
 
@@ -188,6 +224,30 @@ final class TextInjector {
         DispatchQueue.main.asyncAfter(deadline: .now() + pasteDelay) { [weak self] in
             guard let self else { return }
 
+            // Esc landed while the paste was queued — suppress it and put
+            // the user's clipboard back now rather than on the restore
+            // timer, so nothing of the canceled dictation is left behind.
+            if ticket.canceled {
+                if self.pendingRestore?.id == restore.id {
+                    self.pendingRestore = nil
+                }
+                if pasteboard.changeCount == writeChangeCount {
+                    let restoredItems = snapshot.pasteboardItems()
+                    pasteboard.clearContents()
+                    if !restoredItems.isEmpty, !pasteboard.writeObjects(restoredItems) {
+                        AppLogger.shared.error("writeObjects failed while restoring clipboard")
+                    }
+                } else {
+                    AppLogger.shared.info("Clipboard changed since our write — preserving user's new content")
+                }
+                if wasCJK {
+                    InputMethodManager.shared.restoreInputSource(previousSource)
+                }
+                AppLogger.shared.info("Injection canceled before paste — clipboard restored")
+                done(.cancelled)
+                return
+            }
+
             // Focus may have moved while the paste was queued — when it did,
             // the result stays on the clipboard for manual pasting and the
             // scheduled restore is cancelled so it can't clobber the result.
@@ -200,7 +260,7 @@ final class TextInjector {
                 }
                 let stillOurs = pasteboard.changeCount == writeChangeCount
                 AppLogger.shared.warning("Paste aborted — target mismatch: \(mismatch); result parked on clipboard: \(stillOurs)")
-                completion?(.parked(mismatch, onClipboard: stillOurs))
+                done(.parked(mismatch, onClipboard: stillOurs))
                 return
             }
 
@@ -230,15 +290,33 @@ final class TextInjector {
                     }
                 }
 
+                // The paste already landed — cancellation this late can only
+                // suppress the queued auto-send; the delivery stands.
+                if ticket.canceled {
+                    if wasCJK {
+                        AppLogger.shared.debug("Scheduling IME restore in \(imeRestoreDelay)s")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + imeRestoreDelay) {
+                            AppLogger.shared.info("Restoring original input method")
+                            InputMethodManager.shared.restoreInputSource(previousSource)
+                            AppLogger.shared.info("Injection canceled after paste — auto-send skipped")
+                            done(.inserted)
+                        }
+                    } else {
+                        AppLogger.shared.info("Injection canceled after paste — auto-send skipped")
+                        done(.inserted)
+                    }
+                    return
+                }
+
                 if wasCJK {
                     AppLogger.shared.debug("Scheduling IME restore in \(imeRestoreDelay)s")
                     DispatchQueue.main.asyncAfter(deadline: .now() + imeRestoreDelay) {
                         AppLogger.shared.info("Restoring original input method")
                         InputMethodManager.shared.restoreInputSource(previousSource)
-                        self.simulateReturnIfNeeded(sendReturn, target: target, completion: completion)
+                        self.simulateReturnIfNeeded(sendReturn, target: target, ticket: ticket, completion: done)
                     }
                 } else {
-                    self.simulateReturnIfNeeded(sendReturn, target: target, completion: completion)
+                    self.simulateReturnIfNeeded(sendReturn, target: target, ticket: ticket, completion: done)
                 }
             }
         }
@@ -283,12 +361,19 @@ final class TextInjector {
     /// Auto-send: press Return after the paste settles (sends the message in chat apps).
     /// The target is verified one final time inside the delay — a focus change
     /// between paste and Return must not submit into the new focus.
-    private func simulateReturnIfNeeded(_ sendReturn: Bool, target: DictationTarget?, completion: ((InjectionOutcome) -> Void)?) {
+    private func simulateReturnIfNeeded(_ sendReturn: Bool, target: DictationTarget?, ticket: InjectionTicket, completion: ((InjectionOutcome) -> Void)?) {
         guard sendReturn else {
             completion?(.inserted)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Esc landed during the send delay — the paste stands but the
+            // Return must not fire into the canceled session's target.
+            guard !ticket.canceled else {
+                AppLogger.shared.info("Auto-send suppressed — injection canceled")
+                completion?(.inserted)
+                return
+            }
             // Geometry is excluded here: multi-line inputs grow when the paste
             // lands, and a moved frame is not evidence of a focus change.
             if let mismatch = Self.mismatch(for: target, includeGeometry: false) {
