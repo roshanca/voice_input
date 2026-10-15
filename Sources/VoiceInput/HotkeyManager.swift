@@ -115,9 +115,9 @@ final class HotkeyManager {
     /// the tap callback on every Esc event: while false Esc passes through
     /// to the focused app untouched.
     nonisolated(unsafe) fileprivate static var interceptEscape = false
-    /// Whether the Esc keyDown was swallowed — its keyUp is then swallowed
-    /// too, so the focused app never sees half a keystroke.
-    nonisolated(unsafe) fileprivate static var escapePressSwallowed = false
+    /// Which side owns the current physical Esc press — decided at keyDown,
+    /// held until keyUp so auto-repeats never switch owners mid-press.
+    nonisolated(unsafe) fileprivate static var escapeOwnership: EscapeRouting.PressOwnership = .none
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -250,19 +250,24 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
             type: type,
             flags: event.flags,
             sessionActive: HotkeyManager.interceptEscape,
-            pressSwallowed: HotkeyManager.escapePressSwallowed
+            ownership: HotkeyManager.escapeOwnership
         ) {
         case .consume:
             if type == .keyDown {
-                HotkeyManager.escapePressSwallowed = true
-                Task { @MainActor in
-                    HotkeyManager.shared.onEscape?()
+                // Only a fresh press cancels — auto-repeat keyDowns of an
+                // owned press stay swallowed but must not re-fire.
+                if HotkeyManager.escapeOwnership == .none {
+                    Task { @MainActor in
+                        HotkeyManager.shared.onEscape?()
+                    }
                 }
+                HotkeyManager.escapeOwnership = .consumed
             } else {
-                HotkeyManager.escapePressSwallowed = false
+                HotkeyManager.escapeOwnership = .none
             }
             return nil
         case .passThrough:
+            HotkeyManager.escapeOwnership = type == .keyDown ? .passed : .none
             return Unmanaged.passUnretained(event)
         }
     }

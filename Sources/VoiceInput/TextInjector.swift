@@ -91,6 +91,10 @@ final class TextInjector {
         /// earlier pre-dictation snapshot.
         let requiresRestore: Bool
         let snapshot: ClipboardSnapshot
+        /// The injection that owns this write — a superseding injection uses
+        /// it to tell "kept result that belongs on the clipboard" from a
+        /// canceled write whose captured text must not be restored later.
+        let ticket: InjectionTicket
     }
 
     private var pendingRestore: PendingRestore?
@@ -101,6 +105,12 @@ final class TextInjector {
     /// auto-send.
     private final class InjectionTicket {
         var canceled = false
+        /// Runs the pre-paste cleanup synchronously — armed once our text is
+        /// on the clipboard and the paste is queued, disarmed by the queued
+        /// block itself. A canceled write must be settled at cancel time:
+        /// left in place, a later injection would snapshot the canceled text
+        /// as if it were the user's own clipboard content.
+        var abort: (() -> Void)?
     }
 
     /// Injections whose queued stages haven't resolved yet — Esc cancels
@@ -109,11 +119,15 @@ final class TextInjector {
 
     /// Esc pressed during the delivery window: every in-flight injection's
     /// next queued stage runs cleanup-only — a queued paste never posts,
-    /// the user's clipboard is restored, auto-send never fires. A paste
-    /// that already landed stays delivered.
+    /// the user's clipboard is restored (synchronously, via `abort`), and
+    /// auto-send never fires. A paste that already landed stays delivered.
     func cancelInFlight() {
         for ticket in inFlightTickets {
             ticket.canceled = true
+            if let abort = ticket.abort {
+                ticket.abort = nil
+                abort()
+            }
         }
     }
 
@@ -148,6 +162,13 @@ final class TextInjector {
         }
 
         let pasteboard = NSPasteboard.general
+
+        // The pending write our text is about to overwrite — remembered so a
+        // later restore can fall back to its pre-write snapshot when that
+        // write turns out to have been canceled. Only counts while the
+        // clipboard still holds that write (changeCount match).
+        let overwrittenRestore: PendingRestore? =
+            (pendingRestore?.changeCount == pasteboard.changeCount) ? pendingRestore : nil
 
         var snapshot: ClipboardSnapshot?
         var snapshotBaseCount: Int?
@@ -212,9 +233,45 @@ final class TextInjector {
             return
         }
 
-        let restore = PendingRestore(changeCount: writeChangeCount, requiresRestore: !keepInClipboard, snapshot: snapshot)
+        let restore = PendingRestore(changeCount: writeChangeCount, requiresRestore: !keepInClipboard, snapshot: snapshot, ticket: ticket)
         pendingRestore = restore
         AppLogger.shared.info("Set new text to clipboard (changeCount: \(writeChangeCount))")
+
+        /// What to put back when this write is undone — normally our own
+        /// snapshot. When the write we overwrote was itself canceled, its
+        /// pre-write snapshot is the true base: the canceled text never
+        /// counted as clipboard content. Evaluated lazily so the ticket's
+        /// state is read at restore time, not snapshot time.
+        let restoreSnapshot = {
+            if let overwritten = overwrittenRestore, overwritten.ticket.canceled {
+                return overwritten.snapshot
+            }
+            return snapshot
+        }
+
+        // Esc landing before the queued paste fires must settle our write
+        // synchronously — a later injection snapshots whatever is on the
+        // clipboard and would otherwise adopt the canceled text as the
+        // user's own content.
+        ticket.abort = { [weak self] in
+            guard let self else { return }
+            if self.pendingRestore?.id == restore.id {
+                self.pendingRestore = nil
+            }
+            if pasteboard.changeCount == writeChangeCount {
+                let restoredItems = restoreSnapshot().pasteboardItems()
+                pasteboard.clearContents()
+                if !restoredItems.isEmpty, !pasteboard.writeObjects(restoredItems) {
+                    AppLogger.shared.error("writeObjects failed while restoring clipboard")
+                }
+            } else {
+                AppLogger.shared.info("Clipboard changed since our write — preserving user's new content")
+            }
+            if wasCJK {
+                InputMethodManager.shared.restoreInputSource(previousSource)
+            }
+            AppLogger.shared.info("Injection canceled before paste — clipboard restored")
+        }
 
         let pasteDelay = wasCJK ? 0.25 : 0.15
         let restoreDelay: TimeInterval = 0.35
@@ -224,26 +281,13 @@ final class TextInjector {
         DispatchQueue.main.asyncAfter(deadline: .now() + pasteDelay) { [weak self] in
             guard let self else { return }
 
-            // Esc landed while the paste was queued — suppress it and put
-            // the user's clipboard back now rather than on the restore
-            // timer, so nothing of the canceled dictation is left behind.
+            // From here this block owns the remaining cleanup — disarm the
+            // synchronous abort so a late cancel can't double-restore.
+            ticket.abort = nil
+
             if ticket.canceled {
-                if self.pendingRestore?.id == restore.id {
-                    self.pendingRestore = nil
-                }
-                if pasteboard.changeCount == writeChangeCount {
-                    let restoredItems = snapshot.pasteboardItems()
-                    pasteboard.clearContents()
-                    if !restoredItems.isEmpty, !pasteboard.writeObjects(restoredItems) {
-                        AppLogger.shared.error("writeObjects failed while restoring clipboard")
-                    }
-                } else {
-                    AppLogger.shared.info("Clipboard changed since our write — preserving user's new content")
-                }
-                if wasCJK {
-                    InputMethodManager.shared.restoreInputSource(previousSource)
-                }
-                AppLogger.shared.info("Injection canceled before paste — clipboard restored")
+                // Esc already ran the abort hook — the write was settled,
+                // the paste stays suppressed.
                 done(.cancelled)
                 return
             }
@@ -278,7 +322,7 @@ final class TextInjector {
                 } else {
                     // Build the items and log before the ownership check so the
                     // check-to-clear window is as small as possible.
-                    let restoredItems = snapshot.pasteboardItems()
+                    let restoredItems = restoreSnapshot().pasteboardItems()
                     AppLogger.shared.info("Restoring old clipboard content")
                     if pasteboard.changeCount == writeChangeCount {
                         pasteboard.clearContents()

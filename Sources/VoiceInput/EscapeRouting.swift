@@ -11,24 +11,42 @@ enum EscapeRouting {
         case passThrough
     }
 
+    /// Which side owns the current physical Esc press. Decided at keyDown
+    /// and held until keyUp, so auto-repeat keyDowns never switch owners
+    /// mid-press — after the first Esc cancels, `sessionActive` is already
+    /// false, and handing repeat keyDowns to the app while still swallowing
+    /// the release would leak half a keystroke (and vice versa for a press
+    /// the app owns).
+    enum PressOwnership {
+        /// No Esc press is in flight — the next keyDown is a fresh press.
+        case none
+        /// We swallowed the keyDown; repeats and the release stay ours.
+        case consumed
+        /// The keyDown reached the app; repeats and the release stay there.
+        case passed
+    }
+
     static let keyCode: Int64 = 53
 
     /// ⌘⌥⎋ opens Force Quit — never intercepted, session or not: a wedged
     /// dictation is exactly when the user reaches for it.
     private static let forceQuit: CGEventFlags = [.maskCommand, .maskAlternate]
 
-    /// `pressSwallowed` is the tap's memory of the keyDown: the release is
-    /// consumed only when its press was, so the focused app never sees half
-    /// a keystroke. Every other Esc keyDown during an active session is a
-    /// cancel — including Esc pressed while the push-to-talk key is held —
-    /// and Esc with no session always belongs to the focused app.
-    nonisolated static func action(type: CGEventType, flags: CGEventFlags, sessionActive: Bool, pressSwallowed: Bool) -> Action {
+    /// Every fresh Esc keyDown during an active session is a cancel —
+    /// including Esc pressed while the push-to-talk key is held — and Esc
+    /// with no session always belongs to the focused app.
+    nonisolated static func action(type: CGEventType, flags: CGEventFlags, sessionActive: Bool, ownership: PressOwnership) -> Action {
         switch type {
         case .keyDown:
-            guard sessionActive, !flags.contains(forceQuit) else { return .passThrough }
-            return .consume
+            switch ownership {
+            case .consumed: return .consume
+            case .passed: return .passThrough
+            case .none:
+                guard sessionActive, !flags.contains(forceQuit) else { return .passThrough }
+                return .consume
+            }
         case .keyUp:
-            return pressSwallowed ? .consume : .passThrough
+            return ownership == .consumed ? .consume : .passThrough
         default:
             return .passThrough
         }

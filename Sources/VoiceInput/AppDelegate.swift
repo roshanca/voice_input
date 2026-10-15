@@ -48,6 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingSession: DictationSession?
     private var resultTimeout: Timer?
     private var recordingAnimationTimer: Timer?
+    /// The queued recording startup for the current session. Retained so
+    /// Esc can signal it — a task handle that outlives cancel() must stay
+    /// observable, never dropped.
+    private var recordingStartup: Task<Void, Never>?
     /// Injections with queued delivery stages (paste / restore / auto-send).
     /// Keeps Esc's "session active" window open until each delivery resolves.
     private var inFlightInjections = 0
@@ -385,13 +389,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingPanel.setText("")
         floatingPanel.show()
 
-        Task {
+        recordingStartup?.cancel()
+        recordingStartup = Task {
+            // Identity check at run time, not enqueue time: Esc or a hotkey
+            // release landing before this task runs must not leave the
+            // recognizer recording for a session that no longer exists.
+            let sessionID = session.id
+            guard self.activeSession?.id == sessionID, self.isHotkeyHeld, !Task<Never, Never>.isCancelled else { return }
             do {
-                try await speechRecognizer.startRecording(sessionID: session.id)
+                try await speechRecognizer.startRecording(sessionID: sessionID)
                 AppLogger.shared.info("Speech recording started successfully")
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
-                let sessionID = session.id
                 // This catch can land after a newer dictation already owns
                 // the panel — only the session that started this recording
                 // may surface its startup error.
@@ -417,6 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isHotkeyHeld = false
         syncEscapeInterception()
         AppLogger.shared.info("Hotkey released — stopping recording")
+        recordingStartup?.cancel()
         speechRecognizer.stopRecording()
         stopRecordingAnimation()
         SoundPlayer.recordStop()
@@ -446,6 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resultTimeout?.invalidate()
         resultTimeout = nil
         activeSession = nil
+        recordingStartup?.cancel()
         if pendingSession != nil {
             llmRefiner.cancel()
             pendingSession = nil

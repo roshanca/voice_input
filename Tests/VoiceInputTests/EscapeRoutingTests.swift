@@ -7,13 +7,13 @@ final class EscapeRoutingTests: XCTestCase {
         type: CGEventType = .keyDown,
         flags: CGEventFlags = [],
         sessionActive: Bool = true,
-        pressSwallowed: Bool = false
+        ownership: EscapeRouting.PressOwnership = .none
     ) -> EscapeRouting.Action {
         EscapeRouting.action(
             type: type,
             flags: flags,
             sessionActive: sessionActive,
-            pressSwallowed: pressSwallowed
+            ownership: ownership
         )
     }
 
@@ -50,14 +50,32 @@ final class EscapeRoutingTests: XCTestCase {
     /// A release is swallowed only when its press was — otherwise the
     /// focused app would see half a keystroke.
     func testKeyUpConsumedOnlyAfterConsumedPress() {
-        XCTAssertEqual(action(type: .keyUp, pressSwallowed: true), .consume)
-        XCTAssertEqual(action(type: .keyUp, pressSwallowed: false), .passThrough)
+        XCTAssertEqual(action(type: .keyUp, ownership: .consumed), .consume)
+        XCTAssertEqual(action(type: .keyUp, ownership: .none), .passThrough)
     }
 
     /// The release of a swallowed press stays swallowed even after the
     /// session ended — the app never saw the keyDown.
     func testKeyUpConsumedAfterSessionEnded() {
-        XCTAssertEqual(action(type: .keyUp, sessionActive: false, pressSwallowed: true), .consume)
+        XCTAssertEqual(action(type: .keyUp, sessionActive: false, ownership: .consumed), .consume)
+    }
+
+    /// Auto-repeat keyDowns of a swallowed press stay ours even though the
+    /// first Esc already cancelled the session — a repeat that leaked to the
+    /// app while the keyUp stays swallowed would deliver half a keystroke.
+    func testHeldEscRepeatsStayConsumedAfterCancel() {
+        XCTAssertEqual(action(sessionActive: false, ownership: .consumed), .consume)
+    }
+
+    /// Repeats of a press the app owns keep passing even if a session starts
+    /// mid-press — ownership was decided at the original keyDown.
+    func testRepeatsOfPassedPressKeepPassing() {
+        XCTAssertEqual(action(sessionActive: true, ownership: .passed), .passThrough)
+    }
+
+    /// A release for a press the app owns reaches the app.
+    func testKeyUpOfPassedPressPassesThrough() {
+        XCTAssertEqual(action(type: .keyUp, sessionActive: true, ownership: .passed), .passThrough)
     }
 
     /// Non-key events are never Esc business.
