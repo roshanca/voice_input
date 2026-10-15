@@ -16,6 +16,12 @@ final class HotkeyManager {
     var onEscape: (() -> Void)?
     /// Re-paste chord pressed — fires once per physical press.
     var onRePaste: (() -> Void)?
+    /// Translate-session hold edges — same press/release semantics as
+    /// dictation; which pipeline the session runs is the delegate's call.
+    var onTranslatePress: (() -> Void)?
+    var onTranslateRelease: (() -> Void)?
+    /// A tap/doubleTap gesture completed on a translate binding.
+    var onTranslateToggle: (() -> Void)?
     /// Called whenever the tap becomes active/inactive (menu bar icon dimming).
     var onTapStateChange: ((Bool) -> Void)?
 
@@ -24,11 +30,14 @@ final class HotkeyManager {
     /// Re-paste bindings — routed alongside dictation's but dispatched
     /// separately so the chord fires one action per press, not press+release.
     private(set) var rePasteBindings: [HotkeyBinding] = []
+    /// Translate bindings — push-to-talk like dictation's, but the session
+    /// submits to the translation prompt instead of refinement.
+    private(set) var translateBindings: [HotkeyBinding] = []
     private(set) var isTapActive = false
 
     /// Nonisolated mirror of the routed bindings for the C event-tap callback.
-    /// Updated only in `update(dictation:rePaste:)` (main actor); read on
-    /// the tap thread.
+    /// Updated only in `update(dictation:rePaste:translate:)` (main actor);
+    /// read on the tap thread.
     nonisolated(unsafe) fileprivate static var activeRoutedBindings: [RoutedBinding] = []
     /// Nonisolated mirror of "a dictation session is active", consulted by
     /// the tap callback on every Esc event: while false Esc passes through
@@ -41,7 +50,7 @@ final class HotkeyManager {
     /// tap callback — same nonisolated-static pattern as `escapeOwnership`.
     nonisolated(unsafe) fileprivate static var gestureStates: [HotkeyBinding: GestureRouting.State] = [:]
     /// Double-tap window mirrored from `NSEvent.doubleClickInterval` in
-    /// `update(dictation:rePaste:)` — that NSEvent read isn't guaranteed safe
+    /// `update(dictation:rePaste:translate:)` — that NSEvent read isn't guaranteed safe
     /// off the main thread, and a stale value is fine for a user preference.
     nonisolated(unsafe) fileprivate static var doubleTapInterval: TimeInterval = 0.35
     /// Set while a matched re-paste chord is held down: the first keyDown
@@ -73,15 +82,26 @@ final class HotkeyManager {
         UserDefaults.standard.rePasteHotkeyBindings = bindings
     }
 
+    /// Persisted translate bindings. Defaults to ⌃⌥T; new key, no migration.
+    static var savedTranslate: [HotkeyBinding] {
+        UserDefaults.standard.translateHotkeyBindings
+    }
+
+    static func persistTranslate(_ bindings: [HotkeyBinding]) {
+        UserDefaults.standard.translateHotkeyBindings = bindings
+    }
+
     /// Switch bindings for every business and (re)create the tap. The tap
     /// must be re-created when the event mask changes (Fn ↔ F-key);
     /// re-enabling is not enough.
-    func update(dictation: [HotkeyBinding], rePaste: [HotkeyBinding]) {
+    func update(dictation: [HotkeyBinding], rePaste: [HotkeyBinding], translate: [HotkeyBinding]) {
         dictationBindings = dictation
         rePasteBindings = rePaste
+        translateBindings = translate
         Self.activeRoutedBindings = HotkeyRouting.routed(
             dictation.map { RoutedBinding(business: .dictation, binding: $0) }
                 + rePaste.map { RoutedBinding(business: .rePaste, binding: $0) }
+                + translate.map { RoutedBinding(business: .translate, binding: $0) }
         )
         // A binding change mid-press must not inherit a half-counted
         // gesture or a stuck chord flag — drop all edge state with the list.
@@ -100,7 +120,7 @@ final class HotkeyManager {
 
     func start() {
         stop()
-        let allBindings = dictationBindings + rePasteBindings
+        let allBindings = dictationBindings + rePasteBindings + translateBindings
         guard !allBindings.isEmpty else {
             AppLogger.shared.warning("No hotkey bindings — tap not installed")
             setTapActive(false)
@@ -248,6 +268,17 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
                     HotkeyManager.shared.onRelease?()
                 }
             }
+        case .translate:
+            // Same hold edges as dictation — auto-repeat keyDowns on a held
+            // chord re-fire here and are absorbed by the session's held guard.
+            let isPress = routed.binding.hotkey.isPress(event: event)
+            Task { @MainActor in
+                if isPress {
+                    HotkeyManager.shared.onTranslatePress?()
+                } else {
+                    HotkeyManager.shared.onTranslateRelease?()
+                }
+            }
         case .rePaste:
             // One action per physical press, auto-repeat keyDowns and the
             // release swallowed silently so the chord can't leak into the
@@ -284,8 +315,15 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
         case .consume:
             return nil
         case .consumeAndToggle:
+            // A completed gesture means a single action for whichever
+            // business the binding belongs to — a tap-binding re-paste
+            // re-delivers once, a tap-binding translate toggles its session.
             Task { @MainActor in
-                HotkeyManager.shared.onToggle?()
+                switch routed.business {
+                case .dictation: HotkeyManager.shared.onToggle?()
+                case .rePaste: HotkeyManager.shared.onRePaste?()
+                case .translate: HotkeyManager.shared.onTranslateToggle?()
+                }
             }
             return nil
         case .passThrough:

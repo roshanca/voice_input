@@ -105,6 +105,18 @@ struct SettingsView: View {
             }
 
             Section {
+                TextField("Target language", text: $store.translateTargetLanguage)
+                LabeledContent("Hotkey") {
+                    Text(store.translateHotkeyDisplay)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Label("Voice Translation", systemImage: "translate")
+            } footer: {
+                Text("Hold \(store.translateHotkeyDisplay) and speak — on release the transcript is translated into the target language (or into Chinese when it is already in it). Needs a configured LLM profile; works even when refinement is off.")
+            }
+
+            Section {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Dictate")

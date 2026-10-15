@@ -146,6 +146,28 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .rePaste)
     }
 
+    /// Translate sits above both existing businesses on a full tie, so a
+    /// translate binding shadows identical dictation/re-paste bindings (#23).
+    func testTranslateBusinessOutranksOthersOnFullTie() {
+        let chord = Hotkey.chord(keyCode: 17, modifiers: [.control, .option])
+        let entries = [
+            routedBinding(chord, .hold, .dictation),
+            routedBinding(chord, .hold, .rePaste),
+            routedBinding(chord, .hold, .translate),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .translate)
+    }
+
+    /// Lower-priority businesses never preempt a more specific hotkey — a
+    /// dictation chord still beats a translate fn binding.
+    func testSpecificityStillBeatsBusinessPriority() {
+        let entries = [
+            routedBinding(.fnKey, .hold, .translate),
+            routedBinding(.chord(keyCode: 17, modifiers: [.control, .option]), .hold, .dictation),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .dictation)
+    }
+
     func testChordBindingCodableRoundTrip() throws {
         let bindings = [
             HotkeyBinding(hotkey: .chord(keyCode: 9, modifiers: [.control, .command]), behavior: .hold),

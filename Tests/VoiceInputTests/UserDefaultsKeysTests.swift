@@ -81,6 +81,41 @@ final class UserDefaultsKeysTests: XCTestCase {
                        .chord(keyCode: 9, modifiers: [.control, .command]))
     }
 
+    /// The translate feature ships with ⌃⌥T as its persisted default — a
+    /// brand-new install must decode exactly that binding (#23).
+    func testTranslateHotkeyBindingsDefaultsToCtrlOptT() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.translateHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 17, modifiers: [.control, .option]), behavior: .hold)])
+    }
+
+    func testTranslateHotkeyBindingsRoundTrip() {
+        let isolated = IsolatedDefaults()
+        let custom = [HotkeyBinding(hotkey: .chord(keyCode: 8, modifiers: [.control, .option]), behavior: .hold)]
+        isolated.defaults.translateHotkeyBindings = custom
+        XCTAssertEqual(isolated.defaults.translateHotkeyBindings, custom)
+    }
+
+    /// A corrupted or empty stored payload falls back to the ⌃⌥T default
+    /// rather than silently disabling translate.
+    func testTranslateHotkeyBindingsFallsBackOnEmptyPayload() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.set(Data("[]".utf8), forKey: "translateHotkeyBindings")
+        XCTAssertEqual(isolated.defaults.translateHotkeyBindings.first?.hotkey,
+                       .chord(keyCode: 17, modifiers: [.control, .option]))
+    }
+
+    /// Default target is English; a blank stored value normalizes back to
+    /// English rather than producing a broken prompt (#23).
+    func testTranslateTargetLanguageDefaultsAndNormalizesBlank() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "English")
+        isolated.defaults.translateTargetLanguage = "French"
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "French")
+        isolated.defaults.translateTargetLanguage = "   "
+        XCTAssertEqual(isolated.defaults.translateTargetLanguage, "English")
+    }
+
     func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
         let isolated = IsolatedDefaults()
         let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,

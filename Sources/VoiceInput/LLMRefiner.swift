@@ -41,18 +41,41 @@ final class LLMRefiner {
         self.apiKeyOverride = apiKeyOverride
     }
 
+    /// Which post-ASR pass a request performs. Both stream through the same
+    /// request/delegate machinery; only the prompts differ.
+    enum Mode {
+        /// Correct ASR errors only — the profile's custom system prompt when
+        /// set, else the built-in default.
+        case refine
+        /// Translate the transcript into the given language. The profile's
+        /// custom prompt describes refinement, not translation, so this mode
+        /// always uses its own prompt.
+        case translate(targetLanguage: String)
+    }
+
     /// requestID binds every callback of this request to the dictation
     /// session that issued it — the delegate drops callbacks whose id no
     /// longer matches its current session.
     func refine(text: String, requestID: UUID) {
-        AppLogger.shared.info("LLMRefiner.refine called — provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
+        start(text: text, requestID: requestID, mode: .refine)
+    }
+
+    /// Translate session: identical streaming/cancel machinery to `refine`,
+    /// translation prompt. `targetLanguage` arrives with the session so a
+    /// settings change mid-flight can't redirect a committed request.
+    func translate(text: String, requestID: UUID, targetLanguage: String) {
+        start(text: text, requestID: requestID, mode: .translate(targetLanguage: targetLanguage))
+    }
+
+    private func start(text: String, requestID: UUID, mode: Mode) {
+        AppLogger.shared.info("LLMRefiner request started — provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
         // A new request supersedes one still in flight: cancel it so its late
         // callbacks can't clobber the new session's result. Cancellation is
         // not instant, so the delegate must still check requestID.
         task?.cancel()
         task = nil
         guard isConfigured else {
-            AppLogger.shared.warning("LLMRefiner not configured — skipping refinement")
+            AppLogger.shared.warning("LLMRefiner not configured — skipping request")
             delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
             return
         }
@@ -66,11 +89,17 @@ final class LLMRefiner {
             return
         }
 
-        let systemPrompt = resolvedSystemPrompt()
-        // Wrap the transcript so a dictated question/command doesn't look like
-        // a bare user turn — that shape is what makes chat-tuned models answer
-        // it instead of correcting it.
-        let userContent = "Correct this speech transcript:\n<transcript>\n\(text)\n</transcript>"
+        let systemPrompt = resolvedSystemPrompt(for: mode)
+        let userContent: String
+        switch mode {
+        case .refine:
+            // Wrap the transcript so a dictated question/command doesn't look
+            // like a bare user turn — that shape is what makes chat-tuned
+            // models answer it instead of correcting it.
+            userContent = "Correct this speech transcript:\n<transcript>\n\(text)\n</transcript>"
+        case .translate:
+            userContent = TranslationPrompt.userContent(for: text)
+        }
 
         var body: [String: Any] = [
             "model": config.model,
@@ -203,9 +232,17 @@ Rules:
 Output only the corrected text, with no introduction, labels, or markdown.
 """
 
-    private func resolvedSystemPrompt() -> String {
-        let custom = config.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = custom.isEmpty ? LLMRefiner.defaultSystemPrompt : custom
+    private func resolvedSystemPrompt(for mode: Mode) -> String {
+        let base: String
+        switch mode {
+        case .refine:
+            let custom = config.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            base = custom.isEmpty ? LLMRefiner.defaultSystemPrompt : custom
+        case .translate(let targetLanguage):
+            base = TranslationPrompt.systemPrompt(targetLanguage: targetLanguage)
+        }
+        // The custom-vocabulary fragment states preferred forms — as relevant
+        // to a translation target as to a correction.
         return base + DictionaryStore.shared.promptFragment()
     }
 }
