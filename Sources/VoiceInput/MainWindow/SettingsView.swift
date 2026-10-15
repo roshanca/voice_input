@@ -108,7 +108,7 @@ struct SettingsView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Dictate")
-                        Text("Hold to dictate, release to insert.")
+                        Text(store.hotkeyBehavior.usageHint)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -121,6 +121,12 @@ struct SettingsView: View {
                     .labelsHidden()
                     .frame(width: 160)
                 }
+                Picker("Trigger", selection: $store.hotkeyBehavior) {
+                    ForEach(HotkeyBehavior.allCases, id: \.self) { behavior in
+                        Text(behavior.displayName).tag(behavior)
+                    }
+                }
+                .pickerStyle(.segmented)
             } header: {
                 Label("Keyboard Shortcut", systemImage: "keyboard")
             } footer: {

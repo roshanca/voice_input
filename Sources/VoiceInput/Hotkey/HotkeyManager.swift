@@ -9,6 +9,9 @@ final class HotkeyManager {
 
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
+    /// A tap/doubleTap gesture completed on a dictation binding — the
+    /// delegate decides whether that means start or stop.
+    var onToggle: (() -> Void)?
     /// Esc pressed while a dictation session is active (cancel request).
     var onEscape: (() -> Void)?
     /// Called whenever the tap becomes active/inactive (menu bar icon dimming).
@@ -28,6 +31,13 @@ final class HotkeyManager {
     /// Which side owns the current physical Esc press — decided at keyDown,
     /// held until keyUp so auto-repeats never switch owners mid-press.
     nonisolated(unsafe) fileprivate static var escapeOwnership: EscapeRouting.PressOwnership = .none
+    /// Per-binding tap/doubleTap state, consulted and mutated only inside the
+    /// tap callback — same nonisolated-static pattern as `escapeOwnership`.
+    nonisolated(unsafe) fileprivate static var gestureStates: [HotkeyBinding: GestureRouting.State] = [:]
+    /// Double-tap window mirrored from `NSEvent.doubleClickInterval` in
+    /// `update(dictation:)` — that NSEvent read isn't guaranteed safe off
+    /// the main thread, and a stale value is fine for a user preference.
+    nonisolated(unsafe) fileprivate static var doubleTapInterval: TimeInterval = 0.35
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -52,6 +62,10 @@ final class HotkeyManager {
         Self.activeRoutedBindings = HotkeyRouting.routed(
             bindings.map { RoutedBinding(business: .dictation, binding: $0) }
         )
+        // A binding change mid-press must not inherit a half-counted
+        // gesture — drop all tap/doubleTap state with the new list.
+        Self.gestureStates = [:]
+        Self.doubleTapInterval = NSEvent.doubleClickInterval
         stop()
         start()
     }
@@ -210,8 +224,26 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
         }
         return nil
     case .tap, .doubleTap:
-        // Expressible in the model but not yet dispatched — let the event
-        // through rather than swallowing a key the app won't act on.
-        return Unmanaged.passUnretained(event)
+        let edge: GestureRouting.Edge = routed.binding.hotkey.isPress(event: event) ? .press : .release
+        var state = HotkeyManager.gestureStates[routed.binding] ?? GestureRouting.State()
+        let action = GestureRouting.action(
+            edge: edge,
+            behavior: routed.binding.behavior,
+            now: ProcessInfo.processInfo.systemUptime,
+            doubleTapInterval: HotkeyManager.doubleTapInterval,
+            state: &state
+        )
+        HotkeyManager.gestureStates[routed.binding] = state
+        switch action {
+        case .consume:
+            return nil
+        case .consumeAndToggle:
+            Task { @MainActor in
+                HotkeyManager.shared.onToggle?()
+            }
+            return nil
+        case .passThrough:
+            return Unmanaged.passUnretained(event)
+        }
     }
 }

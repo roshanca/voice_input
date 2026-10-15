@@ -42,10 +42,21 @@ final class SettingsStore: ObservableObject {
     @Published var hotkey: Hotkey {
         didSet {
             guard hotkey != oldValue else { return }
-            let bindings = [HotkeyBinding(hotkey: hotkey, behavior: .hold)]
-            HotkeyManager.persistDictation(bindings)
-            HotkeyManager.shared.update(dictation: bindings)
+            persistDictationBinding()
         }
+    }
+    /// The first dictation binding's behavior (hold / tap / doubleTap).
+    @Published var hotkeyBehavior: HotkeyBehavior {
+        didSet {
+            guard hotkeyBehavior != oldValue else { return }
+            persistDictationBinding()
+        }
+    }
+
+    private func persistDictationBinding() {
+        let bindings = [HotkeyBinding(hotkey: hotkey, behavior: hotkeyBehavior)]
+        HotkeyManager.persistDictation(bindings)
+        HotkeyManager.shared.update(dictation: bindings)
     }
 
     /// Available audio input devices; refreshed when the settings window appears.
@@ -67,6 +78,7 @@ final class SettingsStore: ObservableObject {
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         hotkey = HotkeyManager.savedDictation.first?.hotkey ?? .fnKey
+        hotkeyBehavior = HotkeyManager.savedDictation.first?.behavior ?? .hold
         llmConfigs = defaults.llmConfigs
         selectedConfigID = defaults.selectedConfigID
     }
