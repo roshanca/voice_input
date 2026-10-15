@@ -142,21 +142,25 @@ final class TextInjector {
             return
         }
 
-        // The snapshot is only valid while the clipboard stays untouched —
-        // re-check immediately before clearing so a copy that landed during
-        // capture/setup aborts the injection instead of being destroyed.
-        guard pasteboard.changeCount == snapshotBaseCount else {
-            AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
-            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
-            return
-        }
-
         // The target is still checked once more right before the paste below —
         // this early check only avoids clobbering the clipboard for nothing.
+        // It runs before the final ownership re-check on purpose: the AX
+        // round-trip can take a moment, and a copy landing during it must
+        // still abort the injection.
         if let mismatch = Self.mismatch(for: target) {
             AppLogger.shared.warning("Injection skipped — target mismatch: \(mismatch); parking result")
             finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: nil)
             park(text: text, mismatch: mismatch, completion: completion)
+            return
+        }
+
+        // The snapshot is only valid while the clipboard stays untouched —
+        // re-check immediately before clearing so a copy that landed during
+        // capture/setup or the AX validation above aborts the injection
+        // instead of being destroyed.
+        guard pasteboard.changeCount == snapshotBaseCount else {
+            AppLogger.shared.info("Clipboard changed before write — preserving user's content, skipping injection")
+            finishWithoutPaste(previousSource: previousSource, wasCJK: wasCJK, completion: completion)
             return
         }
 

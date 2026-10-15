@@ -88,6 +88,15 @@ struct DictationTarget {
         )
     }
 
+    /// How the current focused element compares to the capture once its
+    /// token stops matching.
+    private enum ElementComparison {
+        case same
+        case different
+        /// Not enough identity evidence to tell — treated as unsafe.
+        case ambiguous
+    }
+
     /// Compares the current focus against the captured target.
     /// Returns nil when the target still holds, otherwise the mismatch.
     ///
@@ -98,7 +107,7 @@ struct DictationTarget {
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             return .appTerminated
         }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+        guard Self.frontmostPID == pid else {
             return .appChanged
         }
         guard let captured = focusedElement else { return nil }
@@ -115,30 +124,74 @@ struct DictationTarget {
             return error == .noValue ? .focusedElementChanged : .unverifiable
         }
         let current = ref as! AXUIElement
-        if CFEqual(captured, current) { return nil }
-        AXUIElementSetMessagingTimeout(current, Self.axTimeout)
-        return fingerprintMatches(current, includeGeometry: includeGeometry)
-            ? nil
-            : .focusedElementChanged
+
+        let verdict: Mismatch?
+        if CFEqual(captured, current) {
+            verdict = nil
+        } else {
+            AXUIElementSetMessagingTimeout(current, Self.axTimeout)
+            switch compare(current: current, includeGeometry: includeGeometry) {
+            case .same: verdict = nil
+            case .different: verdict = .focusedElementChanged
+            case .ambiguous: verdict = .unverifiable
+            }
+        }
+
+        // The AX round-trips above take real time — the app check at the top
+        // can go stale while they run, so identity is verified one last time
+        // before the target is reported valid.
+        if verdict == nil {
+            guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+                return .appTerminated
+            }
+            guard Self.frontmostPID == pid else { return .appChanged }
+        }
+        return verdict
     }
 
-    /// Fallback for apps whose element tokens churn between queries: if every
-    /// observable identity attribute still matches, it is the same field.
-    /// Geometry is part of the fingerprint — two fields in one window rarely
-    /// share role, identifier, title, position and size all at once.
-    private func fingerprintMatches(_ element: AXUIElement, includeGeometry: Bool) -> Bool {
-        guard Self.stringAttribute(kAXRoleAttribute, of: element) == elementRole,
-              Self.stringAttribute(kAXSubroleAttribute, of: element) == elementSubrole,
-              Self.stringAttribute(kAXIdentifierAttribute, of: element) == elementIdentifier,
-              Self.stringAttribute(kAXDescriptionAttribute, of: element) == elementDescription,
-              Self.stringAttribute(kAXTitleAttribute, of: element) == elementTitle else {
-            return false
+    /// Fallback for apps whose element tokens churn between queries.
+    ///
+    /// Equal nil attributes prove nothing — a match only counts when at least
+    /// one concrete attribute (identifier, title, … or the frame when
+    /// geometry is included) is present on both sides and equal. With zero
+    /// evidence the element can't be told apart from a sibling field, so the
+    /// result is `.ambiguous` and delivery is suppressed.
+    private func compare(current element: AXUIElement, includeGeometry: Bool) -> ElementComparison {
+        // Role is the baseline: a different kind of element is never the
+        // same field, and it is too common to count as evidence by itself.
+        guard Self.stringAttribute(kAXRoleAttribute, of: element) == elementRole else {
+            return .different
         }
-        if includeGeometry, let elementFrame,
-           let currentFrame = Self.frameOf(element), currentFrame != elementFrame {
-            return false
+
+        var evidence = 0
+        for (attribute, capturedValue) in [
+            (kAXSubroleAttribute, elementSubrole),
+            (kAXIdentifierAttribute, elementIdentifier),
+            (kAXDescriptionAttribute, elementDescription),
+            (kAXTitleAttribute, elementTitle),
+        ] {
+            let currentValue = Self.stringAttribute(attribute, of: element)
+            guard currentValue == capturedValue else { return .different }
+            if capturedValue != nil { evidence += 1 }
         }
-        return true
+
+        if includeGeometry {
+            switch (elementFrame, Self.frameOf(element)) {
+            case let (capturedFrame?, currentFrame?):
+                guard capturedFrame == currentFrame else { return .different }
+                evidence += 1
+            case (nil, nil):
+                break
+            default:
+                return .different
+            }
+        }
+
+        return evidence > 0 ? .same : .ambiguous
+    }
+
+    private static var frontmostPID: pid_t? {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
 
     private static func copyFocusedElement(of appElement: AXUIElement) -> AXUIElement? {

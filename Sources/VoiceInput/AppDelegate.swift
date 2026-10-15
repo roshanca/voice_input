@@ -459,6 +459,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// path, a flashed panel message when the target moved or the result had
     /// to be parked for manual recovery.
     private func reportInjectionOutcome(_ outcome: InjectionOutcome) {
+        if case .inserted = outcome { return }
+
+        // The outcome arrives up to ~a second after submission. A newer
+        // dictation started in the meantime owns the panel — stale feedback
+        // would overwrite its transcript and schedule a hide underneath it.
+        guard activeSession == nil, pendingSession == nil, !isHotkeyHeld else {
+            AppLogger.shared.info("Suppressing injection feedback — a newer dictation owns the panel")
+            return
+        }
+
         switch outcome {
         case .inserted:
             break
