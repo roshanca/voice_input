@@ -7,7 +7,11 @@ final class FloatingPanel: NSPanel {
     private let visualEffectView = NSVisualEffectView()
     private let waveformView = WaveformView(frame: NSRect(x: 0, y: 0, width: 44, height: 32))
     private let textLabel = NSTextField(labelWithString: "")
+    private let useOriginalButton = NSButton(title: "Use Original", target: nil, action: nil)
     private let contentStack = NSStackView()
+
+    /// Invoked when the user clicks "Use Original" during refinement.
+    var onUseOriginal: (() -> Void)?
 
     /// Bumped on every show/hide so a pending hide completion can't order the
     /// panel out from underneath a later show.
@@ -99,12 +103,24 @@ final class FloatingPanel: NSPanel {
         textLabel.maximumNumberOfLines = 1
         textLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        // Shown only while an LLM refinement is in flight. A nonactivating
+        // panel still receives clicks, so the affordance works without
+        // stealing focus from the dictation target.
+        useOriginalButton.target = self
+        useOriginalButton.action = #selector(useOriginalClicked)
+        useOriginalButton.bezelStyle = .rounded
+        useOriginalButton.controlSize = .small
+        useOriginalButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        useOriginalButton.isHidden = true
+        useOriginalButton.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
         contentStack.orientation = .horizontal
         contentStack.spacing = 12
         contentStack.alignment = .centerY
         contentStack.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 20)
         contentStack.addArrangedSubview(waveformView)
         contentStack.addArrangedSubview(textLabel)
+        contentStack.addArrangedSubview(useOriginalButton)
         contentStack.translatesAutoresizingMaskIntoConstraints = false
 
         visualEffectView.addSubview(contentStack)
@@ -175,6 +191,9 @@ final class FloatingPanel: NSPanel {
 
     func show() {
         visibilityGeneration += 1
+        // Every show starts a fresh dictation state — a leftover "Use
+        // Original" button from a canceled refinement must not leak into it.
+        useOriginalButton.isHidden = true
         if let screen = screenUnderMouse() {
             setFrame(centeredFrame(width: targetWidth(), on: screen), display: false)
         }
@@ -193,6 +212,7 @@ final class FloatingPanel: NSPanel {
 
     func hide() {
         visibilityGeneration += 1
+        useOriginalButton.isHidden = true
         let generation = visibilityGeneration
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.22
@@ -226,6 +246,23 @@ final class FloatingPanel: NSPanel {
 
     func setText(_ text: String) {
         textLabel.stringValue = text
+        resizeToFit()
+    }
+
+    /// The "Use Original" affordance, meaningful only while a refinement is
+    /// in flight. Toggling it changes the stack's fitting size, so the panel
+    /// width animates along with it.
+    func setUseOriginalVisible(_ visible: Bool) {
+        guard useOriginalButton.isHidden == visible else { return }
+        useOriginalButton.isHidden = !visible
+        resizeToFit()
+    }
+
+    @objc private func useOriginalClicked() {
+        onUseOriginal?()
+    }
+
+    private func resizeToFit() {
         let newWidth = targetWidth()
         guard abs(newWidth - frame.width) > 0.5, isVisible, let screen = currentScreen() else { return }
 

@@ -68,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = DictionaryStore.shared
         speechRecognizer.delegate = self
         llmRefiner.delegate = self
+        floatingPanel.onUseOriginal = { [weak self] in self?.useOriginalText() }
         speechRecognizer.warmUp()
         setupHotkey()
     }
@@ -443,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if session.llmEnabled && llmRefiner.isConfigured {
             AppLogger.shared.info("LLM enabled and configured — starting refinement")
             floatingPanel.setText("Refining…")
+            floatingPanel.setUseOriginalVisible(true)
             session.submittedText = trimmed
             pendingSession = session
             llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated), requestID: session.id)
@@ -455,6 +457,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             recordHistory(raw: trimmed, refined: nil, output: output, session: session)
         }
+    }
+
+    /// "Use Original" while a refinement is in flight: cancel the request and
+    /// commit the raw transcript through the same injection path a direct
+    /// dictation uses. `pendingSession` is cleared before the cancel so an
+    /// LLM result racing the click is dropped by the requestID guard instead
+    /// of double-injecting or double-recording.
+    private func useOriginalText() {
+        guard let session = pendingSession else { return }
+        pendingSession = nil
+        AppLogger.shared.info("Use Original chosen — canceling pending refinement")
+        llmRefiner.cancel()
+        floatingPanel.hide()
+        let output = RefinementFallback.committedText(
+            submittedText: session.submittedText,
+            dictionaryDirectReplacement: session.dictionaryDirectReplacement,
+            entries: DictionaryStore.shared.entries
+        )
+        TextInjector.shared.inject(text: output, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+            self?.reportInjectionOutcome(outcome)
+        }
+        recordHistory(raw: session.submittedText, refined: nil, output: output, session: session)
     }
 
     /// Surfaces what happened to a submitted dictation — silent on the normal
@@ -591,9 +615,11 @@ extension AppDelegate: LLMRefinerDelegate {
         pendingSession = nil
         AppLogger.shared.error("LLM refinement failed: \(error.localizedDescription)")
         floatingPanel.hide()
-        let fallback = session.dictionaryDirectReplacement
-            ? DictionaryStore.shared.applyReplacements(to: session.submittedText)
-            : session.submittedText
+        let fallback = RefinementFallback.committedText(
+            submittedText: session.submittedText,
+            dictionaryDirectReplacement: session.dictionaryDirectReplacement,
+            entries: DictionaryStore.shared.entries
+        )
         TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
             self?.reportInjectionOutcome(outcome)
         }
