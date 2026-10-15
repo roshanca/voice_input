@@ -56,7 +56,7 @@ final class SettingsStore: ObservableObject {
     private func persistDictationBinding() {
         let bindings = [HotkeyBinding(hotkey: hotkey, behavior: hotkeyBehavior)]
         HotkeyManager.persistDictation(bindings)
-        HotkeyManager.shared.update(dictation: bindings)
+        HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste)
     }
 
     /// Available audio input devices; refreshed when the settings window appears.
