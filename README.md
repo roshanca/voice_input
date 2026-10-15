@@ -39,6 +39,8 @@ make clean
 
 This produces `VoiceInput.app` in the project root, signed with the local **"VoiceInput Dev"** identity (a stable self-signed certificate) so that macOS TCC permissions persist across rebuilds.
 
+Always run the app through `make` targets — the bundle embeds `Sparkle.framework`, which a bare `swift build`/`swift run` binary can't locate at runtime (a SwiftPM limitation with executable targets). Signing identities can be overridden per machine via `Config/Signing.local.mk`, and `make dmg` packages a distributable disk image — see [docs/Release.md](docs/Release.md).
+
 ## Usage
 
 1. Launch the app — a microphone icon appears in the menu bar.
