@@ -48,6 +48,10 @@ struct DictationTarget {
     /// Bounds AX replies from a stuck or busy app.
     private static let axTimeout: Float = 0.2
 
+    /// How many validate-then-confirm passes run before a target whose
+    /// element token keeps churning is reported unverifiable.
+    private static let maxValidationPasses = 2
+
     /// Records the frontmost app and its focused element, if readable.
     /// Returns nil only when no frontmost app can be determined at all.
     static func capture() -> DictationTarget? {
@@ -62,7 +66,7 @@ struct DictationTarget {
         if HotkeyManager.checkAccessibility() {
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, axTimeout)
-            if let focused = copyFocusedElement(of: appElement) {
+            if let focused = copyFocusedElement(of: appElement).element {
                 AXUIElementSetMessagingTimeout(focused, axTimeout)
                 element = focused
                 role = stringAttribute(kAXRoleAttribute, of: focused)
@@ -114,61 +118,43 @@ struct DictationTarget {
 
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, Self.axTimeout)
-        var ref: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(
-            appElement, kAXFocusedUIElementAttribute as CFString, &ref
-        )
-        guard error == .success, let ref else {
-            // An explicit "no value" means focus left the recorded element;
-            // anything else means the answer never arrived.
-            return error == .noValue ? .focusedElementChanged : .unverifiable
-        }
-        let current = ref as! AXUIElement
 
-        var verdict: Mismatch?
-        if CFEqual(captured, current) {
-            verdict = nil
-        } else {
-            AXUIElementSetMessagingTimeout(current, Self.axTimeout)
-            switch compare(current: current, includeGeometry: includeGeometry) {
-            case .same: verdict = nil
-            case .different: verdict = .focusedElementChanged
-            case .ambiguous: verdict = .unverifiable
-            }
-        }
+        let (fetched, fetchError) = Self.copyFocusedElement(of: appElement)
+        guard var current = fetched else { return Self.fetchMismatch(fetchError) }
 
-        if verdict == nil {
-            // Focus can move while the queries above run — re-read the
-            // focused element and require it to still verify. A different
-            // token isn't yet proof of a change (churned tokens are why the
-            // fingerprint exists), but the refetched element must then carry
-            // the same distinguishing evidence as the capture.
-            var confirmRef: CFTypeRef?
-            let confirmError = AXUIElementCopyAttributeValue(
-                appElement, kAXFocusedUIElementAttribute as CFString, &confirmRef
-            )
-            guard confirmError == .success, let confirmRef else {
-                return confirmError == .noValue ? .focusedElementChanged : .unverifiable
-            }
-            let confirmed = confirmRef as! AXUIElement
-            if !CFEqual(confirmed, current) {
-                AXUIElementSetMessagingTimeout(confirmed, Self.axTimeout)
-                switch compare(current: confirmed, includeGeometry: includeGeometry) {
+        // Every pass ends with a fresh focused-element read compared by token
+        // only — validation must never finish on fingerprint work, because
+        // focus can move while those queries run. A differing confirmation
+        // becomes the next pass's candidate; tokens that keep churning
+        // exhaust the passes and fail closed as unverifiable.
+        var passes = 0
+        while true {
+            if !CFEqual(captured, current) {
+                AXUIElementSetMessagingTimeout(current, Self.axTimeout)
+                switch compare(current: current, includeGeometry: includeGeometry) {
                 case .same: break
                 case .different: return .focusedElementChanged
                 case .ambiguous: return .unverifiable
                 }
             }
 
-            // The AX round-trips above take real time — the app check at the
-            // top can go stale while they run, so identity is verified one
-            // last time before the target is reported valid.
-            guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
-                return .appTerminated
-            }
-            guard Self.frontmostPID == pid else { return .appChanged }
+            let (confirmed, confirmError) = Self.copyFocusedElement(of: appElement)
+            guard let confirmed else { return Self.fetchMismatch(confirmError) }
+            if CFEqual(confirmed, current) { break }
+
+            passes += 1
+            guard passes < Self.maxValidationPasses else { return .unverifiable }
+            current = confirmed
         }
-        return verdict
+
+        // The AX round-trips above take real time — the app check at the
+        // top can go stale while they run, so identity is verified one
+        // last time before the target is reported valid.
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+            return .appTerminated
+        }
+        guard Self.frontmostPID == pid else { return .appChanged }
+        return nil
     }
 
     /// Fallback for apps whose element tokens churn between queries.
@@ -235,12 +221,22 @@ struct DictationTarget {
         NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
 
-    private static func copyFocusedElement(of appElement: AXUIElement) -> AXUIElement? {
+    /// The app's focused element, keeping the AX error so callers can tell
+    /// "focus went nowhere" from "no answer arrived".
+    private static func copyFocusedElement(of appElement: AXUIElement) -> (element: AXUIElement?, error: AXError) {
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        let error = AXUIElementCopyAttributeValue(
             appElement, kAXFocusedUIElementAttribute as CFString, &ref
-        ) == .success, let ref else { return nil }
-        return (ref as! AXUIElement)
+        )
+        guard error == .success, let ref else { return (nil, error) }
+        let element = ref as! AXUIElement
+        return (element, error)
+    }
+
+    private static func fetchMismatch(_ error: AXError) -> Mismatch {
+        // An explicit "no value" means focus left the recorded element;
+        // anything else means the answer never arrived.
+        error == .noValue ? .focusedElementChanged : .unverifiable
     }
 
     private static func stringAttribute(_ name: String, of element: AXUIElement) -> String? {
