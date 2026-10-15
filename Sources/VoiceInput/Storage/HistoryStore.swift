@@ -4,24 +4,37 @@ struct DictationRecord: Codable, Identifiable, Equatable {
     let id: UUID
     let date: Date
     let durationSeconds: Double
-    /// Raw speech-recognition output.
+    /// Raw speech-recognition output, before dictionary replacement or LLM refinement.
     let rawText: String
     /// LLM-refined text, nil when refinement was disabled or failed.
     let refinedText: String?
+    /// The text actually committed — injected into the target or parked for manual paste.
+    let outputText: String
     let wordCount: Int
     let language: String
 
-    /// The text that was actually inserted.
-    var finalText: String { refinedText ?? rawText }
-
-    init(id: UUID = UUID(), date: Date, durationSeconds: Double, rawText: String, refinedText: String?, language: String) {
+    init(id: UUID = UUID(), date: Date, durationSeconds: Double, rawText: String, refinedText: String?, outputText: String, language: String) {
         self.id = id
         self.date = date
         self.durationSeconds = durationSeconds
         self.rawText = rawText
         self.refinedText = refinedText
+        self.outputText = outputText
         self.wordCount = DictationRecord.countWords(rawText)
         self.language = language
+    }
+
+    /// Records written before `outputText` existed committed `refinedText ?? rawText`.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        date = try container.decode(Date.self, forKey: .date)
+        durationSeconds = try container.decode(Double.self, forKey: .durationSeconds)
+        rawText = try container.decode(String.self, forKey: .rawText)
+        refinedText = try container.decodeIfPresent(String.self, forKey: .refinedText)
+        outputText = try container.decodeIfPresent(String.self, forKey: .outputText) ?? refinedText ?? rawText
+        wordCount = try container.decodeIfPresent(Int.self, forKey: .wordCount) ?? DictationRecord.countWords(rawText)
+        language = try container.decode(String.self, forKey: .language)
     }
 
     /// Latin scripts: whitespace-separated words. CJK: non-whitespace characters.

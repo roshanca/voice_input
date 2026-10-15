@@ -11,7 +11,7 @@ struct HistoryView: View {
         guard !query.isEmpty else { return history.records }
         return history.records.filter {
             $0.rawText.localizedCaseInsensitiveContains(query) ||
-            ($0.refinedText?.localizedCaseInsensitiveContains(query) ?? false)
+            $0.outputText.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -46,7 +46,7 @@ struct HistoryView: View {
                 List(filtered) { record in
                     HistoryRow(record: record)
                         .contextMenu {
-                            Button("Copy") { copy(record.finalText) }
+                            Button("Copy") { copy(record.outputText) }
                             Button("Delete", role: .destructive) {
                                 history.delete(id: record.id)
                             }
@@ -76,9 +76,9 @@ private struct HistoryRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(record.finalText)
+            Text(record.outputText)
                 .lineLimit(3)
-            if let refined = record.refinedText, refined != record.rawText {
+            if record.outputText != record.rawText {
                 Text(record.rawText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
