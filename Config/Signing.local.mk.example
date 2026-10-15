@@ -1,0 +1,9 @@
+# Copy this file to Config/Signing.local.mk and override whatever you need.
+# Config/Signing.local.mk is gitignored — never commit personal signing
+# settings or certificates.
+
+# Example: sign with a Developer ID identity for a notarized release build.
+# CODESIGN_IDENTITY = Developer ID Application: Your Name (TEAMID)
+
+# Example: ad-hoc signing on a machine without the VoiceInput Dev cert.
+# CODESIGN_IDENTITY = -

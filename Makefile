@@ -6,16 +6,22 @@ APP_BUNDLE = $(APP_NAME).app
 APP_CONTENTS = $(APP_BUNDLE)/Contents
 APP_MACOS = $(APP_CONTENTS)/MacOS
 APP_RESOURCES = $(APP_CONTENTS)/Resources
+APP_FRAMEWORKS = $(APP_CONTENTS)/Frameworks
 ICON_SOURCE = Assets/AppIcon.png
 ICONSET_DIR = $(BUILD_DIR)/AppIcon.iconset
 # Auto-stamped into the bundle's CFBundleVersion on every build.
 BUILD_VERSION = $(shell date +%Y%m%d.%H%M)
+DMG_PATH = $(APP_NAME).dmg
 
-.PHONY: build run install clean test
+# Shared signing defaults, overridable per-machine (see docs/Release.md).
+include Config/Signing.shared.mk
+-include Config/Signing.local.mk
+
+.PHONY: build run install clean test dmg
 
 build:
 	@echo "Building $(APP_NAME)..."
-	swift build -c release
+	swift build -c release -Xlinker -rpath -Xlinker @executable_path/../Frameworks
 	@echo "Creating app bundle..."
 	rm -rf $(APP_BUNDLE)
 	mkdir -p $(APP_MACOS)
@@ -38,14 +44,28 @@ build:
 	sips -z 512 512   $(ICON_SOURCE) --out $(ICONSET_DIR)/icon_512x512.png
 	cp $(ICON_SOURCE) $(ICONSET_DIR)/icon_512x512@2x.png
 	iconutil -c icns $(ICONSET_DIR) -o $(APP_RESOURCES)/AppIcon.icns
+	@echo "Embedding Sparkle.framework..."
+	@SPARKLE_FW=$$(find $(BUILD_DIR)/artifacts -type d -name "Sparkle.framework" -path "*macos-arm64*" | head -1); \
+	if [ -n "$$SPARKLE_FW" ]; then \
+		mkdir -p $(APP_FRAMEWORKS); \
+		rm -rf $(APP_FRAMEWORKS)/Sparkle.framework; \
+		ditto "$$SPARKLE_FW" $(APP_FRAMEWORKS)/Sparkle.framework; \
+	else \
+		echo "Warning: Sparkle.framework not found under $(BUILD_DIR)/artifacts — bundle will lack updater support"; \
+	fi
 	@echo "Signing app bundle..."
-	codesign --force --deep --sign "VoiceInput Dev" \
-		--entitlements VoiceInput.entitlements \
+	codesign --force --deep --sign "$(CODESIGN_IDENTITY)" \
+		--entitlements $(CODESIGN_ENTITLEMENTS) \
 		$(APP_BUNDLE)
 	@echo "Build complete: $(APP_BUNDLE)"
 
 test:
-	swift test
+	# The products-dir rpath lets the test bundle find the copied
+	# Sparkle.framework — SwiftPM doesn't add it for executable deps.
+	swift test -Xlinker -rpath -Xlinker $(shell swift build --show-bin-path)
+
+dmg: build
+	tools/build_dmg.sh $(APP_BUNDLE) $(DMG_PATH)
 
 run: build
 	open $(APP_BUNDLE)
@@ -58,4 +78,5 @@ install: build
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -rf $(APP_BUNDLE)
+	rm -f $(DMG_PATH)
 	@echo "Cleaned build artifacts."

@@ -1,11 +1,13 @@
 import Cocoa
 import Carbon
+import Sparkle
 @preconcurrency import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var logsWindowController: LogsWindowController?
+    private let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     private var tapActive: Bool { HotkeyManager.shared.isTapActive }
 
@@ -118,6 +120,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(openItem)
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsPage(_:)), keyEquivalent: ",")
         menu.addItem(settingsItem)
+        let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+        updateItem.target = updaterController
+        menu.addItem(updateItem)
 
         menu.addItem(.separator())
 
