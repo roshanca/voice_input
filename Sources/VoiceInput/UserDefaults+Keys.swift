@@ -13,6 +13,7 @@ extension UserDefaults {
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
         static let dictationHotkeyBindings = "dictationHotkeyBindings"
+        static let rePasteHotkeyBindings = "rePasteHotkeyBindings"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
@@ -109,6 +110,23 @@ extension UserDefaults {
             if let first = newValue.first {
                 hotkeyData = try? JSONEncoder().encode(first.hotkey)
             }
+        }
+    }
+
+    /// Re-paste chord bindings — new key, so no legacy migration. Defaults
+    /// to ⌃⌘V (V = keyCode 9); the `.hold` behavior here means "act on the
+    /// press edge", dispatch collapses it to one action per press.
+    var rePasteHotkeyBindings: [HotkeyBinding] {
+        get {
+            if let data = data(forKey: Keys.rePasteHotkeyBindings),
+               let decoded = try? JSONDecoder().decode([HotkeyBinding].self, from: data),
+               !decoded.isEmpty {
+                return decoded
+            }
+            return [HotkeyBinding(hotkey: .chord(keyCode: 9, modifiers: [.control, .command]), behavior: .hold)]
+        }
+        set {
+            set(try? JSONEncoder().encode(newValue), forKey: Keys.rePasteHotkeyBindings)
         }
     }
 

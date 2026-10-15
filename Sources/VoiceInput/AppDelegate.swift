@@ -150,6 +150,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // The ⌃⌘V keyEquivalent only advertises the shortcut — the real
+        // dispatch is the global tap; menu key equivalents never see it.
+        let rePasteItem = NSMenuItem(title: "Re-paste Last Result", action: #selector(rePasteMenuItem(_:)), keyEquivalent: "v")
+        rePasteItem.keyEquivalentModifierMask = [.control, .command]
+        rePasteItem.isEnabled = !HistoryStore.shared.records.isEmpty
+        menu.addItem(rePasteItem)
+
+        menu.addItem(.separator())
+
         let copyItem = NSMenuItem(title: "Copy Result to Clipboard", action: #selector(toggleCopyToClipboard(_:)), keyEquivalent: "")
         copyItem.state = UserDefaults.standard.copyToClipboard ? .on : .off
         menu.addItem(copyItem)
@@ -231,6 +240,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sender.state = UserDefaults.standard.llmEnabled ? .on : .off
     }
 
+    @objc private func rePasteMenuItem(_ sender: NSMenuItem) {
+        rePasteLastResult()
+    }
+
     @objc private func toggleCopyToClipboard(_ sender: NSMenuItem) {
         UserDefaults.standard.copyToClipboard = !UserDefaults.standard.copyToClipboard
         AppLogger.shared.info("Copy to clipboard toggled: \(UserDefaults.standard.copyToClipboard)")
@@ -264,10 +277,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.onPress = { [weak self] in self?.hotkeyPressed() }
         hotkeyManager.onRelease = { [weak self] in self?.hotkeyReleased() }
         hotkeyManager.onEscape = { [weak self] in self?.cancelActiveDictation() }
+        hotkeyManager.onRePaste = { [weak self] in self?.rePasteLastResult() }
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
         }
-        hotkeyManager.update(dictation: HotkeyManager.savedDictation)
+        hotkeyManager.update(dictation: HotkeyManager.savedDictation, rePaste: HotkeyManager.savedRePaste)
 
         if !hotkeyManager.isTapActive {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -454,6 +468,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // than dropped.
         recordingStartups[startupID] = startupTask
         TrackedTaskStore.shared.track(startupTask, label: "recording-start")
+    }
+
+    /// ⌃⌘V anywhere: re-deliver the newest committed dictation result into
+    /// whatever is focused right now — for when the original paste was lost
+    /// or the same text is wanted again without opening History.
+    func rePasteLastResult() {
+        guard let record = HistoryStore.shared.records.first,
+              !record.outputText.isEmpty else {
+            AppLogger.shared.info("Re-paste pressed — no committed result in history")
+            return
+        }
+        let text = record.outputText
+        AppLogger.shared.info("Re-paste pressed — re-injecting latest result", metadata: ["output": SensitiveLogValue(text)])
+        // The target is captured at press time, not copied from the original
+        // dictation — re-paste deliberately goes wherever the user has focus.
+        // Reuse the delivery bookkeeping so Esc still aborts mid-delivery.
+        inFlightInjections += 1
+        syncEscapeInterception()
+        TextInjector.shared.inject(text: text, keepInClipboard: false, sendReturn: false, target: DictationTarget.capture()) { [weak self] outcome in
+            guard let self else { return }
+            self.inFlightInjections -= 1
+            self.syncEscapeInterception()
+            // A re-paste writes no history record — a cancelled delivery
+            // needs no rollback; anything else gets the usual feedback.
+            if case .cancelled = outcome { return }
+            self.reportInjectionOutcome(outcome)
+        }
     }
 
     func hotkeyReleased() {

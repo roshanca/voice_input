@@ -69,6 +69,92 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertFalse(Hotkey.fKey(9).isPress(event: CGEvent(keyboardEventSource: nil, virtualKey: 101, keyDown: false)!))
     }
 
+    // MARK: - Chord matching (re-paste, #19)
+
+    private func keyEvent(keyCode: Int64, keyDown: Bool, flags: CGEventFlags = []) -> CGEvent? {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: keyDown)
+        event?.flags = flags
+        return event
+    }
+
+    /// ⌃⌘V — the persisted re-paste default (V = keyCode 9).
+    private let ctrlCmdV = Hotkey.chord(keyCode: 9, modifiers: [.control, .command])
+
+    func testChordMatchesExactModifiersOnKeyDown() {
+        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand])!))
+    }
+
+    func testChordRejectsWrongKeyCode() {
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 8, keyDown: true, flags: [.maskControl, .maskCommand])!))
+    }
+
+    func testChordRejectsMissingModifier() {
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskCommand])!))
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [])!))
+    }
+
+    /// Extra modifiers must not be claimed — ⌃⌘⇧V is some other app's
+    /// shortcut (e.g. "paste and match style") and has to pass through.
+    func testChordRejectsSupersetModifiers() {
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand, .maskShift])!))
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand, .maskAlternate])!))
+    }
+
+    /// Fn and Caps Lock never disambiguate a chord — a ⌃⌘V press while
+    /// Caps Lock happens to be engaged still matches.
+    func testChordIgnoresFnAndCapsLock() {
+        let flags: CGEventFlags = [.maskControl, .maskCommand, .maskSecondaryFn, .maskAlphaShift]
+        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: flags)!))
+    }
+
+    func testChordKeyUpMatchesOnKeyCodeAloneSoPressAlwaysCloses() {
+        // Both phases match so the tap swallows the whole keystroke. keyUp
+        // ignores modifiers entirely — the user may release ⌃ first or add
+        // ⇧ mid-hold, and the press must still end (a dead next press is
+        // worse than a swallowed keyUp the app never acts on).
+        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskControl, .maskCommand])!))
+        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskCommand])!))
+        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskShift])!))
+        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 8, keyDown: false, flags: [])!))
+    }
+
+    func testChordPressIsKeyDownOnly() {
+        XCTAssertTrue(ctrlCmdV.isPress(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand])!))
+        XCTAssertFalse(ctrlCmdV.isPress(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskControl, .maskCommand])!))
+        XCTAssertFalse(ctrlCmdV.usesFlagsChanged)
+        XCTAssertEqual(ctrlCmdV.displayName, "⌃⌘V")
+    }
+
+    func testChordOutranksBareKey() {
+        let entries = [
+            routedBinding(.fKey(5)),
+            routedBinding(.chord(keyCode: 9, modifiers: [.control, .command])),
+            routedBinding(.fnKey),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).first?.binding.hotkey,
+                       .chord(keyCode: 9, modifiers: [.control, .command]))
+    }
+
+    /// Same hotkey + same behavior in both businesses: rePaste wins so a
+    /// re-paste binding can shadow an identical dictation binding.
+    func testRePasteBusinessOutranksDictationOnFullTie() {
+        let chord = Hotkey.chord(keyCode: 9, modifiers: [.control, .command])
+        let entries = [
+            routedBinding(chord, .hold, .dictation),
+            routedBinding(chord, .hold, .rePaste),
+        ]
+        XCTAssertEqual(HotkeyRouting.routed(entries).first?.business, .rePaste)
+    }
+
+    func testChordBindingCodableRoundTrip() throws {
+        let bindings = [
+            HotkeyBinding(hotkey: .chord(keyCode: 9, modifiers: [.control, .command]), behavior: .hold),
+            HotkeyBinding(hotkey: .chord(keyCode: 6, modifiers: [.option, .shift]), behavior: .tap),
+        ]
+        let decoded = try JSONDecoder().decode([HotkeyBinding].self, from: JSONEncoder().encode(bindings))
+        XCTAssertEqual(decoded, bindings)
+    }
+
     // MARK: - Persistence / migration shapes
 
     func testBindingCodableRoundTrip() throws {

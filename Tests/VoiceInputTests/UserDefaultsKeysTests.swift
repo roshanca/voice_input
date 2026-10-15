@@ -57,6 +57,30 @@ final class UserDefaultsKeysTests: XCTestCase {
         XCTAssertEqual(decoded.first?.apiKey, "")
     }
 
+    /// The re-paste feature ships with ⌃⌘V as its persisted default — a
+    /// brand-new install must decode exactly that binding (#19).
+    func testRePasteHotkeyBindingsDefaultsToCtrlCmdV() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.rePasteHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 9, modifiers: [.control, .command]), behavior: .hold)])
+    }
+
+    func testRePasteHotkeyBindingsRoundTrip() {
+        let isolated = IsolatedDefaults()
+        let custom = [HotkeyBinding(hotkey: .chord(keyCode: 8, modifiers: [.control, .option]), behavior: .hold)]
+        isolated.defaults.rePasteHotkeyBindings = custom
+        XCTAssertEqual(isolated.defaults.rePasteHotkeyBindings, custom)
+    }
+
+    /// A corrupted or empty stored payload falls back to the ⌃⌘V default
+    /// rather than silently disabling the feature.
+    func testRePasteHotkeyBindingsFallsBackOnEmptyPayload() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.set(Data("[]".utf8), forKey: "rePasteHotkeyBindings")
+        XCTAssertEqual(isolated.defaults.rePasteHotkeyBindings.first?.hotkey,
+                       .chord(keyCode: 9, modifiers: [.control, .command]))
+    }
+
     func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
         let isolated = IsolatedDefaults()
         let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,

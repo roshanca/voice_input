@@ -44,7 +44,7 @@ final class SettingsStore: ObservableObject {
             guard hotkey != oldValue else { return }
             let bindings = [HotkeyBinding(hotkey: hotkey, behavior: .hold)]
             HotkeyManager.persistDictation(bindings)
-            HotkeyManager.shared.update(dictation: bindings)
+            HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste)
         }
     }
 
