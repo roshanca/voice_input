@@ -42,8 +42,21 @@ extension UserDefaults {
     /// Per-app auto-send rules: bundle identifier → forced on/off. An app
     /// with no entry follows the global `autoSend` toggle — removing the
     /// entry is how an override returns to inherit.
+    ///
+    /// Entries decode independently and only true booleans are kept: one
+    /// malformed value must not wipe out every valid rule (a wholesale
+    /// `[String: Bool]` cast would). `as? Bool` alone is too loose — a
+    /// stored `1` casts successfully — so identity is checked against the
+    /// real CFBoolean type.
     var autoSendOverrides: [String: Bool] {
-        get { dictionary(forKey: Keys.autoSendOverrides) as? [String: Bool] ?? [:] }
+        get {
+            guard let dict = dictionary(forKey: Keys.autoSendOverrides) else { return [:] }
+            return dict.compactMapValues { value in
+                guard CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID(),
+                      let bool = value as? Bool else { return nil }
+                return bool
+            }
+        }
         set { set(newValue, forKey: Keys.autoSendOverrides) }
     }
 

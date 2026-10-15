@@ -106,4 +106,63 @@ final class AutoSendRulesTests: XCTestCase {
         XCTAssertEqual(AutoSendRules.override(for: chat, in: defaults.autoSendOverrides), .inherit)
         XCTAssertEqual(AutoSendRules.override(for: editor, in: defaults.autoSendOverrides), .off)
     }
+
+    /// Entries decode independently: a malformed value sitting next to real
+    /// rules must not wipe the whole map. With global auto-send on, an
+    /// explicit Off next to garbage still suppresses the send — the case a
+    /// wholesale dictionary cast would have silently flipped.
+    func testMalformedEntryDoesNotDisableValidRules() throws {
+        let suiteName = "AutoSendRulesTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(
+            [editor: false, chat: true, "com.example.broken": "garbage"],
+            forKey: UserDefaults.Keys.autoSendOverrides
+        )
+
+        XCTAssertEqual(defaults.autoSendOverrides, [editor: false, chat: true])
+        XCTAssertFalse(AutoSendRules.shouldAutoSend(
+            bundleID: editor,
+            overrides: defaults.autoSendOverrides,
+            globalDefault: true
+        ))
+        XCTAssertTrue(AutoSendRules.shouldAutoSend(
+            bundleID: chat,
+            overrides: defaults.autoSendOverrides,
+            globalDefault: false
+        ))
+    }
+
+    /// Non-boolean scalars are malformed too — a stored `1` is not a valid
+    /// "on" rule and must be dropped rather than reinterpreted.
+    func testNonBooleanScalarsAreDropped() throws {
+        let suiteName = "AutoSendRulesTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(
+            [chat: 1, editor: 3.5, "com.example.real": true],
+            forKey: UserDefaults.Keys.autoSendOverrides
+        )
+
+        XCTAssertEqual(defaults.autoSendOverrides, ["com.example.real": true])
+    }
+
+    /// A value at the key that isn't a dictionary at all reads as empty —
+    /// every app inherits.
+    func testNonDictionaryValueReadsAsEmpty() throws {
+        let suiteName = "AutoSendRulesTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set("not a dictionary", forKey: UserDefaults.Keys.autoSendOverrides)
+
+        XCTAssertEqual(defaults.autoSendOverrides, [:])
+        XCTAssertTrue(AutoSendRules.shouldAutoSend(
+            bundleID: chat,
+            overrides: defaults.autoSendOverrides,
+            globalDefault: true
+        ))
+    }
 }
