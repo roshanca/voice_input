@@ -145,6 +145,9 @@ struct SettingsView: View {
                 HStack {
                     Text("Logs")
                     Spacer()
+                    Button("Export Diagnostics…") {
+                        DiagnosticsExporter.exportViaSavePanel()
+                    }
                     Button("View Logs…") {
                         (NSApp.delegate as? AppDelegate)?.openLogsWindow()
                     }
