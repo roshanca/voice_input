@@ -82,8 +82,10 @@ final class TextInjector {
         }
     }
 
-    /// The latest write whose delayed restore hasn't run yet.
-    private struct PendingRestore {
+    /// The latest write whose delayed restore hasn't run yet. A class so the
+    /// chain can be self-referential: `overwritten` links to the pending
+    /// write this one replaced while it still held the clipboard.
+    private final class PendingRestore {
         let id = UUID()
         let changeCount: Int
         /// A keepInClipboard write leaves its result on the clipboard, so a
@@ -91,10 +93,20 @@ final class TextInjector {
         /// earlier pre-dictation snapshot.
         let requiresRestore: Bool
         let snapshot: ClipboardSnapshot
-        /// The injection that owns this write — a superseding injection uses
-        /// it to tell "kept result that belongs on the clipboard" from a
-        /// canceled write whose captured text must not be restored later.
+        /// The injection owning this write.
         let ticket: InjectionTicket
+        /// The pending write ours replaced while it still held the
+        /// clipboard — the restore chain a walk follows to find the true
+        /// base when intermediate writes were canceled.
+        let overwritten: PendingRestore?
+
+        init(changeCount: Int, requiresRestore: Bool, snapshot: ClipboardSnapshot, ticket: InjectionTicket, overwritten: PendingRestore?) {
+            self.changeCount = changeCount
+            self.requiresRestore = requiresRestore
+            self.snapshot = snapshot
+            self.ticket = ticket
+            self.overwritten = overwritten
+        }
     }
 
     private var pendingRestore: PendingRestore?
@@ -105,6 +117,11 @@ final class TextInjector {
     /// auto-send.
     private final class InjectionTicket {
         var canceled = false
+        /// Set once the simulated paste posted — a canceled write whose
+        /// paste fired is legitimate clipboard content (keepInClipboard is
+        /// meant to keep it); only a write canceled before its paste is
+        /// illegitimate and must not become a restore base.
+        var pasteFired = false
         /// Runs the pre-paste cleanup synchronously — armed once our text is
         /// on the clipboard and the paste is queued, disarmed by the queued
         /// block itself. A canceled write must be settled at cancel time:
@@ -163,10 +180,10 @@ final class TextInjector {
 
         let pasteboard = NSPasteboard.general
 
-        // The pending write our text is about to overwrite — remembered so a
-        // later restore can fall back to its pre-write snapshot when that
-        // write turns out to have been canceled. Only counts while the
-        // clipboard still holds that write (changeCount match).
+        // The pending write our text is about to overwrite — linked into our
+        // PendingRestore so a later restore can walk past it when that write
+        // was canceled. Only counts while the clipboard still holds that
+        // write (changeCount match).
         let overwrittenRestore: PendingRestore? =
             (pendingRestore?.changeCount == pasteboard.changeCount) ? pendingRestore : nil
 
@@ -233,21 +250,9 @@ final class TextInjector {
             return
         }
 
-        let restore = PendingRestore(changeCount: writeChangeCount, requiresRestore: !keepInClipboard, snapshot: snapshot, ticket: ticket)
+        let restore = PendingRestore(changeCount: writeChangeCount, requiresRestore: !keepInClipboard, snapshot: snapshot, ticket: ticket, overwritten: overwrittenRestore)
         pendingRestore = restore
         AppLogger.shared.info("Set new text to clipboard (changeCount: \(writeChangeCount))")
-
-        /// What to put back when this write is undone — normally our own
-        /// snapshot. When the write we overwrote was itself canceled, its
-        /// pre-write snapshot is the true base: the canceled text never
-        /// counted as clipboard content. Evaluated lazily so the ticket's
-        /// state is read at restore time, not snapshot time.
-        let restoreSnapshot = {
-            if let overwritten = overwrittenRestore, overwritten.ticket.canceled {
-                return overwritten.snapshot
-            }
-            return snapshot
-        }
 
         // Esc landing before the queued paste fires must settle our write
         // synchronously — a later injection snapshots whatever is on the
@@ -259,7 +264,7 @@ final class TextInjector {
                 self.pendingRestore = nil
             }
             if pasteboard.changeCount == writeChangeCount {
-                let restoredItems = restoreSnapshot().pasteboardItems()
+                let restoredItems = Self.restoreBase(of: restore).pasteboardItems()
                 pasteboard.clearContents()
                 if !restoredItems.isEmpty, !pasteboard.writeObjects(restoredItems) {
                     AppLogger.shared.error("writeObjects failed while restoring clipboard")
@@ -309,6 +314,7 @@ final class TextInjector {
             }
 
             AppLogger.shared.info("Simulating Cmd+V paste")
+            ticket.pasteFired = true
             self.simulatePaste()
 
             AppLogger.shared.debug("Scheduling clipboard restore in \(restoreDelay)s")
@@ -322,7 +328,7 @@ final class TextInjector {
                 } else {
                     // Build the items and log before the ownership check so the
                     // check-to-clear window is as small as possible.
-                    let restoredItems = restoreSnapshot().pasteboardItems()
+                    let restoredItems = Self.restoreBase(of: restore).pasteboardItems()
                     AppLogger.shared.info("Restoring old clipboard content")
                     if pasteboard.changeCount == writeChangeCount {
                         pasteboard.clearContents()
@@ -364,6 +370,22 @@ final class TextInjector {
                 }
             }
         }
+    }
+
+    /// The clipboard content to restore when undoing `pending`'s write.
+    /// `snapshot` captured whatever the write replaced — but when that was
+    /// itself a write canceled before its paste fired, its captured text is
+    /// illegitimate and the true base is that write's own restore target.
+    /// Walks the chain so a run of overlapping canceled writes resolves to
+    /// the real pre-sequence clipboard; a predecessor that pasted (cancel
+    /// only suppressed its auto-send) or wasn't canceled ends the walk —
+    /// its text is legitimate content.
+    private static func restoreBase(of pending: PendingRestore) -> ClipboardSnapshot {
+        if let overwritten = pending.overwritten,
+           overwritten.ticket.canceled && !overwritten.ticket.pasteFired {
+            return restoreBase(of: overwritten)
+        }
+        return pending.snapshot
     }
 
     /// The clipboard could not be used safely, so nothing is sent anywhere.
