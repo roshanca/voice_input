@@ -101,16 +101,35 @@ enum Hotkey: Codable, Equatable, Hashable {
     }
 }
 
-/// How a bound hotkey triggers its business action. Only `hold` is
-/// dispatched today; the rest are modeled so routing and persistence are
-/// ready when their feature work lands.
-enum HotkeyBehavior: String, Codable {
+/// How a bound hotkey triggers its business action. All three are
+/// dispatched: `hold` per-edge in the tap callback, `tap`/`doubleTap`
+/// through `GestureRouting`.
+enum HotkeyBehavior: String, Codable, CaseIterable {
     /// Press starts, release stops (push-to-talk).
     case hold
     /// One press-release starts, the next stops.
     case tap
-    /// Two press-releases inside the system double-click window start.
+    /// Two rapid presses inside the system double-click window start;
+    /// single taps are swallowed but inert.
     case doubleTap
+
+    var displayName: String {
+        switch self {
+        case .hold: return "Hold to talk"
+        case .tap: return "Tap to toggle"
+        case .doubleTap: return "Double-tap"
+        }
+    }
+
+    /// One-line usage explanation under the settings picker, so the caption
+    /// stays truthful for whichever gesture is chosen.
+    var usageHint: String {
+        switch self {
+        case .hold: return "Hold to dictate, release to insert."
+        case .tap: return "Press once to start, again to stop."
+        case .doubleTap: return "Tap twice quickly to start; double-tap again to stop."
+        }
+    }
 
     /// Routing tie-breaker, mirroring the more elaborate precedence used by
     /// dictation apps that support all three gestures: doubleTap > hold > tap.
@@ -131,7 +150,8 @@ enum HotkeyBehavior: String, Codable {
 }
 
 /// A hotkey plus the way it triggers — one entry in a business's list.
-struct HotkeyBinding: Codable, Equatable {
+/// Hashable so tap/doubleTap gesture state can key off the binding itself.
+struct HotkeyBinding: Codable, Equatable, Hashable {
     var hotkey: Hotkey
     var behavior: HotkeyBehavior
 }

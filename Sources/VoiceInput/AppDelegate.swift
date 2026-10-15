@@ -263,6 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyManager = HotkeyManager.shared
         hotkeyManager.onPress = { [weak self] in self?.hotkeyPressed() }
         hotkeyManager.onRelease = { [weak self] in self?.hotkeyReleased() }
+        hotkeyManager.onToggle = { [weak self] in self?.toggleDictation() }
         hotkeyManager.onEscape = { [weak self] in self?.cancelActiveDictation() }
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
@@ -475,6 +476,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 AppLogger.shared.info("Result timeout fired — processing final text")
                 self.submitSession(sessionID)
             }
+        }
+    }
+
+    /// Tap/doubleTap bindings land here: idle → the same start path a hold
+    /// press takes; a hotkey session already recording → the same stop path
+    /// a release takes. `isHotkeyHeld` really means "a hotkey gesture owns
+    /// this session and hasn't ended it" — a tap-started session stays
+    /// "held" until the next tap — so both directions reuse the hold-mode
+    /// guards (startup cancellation, session-id checks, Esc window) instead
+    /// of growing parallel in-flight handling.
+    private func toggleDictation() {
+        if isHotkeyHeld {
+            hotkeyReleased()
+        } else {
+            hotkeyPressed()
         }
     }
 

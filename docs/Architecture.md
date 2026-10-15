@@ -6,15 +6,17 @@ weaknesses, not aspirational.
 
 ## What it is
 
-Menu-bar push-to-talk dictation: hold a hotkey → speak → release →
-recognized (optionally LLM-polished) text is typed into the focused app.
-No window by default; the SwiftUI main window opens on demand.
+Menu-bar dictation: trigger a hotkey (hold, tap-to-toggle, or double-tap)
+→ speak → recognized (optionally LLM-polished) text is typed into the
+focused app. No window by default; the SwiftUI main window opens on demand.
 
 ## Pipeline
 
 ```
 HotkeyManager (CGEvent tap)
   → AppDelegate.hotkeyPressed/Released        # owns session lifecycle
+    (tap/doubleTap bindings → GestureRouting → onToggle → toggleDictation,
+    which reuses the same pressed/released paths)
   → SpeechRecognizer (SFSpeechRecognizer + AVAudioEngine)
       partials → FloatingPanel (waveform + live text)
   → on release: submitSession()
@@ -44,7 +46,8 @@ cancels any in-flight refinement so late chunks can't inject text.
 | `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
 | `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable |
 | `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch |
-| `HotkeyRouting` (in HotkeyModel) | Pure routing: regular keys > modifier-only, `doubleTap > longPress > tap`, then business priority. Unimplemented behaviors pass through without consuming the key |
+| `HotkeyRouting` (in HotkeyModel) | Pure routing: regular keys > modifier-only, `doubleTap > hold > tap`, then business priority. First matching routed binding owns the event |
+| `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
 | `LLMRefiner.swift` | SSE streaming refine; task stored in `TrackedTaskStore` |
 | `TextInjector.swift` | clipboard swap + ⌘V + restore; CJK input-method aware; optional auto-Return; `InjectionTicket` tracks cancel-before/after-paste so a cancelled delivery suppresses send and deletes its history record |
@@ -88,8 +91,9 @@ Full workflow: `docs/Release.md`.
 - `AppDelegate` is the acknowledged refactor boundary (coordinator +
   session state + menu + panel wiring).
 - `SelectedTextProbe` exists but no feature consumes it yet (#21 will).
-- `HotkeyBehavior` declares `tap`/`doubleTap` but only `longPress`
-  (push-to-talk) is wired (#20 will).
+- `HotkeyManager` supports one binding per business for gesture purposes —
+  two bindings on the same hotkey collapse to the routed winner; the
+  settings UI edits a single dictation binding anyway.
 - App is **not sandboxed**; entitlements file only. Permission footprint:
   Accessibility, Microphone, Speech — keep it that way (see Voxt's
   permission-minimization precedent).
