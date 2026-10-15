@@ -48,6 +48,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingSession: DictationSession?
     private var resultTimeout: Timer?
     private var recordingAnimationTimer: Timer?
+    /// Queued/running recording startups keyed by a per-press id. A canceled
+    /// task isn't finished — it exits when its body returns — so handles
+    /// stay tracked until the task itself removes its entry (cancellation
+    /// ≠ completion); a new press must never overwrite a live handle.
+    private var recordingStartups: [UUID: Task<Void, Never>] = [:]
+    /// Injections with queued delivery stages (paste / restore / auto-send).
+    /// Keeps Esc's "session active" window open until each delivery resolves.
+    private var inFlightInjections = 0
+
+    /// Whether Esc currently means "cancel the dictation": recording,
+    /// awaiting the final result, refining, or delivering. Mirrored into
+    /// HotkeyManager so the event tap can decide synchronously whether the
+    /// keypress belongs to us or to the focused app.
+    private var isDictationSessionActive: Bool {
+        isHotkeyHeld || activeSession != nil || pendingSession != nil || inFlightInjections > 0
+    }
+
+    private func syncEscapeInterception() {
+        HotkeyManager.shared.setEscapeInterception(isDictationSessionActive)
+    }
 
     private let idleImage = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Voice Input")
     private var recordingImage: NSImage?
@@ -227,6 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyManager = HotkeyManager.shared
         hotkeyManager.onPress = { [weak self] in self?.hotkeyPressed() }
         hotkeyManager.onRelease = { [weak self] in self?.hotkeyReleased() }
+        hotkeyManager.onEscape = { [weak self] in self?.cancelActiveDictation() }
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
         }
@@ -361,6 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             target: DictationTarget.capture()
         )
         activeSession = session
+        syncEscapeInterception()
         AppLogger.shared.info("Hotkey pressed — starting recording")
         startRecordingAnimation()
         SoundPlayer.recordStart()
@@ -368,13 +390,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingPanel.setText("")
         floatingPanel.show()
 
-        Task {
+        // Signal every outstanding startup — stale ones bail on the identity
+        // guard at run time, and their handles retire when they actually
+        // exit.
+        recordingStartups.values.forEach { $0.cancel() }
+        let startupID = UUID()
+        recordingStartups[startupID] = Task {
+            defer { self.recordingStartups.removeValue(forKey: startupID) }
+            // Identity check at run time, not enqueue time: Esc or a hotkey
+            // release landing before this task runs must not leave the
+            // recognizer recording for a session that no longer exists.
+            let sessionID = session.id
+            guard self.activeSession?.id == sessionID, self.isHotkeyHeld, !Task<Never, Never>.isCancelled else { return }
             do {
-                try await speechRecognizer.startRecording(sessionID: session.id)
+                try await speechRecognizer.startRecording(sessionID: sessionID)
                 AppLogger.shared.info("Speech recording started successfully")
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
-                let sessionID = session.id
                 // This catch can land after a newer dictation already owns
                 // the panel — only the session that started this recording
                 // may surface its startup error.
@@ -389,6 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.isHotkeyHeld = false
                     self.activeSession = nil
                     self.stopRecordingAnimation()
+                    self.syncEscapeInterception()
                 }
             }
         }
@@ -397,7 +430,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func hotkeyReleased() {
         guard isHotkeyHeld else { return }
         isHotkeyHeld = false
+        syncEscapeInterception()
         AppLogger.shared.info("Hotkey released — stopping recording")
+        recordingStartups.values.forEach { $0.cancel() }
         speechRecognizer.stopRecording()
         stopRecordingAnimation()
         SoundPlayer.recordStop()
@@ -412,6 +447,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.submitSession(sessionID)
             }
         }
+    }
+
+    /// Esc during an active session: stop whichever stage the dictation is
+    /// in — recording, awaiting the final result, refining, or delivering —
+    /// close the panel, and let the session/request guards drop every late
+    /// callback. Nothing is injected, auto-sent, or recorded for a session
+    /// canceled this way.
+    func cancelActiveDictation() {
+        guard isDictationSessionActive else { return }
+        let wasRecording = isHotkeyHeld
+        AppLogger.shared.info("Esc pressed — canceling dictation session")
+        isHotkeyHeld = false
+        resultTimeout?.invalidate()
+        resultTimeout = nil
+        activeSession = nil
+        recordingStartups.values.forEach { $0.cancel() }
+        if pendingSession != nil {
+            llmRefiner.cancel()
+            pendingSession = nil
+        }
+        speechRecognizer.cancelRecording()
+        stopRecordingAnimation()
+        if wasRecording {
+            SoundPlayer.recordStop()
+        }
+        TextInjector.shared.cancelInFlight()
+        floatingPanel.hide()
+        syncEscapeInterception()
     }
 
     /// Commit the session's text exactly once. The first of the final
@@ -430,6 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !trimmed.isEmpty else {
             AppLogger.shared.warning("submitSession — trimmed text is empty, hiding panel")
             floatingPanel.hide()
+            syncEscapeInterception()
             return
         }
 
@@ -447,16 +511,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             floatingPanel.setUseOriginalVisible(true)
             session.submittedText = trimmed
             pendingSession = session
+            syncEscapeInterception()
             llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated), requestID: session.id)
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
-            floatingPanel.hide()
             let output = applyReplacements(trimmed)
-            TextInjector.shared.inject(text: output, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
-                self?.reportInjectionOutcome(outcome)
-            }
-            recordHistory(raw: trimmed, refined: nil, output: output, session: session)
+            deliver(text: output, raw: trimmed, refined: nil, session: session)
         }
+    }
+
+    /// Shared delivery path for a committed dictation: close the panel,
+    /// queue paste + optional auto-send into the recorded target, and write
+    /// history. `inFlightInjections` keeps Esc's cancel window open until
+    /// the delivery resolves; a `.cancelled` outcome removes the record the
+    /// suppressed delivery never produced.
+    private func deliver(text: String, raw: String, refined: String?, session: DictationSession) {
+        floatingPanel.hide()
+        inFlightInjections += 1
+        syncEscapeInterception()
+        TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+            guard let self else { return }
+            self.inFlightInjections -= 1
+            if case .cancelled = outcome {
+                HistoryStore.shared.delete(id: session.id)
+            } else {
+                self.reportInjectionOutcome(outcome)
+            }
+            self.syncEscapeInterception()
+        }
+        recordHistory(raw: raw, refined: refined, output: text, session: session)
     }
 
     /// "Use Original" while a refinement is in flight: cancel the request and
@@ -469,16 +552,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingSession = nil
         AppLogger.shared.info("Use Original chosen — canceling pending refinement")
         llmRefiner.cancel()
-        floatingPanel.hide()
         let output = RefinementFallback.committedText(
             submittedText: session.submittedText,
             dictionaryDirectReplacement: session.dictionaryDirectReplacement,
             entries: DictionaryStore.shared.entries
         )
-        TextInjector.shared.inject(text: output, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
-            self?.reportInjectionOutcome(outcome)
-        }
-        recordHistory(raw: session.submittedText, refined: nil, output: output, session: session)
+        deliver(text: output, raw: session.submittedText, refined: nil, session: session)
     }
 
     /// Surfaces what happened to a submitted dictation — silent on the normal
@@ -505,11 +584,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             floatingPanel.flash("\(mismatch.userMessage) — result \(destination)")
         case .clipboardNotDelivered:
             floatingPanel.flash("Couldn't insert — result saved in History")
+        case .cancelled:
+            // Handled by the deliver() completion — a canceled delivery
+            // shows no feedback.
+            break
         }
     }
 
     private func recordHistory(raw: String, refined: String?, output: String, session: DictationSession) {
         let record = DictationRecord(
+            // The record id is the session's, so a delivery suppressed by
+            // Esc can remove its record by session identity.
+            id: session.id,
             date: Date(),
             durationSeconds: session.duration,
             rawText: raw,
@@ -603,26 +689,18 @@ extension AppDelegate: LLMRefinerDelegate {
         }
         pendingSession = nil
         AppLogger.shared.info("LLM refinement finished — result: \(text)", sensitive: true)
-        floatingPanel.hide()
-        TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
-            self?.reportInjectionOutcome(outcome)
-        }
-        recordHistory(raw: session.submittedText, refined: text, output: text, session: session)
+        deliver(text: text, raw: session.submittedText, refined: text, session: session)
     }
 
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID) {
         guard let session = pendingSession, session.id == requestID else { return }
         pendingSession = nil
         AppLogger.shared.error("LLM refinement failed: \(error.localizedDescription)")
-        floatingPanel.hide()
         let fallback = RefinementFallback.committedText(
             submittedText: session.submittedText,
             dictionaryDirectReplacement: session.dictionaryDirectReplacement,
             entries: DictionaryStore.shared.entries
         )
-        TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
-            self?.reportInjectionOutcome(outcome)
-        }
-        recordHistory(raw: session.submittedText, refined: nil, output: fallback, session: session)
+        deliver(text: fallback, raw: session.submittedText, refined: nil, session: session)
     }
 }
