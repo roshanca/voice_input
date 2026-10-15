@@ -207,6 +207,21 @@ final class FloatingPanel: NSPanel {
         }
     }
 
+    /// Transient status message that hides itself after `duration`. The
+    /// generation check keeps the delayed hide from ordering the panel out
+    /// from underneath a dictation that started in the meantime.
+    func flash(_ text: String, duration: TimeInterval = 2.4) {
+        show()
+        setText(text)
+        let generation = visibilityGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.visibilityGeneration == generation else { return }
+                self.hide()
+            }
+        }
+    }
+
     // MARK: - Content
 
     func setText(_ text: String) {

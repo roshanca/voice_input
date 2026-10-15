@@ -28,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let copyToClipboard: Bool
         let autoSend: Bool
         let dictionaryDirectReplacement: Bool
+        /// Where the result is meant to land — captured at recording start,
+        /// re-validated before the paste and again before auto-send.
+        let target: DictationTarget?
         var rawText = ""
         var annotatedText = ""
         /// Set at submission on the LLM path: the committed text and the
@@ -353,7 +356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             llmEnabled: UserDefaults.standard.llmEnabled,
             copyToClipboard: UserDefaults.standard.copyToClipboard,
             autoSend: UserDefaults.standard.autoSend,
-            dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement
+            dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement,
+            target: DictationTarget.capture()
         )
         activeSession = session
         AppLogger.shared.info("Hotkey pressed — starting recording")
@@ -444,8 +448,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
             floatingPanel.hide()
-            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+                self?.reportInjectionOutcome(outcome)
+            }
             recordHistory(raw: trimmed, refined: nil, session: session)
+        }
+    }
+
+    /// Surfaces what happened to a submitted dictation — silent on the normal
+    /// path, a flashed panel message when the target moved or the result had
+    /// to be parked for manual recovery.
+    private func reportInjectionOutcome(_ outcome: InjectionOutcome) {
+        switch outcome {
+        case .inserted:
+            break
+        case .insertedSendSuppressed(let mismatch):
+            floatingPanel.flash("Pasted — auto-send skipped: \(mismatch.userMessage)")
+        case .parked(let mismatch, let onClipboard):
+            let destination = onClipboard ? "kept on clipboard" : "saved in History"
+            floatingPanel.flash("\(mismatch.userMessage) — result \(destination)")
+        case .clipboardNotDelivered:
+            floatingPanel.flash("Couldn't insert — result saved in History")
         }
     }
 
@@ -544,7 +567,9 @@ extension AppDelegate: LLMRefinerDelegate {
         pendingSession = nil
         AppLogger.shared.info("LLM refinement finished — result: \(text)", sensitive: true)
         floatingPanel.hide()
-        TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+        TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+            self?.reportInjectionOutcome(outcome)
+        }
         recordHistory(raw: session.submittedText, refined: text, session: session)
     }
 
@@ -556,7 +581,9 @@ extension AppDelegate: LLMRefinerDelegate {
         let fallback = session.dictionaryDirectReplacement
             ? DictionaryStore.shared.applyReplacements(to: session.submittedText)
             : session.submittedText
-        TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend)
+        TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+            self?.reportInjectionOutcome(outcome)
+        }
         recordHistory(raw: session.submittedText, refined: nil, session: session)
     }
 }
