@@ -245,6 +245,9 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
     case dictation
     /// Re-delivers the last committed dictation result (⌃⌘V by default).
     case rePaste
+    /// Push-to-talk into translation: same recording session as dictation,
+    /// but the post-ASR stage translates instead of refining (⌃⌥T by default).
+    case translate
 
     /// Routing tie-breaker when two businesses share the same hotkey and
     /// behavior. Higher wins; dictation stays lowest so other actions
@@ -253,6 +256,7 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
         switch self {
         case .dictation: return 0
         case .rePaste: return 1
+        case .translate: return 2
         }
     }
 }

@@ -8,7 +8,8 @@ weaknesses, not aspirational.
 
 Menu-bar dictation: trigger a hotkey (hold, tap-to-toggle, or double-tap)
 → speak → recognized (optionally LLM-polished) text is typed into the
-focused app. No window by default; the SwiftUI main window opens on demand.
+focused app. A second hotkey swaps the polish step for LLM translation.
+No window by default; the SwiftUI main window opens on demand.
 
 ## Pipeline
 
@@ -34,6 +35,13 @@ Esc only while a session is active → AppDelegate.cancelActiveDictation()
 Re-paste: ⌃⌘V chord (Hotkey.chord — exact modifier match, swallowed whole)
 fires once per press → AppDelegate.rePasteLastResult() → TextInjector with
 a freshly captured target; text = HistoryStore's latest outputText
+Translate: ⌃⌥T chord (HotkeyBusiness.translate, hold) → same session
+machinery (translatePressed/Released share the dictation internals; the
+session carries `kind`). submitSession forks on kind → LLMRefiner.translate
+(TranslationPrompt, `translateTargetLanguage`) → translated text →
+TextInjector → HistoryStore. Unlike refinement this is not gated by
+`llmEnabled` — with no configured profile the transcript is parked in
+History + panel flash, nothing injected
 ```
 
 **Session identity:** `AppDelegate` owns `activeSession: {id, generation,
@@ -47,12 +55,13 @@ cancels any in-flight refinement so late chunks can't inject text.
 |---|---|
 | `App.swift` | `@main` NSApplicationDelegateAdaptor shell |
 | `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
-| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation + `rePaste` |
-| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold) |
-| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (rePaste > dictation). First matching routed binding owns the event |
+| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation + `rePaste` + `translate` |
+| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate bindings dispatch press/release edges like dictation's |
+| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (translate > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
-| `LLMRefiner.swift` | SSE streaming refine; task stored in `TrackedTaskStore` |
+| `LLMRefiner.swift` | SSE streaming refine **or** translate (`Mode` selects system prompt + user wrapper); task stored in `TrackedTaskStore` |
+| `TranslationPrompt.swift` | Pure prompt builder for translate sessions — bidirectional against Chinese (already-in-target input translates back to Chinese), `<transcript>` inert-text wrapper like refine |
 | `TextInjector.swift` | clipboard swap + ⌘V + restore; CJK input-method aware; optional auto-Return; `InjectionTicket` tracks cancel-before/after-paste so a cancelled delivery suppresses send and deletes its history record |
 | `DictationTarget.swift` | Frontmost app + focused AX element captured before the panel steals focus (and at ⌃⌘V press for re-paste); re-validated before paste and before auto-Return; mismatch parks the result instead of sending |
 | `EscapeRouting.swift` | Pure Esc routing: consume only while a session is active; `PressOwnership` pins one decision per physical press (repeats + keyUp follow it); ⌘⌥⎋ always passes through |
@@ -69,14 +78,14 @@ cancels any in-flight refinement so late chunks can't inject text.
 | `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `translateTargetLanguage` to English |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing
 
 `Tests/VoiceInputTests/` — XCTest on pure logic only: dictionary rules,
 hotkey routing/decoding, selection policy, log redaction, task store,
-stats, UserDefaults keys. `TestHelpers.swift` provides isolated
+stats, UserDefaults keys, translation prompt contract. `TestHelpers.swift` provides isolated
 `UserDefaults` suites and temp dirs. **No TCC-dependent tests.**
 
 Run via `make test` (adds the rpath SwiftPM omits; see AGENTS.md).

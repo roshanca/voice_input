@@ -56,7 +56,21 @@ final class SettingsStore: ObservableObject {
     private func persistDictationBinding() {
         let bindings = [HotkeyBinding(hotkey: hotkey, behavior: hotkeyBehavior)]
         HotkeyManager.persistDictation(bindings)
-        HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste)
+        HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste, translate: HotkeyManager.savedTranslate)
+    }
+
+    /// Language the translate hotkey translates into — free-form, read
+    /// verbatim into the LLM prompt; the accessor normalizes blank to English.
+    @Published var translateTargetLanguage: String {
+        didSet {
+            guard translateTargetLanguage != oldValue else { return }
+            UserDefaults.standard.translateTargetLanguage = translateTargetLanguage
+        }
+    }
+    /// Read-only display of the first translate binding — the list is
+    /// persisted and routed, but not editable from settings yet.
+    var translateHotkeyDisplay: String {
+        HotkeyManager.savedTranslate.first?.hotkey.displayName ?? "Unbound"
     }
 
     /// Available audio input devices; refreshed when the settings window appears.
@@ -81,6 +95,7 @@ final class SettingsStore: ObservableObject {
         hotkeyBehavior = HotkeyManager.savedDictation.first?.behavior ?? .hold
         llmConfigs = defaults.llmConfigs
         selectedConfigID = defaults.selectedConfigID
+        translateTargetLanguage = defaults.translateTargetLanguage
     }
 
     /// Re-read values that may have been changed from the menu bar while the
@@ -95,6 +110,7 @@ final class SettingsStore: ObservableObject {
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
+        translateTargetLanguage = defaults.translateTargetLanguage
         inputDevices = AudioDeviceManager.inputDevices()
         llmConfigs = defaults.llmConfigs
         if let id = defaults.selectedConfigID, llmConfigs.contains(where: { $0.id == id }) {

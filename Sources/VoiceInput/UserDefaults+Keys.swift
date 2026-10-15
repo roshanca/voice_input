@@ -14,6 +14,8 @@ extension UserDefaults {
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
         static let dictationHotkeyBindings = "dictationHotkeyBindings"
         static let rePasteHotkeyBindings = "rePasteHotkeyBindings"
+        static let translateHotkeyBindings = "translateHotkeyBindings"
+        static let translateTargetLanguage = "translateTargetLanguage"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
@@ -128,6 +130,39 @@ extension UserDefaults {
         set {
             set(try? JSONEncoder().encode(newValue), forKey: Keys.rePasteHotkeyBindings)
         }
+    }
+
+    /// Translate-mode bindings — new key, no migration. `.hold` here is real
+    /// push-to-talk: the press edge starts a translate session, the release
+    /// submits it. Defaults to ⌃⌥T (T = keyCode 17). The suggested ⌃⌥Space
+    /// was rejected — it is macOS's own "Select next source in Input menu"
+    /// shortcut, which the zh-CN user base relies on, and our tap swallows
+    /// bound chords wholesale so the system shortcut would die while
+    /// VoiceInput runs.
+    var translateHotkeyBindings: [HotkeyBinding] {
+        get {
+            if let data = data(forKey: Keys.translateHotkeyBindings),
+               let decoded = try? JSONDecoder().decode([HotkeyBinding].self, from: data),
+               !decoded.isEmpty {
+                return decoded
+            }
+            return [HotkeyBinding(hotkey: .chord(keyCode: 17, modifiers: [.control, .option]), behavior: .hold)]
+        }
+        set {
+            set(try? JSONEncoder().encode(newValue), forKey: Keys.translateHotkeyBindings)
+        }
+    }
+
+    /// The language translate sessions translate into — interpolated verbatim
+    /// into the LLM prompt, so any language name works. A blank stored value
+    /// falls back to English rather than producing a broken prompt.
+    var translateTargetLanguage: String {
+        get {
+            let stored = string(forKey: Keys.translateTargetLanguage)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return stored.isEmpty ? "English" : stored
+        }
+        set { set(newValue, forKey: Keys.translateTargetLanguage) }
     }
 
     var llmConfigs: [LLMConfig] {

@@ -21,7 +21,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// result timeout, the LLM refinement — so stale work from a previous
     /// dictation is recognized and dropped instead of leaking into this one.
     private struct DictationSession {
+        /// What the post-ASR stage does with the transcript. Recording,
+        /// target capture, panel streaming, injection, and history are
+        /// shared — only the LLM call differs.
+        enum Kind {
+            /// Refine with the LLM when enabled, else insert the transcript.
+            case dictation
+            /// Always LLM: translate the transcript into the target language.
+            case translate
+
+            /// The in-flight LLM stage's name for logs ("refinement"/"translation").
+            var stageName: String {
+                switch self {
+                case .dictation: return "refinement"
+                case .translate: return "translation"
+                }
+            }
+        }
+
         let id = UUID()
+        let kind: Kind
         let startDate = Date()
         /// Language and settings snapshot taken at session start, so changes
         /// made while a result is in flight can't cross session boundaries.
@@ -30,6 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let copyToClipboard: Bool
         let autoSend: Bool
         let dictionaryDirectReplacement: Bool
+        /// Translate sessions only — the language to translate into,
+        /// snapshotted with the rest at session start.
+        let translateTargetLanguage: String
         /// Where the result is meant to land — captured at recording start,
         /// re-validated before the paste and again before auto-send.
         let target: DictationTarget?
@@ -279,10 +301,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.onToggle = { [weak self] in self?.toggleDictation() }
         hotkeyManager.onEscape = { [weak self] in self?.cancelActiveDictation() }
         hotkeyManager.onRePaste = { [weak self] in self?.rePasteLastResult() }
+        hotkeyManager.onTranslatePress = { [weak self] in self?.translatePressed() }
+        hotkeyManager.onTranslateRelease = { [weak self] in self?.translateReleased() }
+        hotkeyManager.onTranslateToggle = { [weak self] in self?.toggleTranslate() }
         hotkeyManager.onTapStateChange = { [weak self] _ in
             self?.updateMenuBarIcon()
         }
-        hotkeyManager.update(dictation: HotkeyManager.savedDictation, rePaste: HotkeyManager.savedRePaste)
+        hotkeyManager.update(
+            dictation: HotkeyManager.savedDictation,
+            rePaste: HotkeyManager.savedRePaste,
+            translate: HotkeyManager.savedTranslate
+        )
 
         if !hotkeyManager.isTapActive {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -393,14 +422,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Hotkey Handling
 
     func hotkeyPressed() {
+        sessionPressed(kind: .dictation)
+    }
+
+    /// Translate hotkey press — same session machinery as dictation; the
+    /// kind tag is what reroutes the post-ASR stage to translation.
+    func translatePressed() {
+        sessionPressed(kind: .translate)
+    }
+
+    private func sessionPressed(kind: DictationSession.Kind) {
         guard !isHotkeyHeld else { return }
         isHotkeyHeld = true
         resultTimeout?.invalidate()
         // A new dictation supersedes whatever the previous one left pending:
         // cancel an in-flight refinement so its callbacks can't inject text
         // or write history for a session the user has already moved on from.
-        if pendingSession != nil {
-            AppLogger.shared.info("New dictation started — canceling pending refinement")
+        if let pending = pendingSession {
+            AppLogger.shared.info("New session started — canceling pending \(pending.kind.stageName)")
             llmRefiner.cancel()
             pendingSession = nil
         }
@@ -409,6 +448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // bundle ID — re-checking at send time could apply a different app's
         // rule after the user switched focus mid-delivery.
         let session = DictationSession(
+            kind: kind,
             language: LanguageManager.shared.current.rawValue,
             llmEnabled: UserDefaults.standard.llmEnabled,
             copyToClipboard: UserDefaults.standard.copyToClipboard,
@@ -418,11 +458,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 globalDefault: UserDefaults.standard.autoSend
             ),
             dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement,
+            translateTargetLanguage: UserDefaults.standard.translateTargetLanguage,
             target: target
         )
         activeSession = session
         syncEscapeInterception()
-        AppLogger.shared.info("Hotkey pressed — starting recording (target: \(target?.appName ?? "unknown"), auto-send: \(session.autoSend))")
+        AppLogger.shared.info("\(kind == .translate ? "Translate" : "Dictation") hotkey pressed — starting recording (target: \(target?.appName ?? "unknown"), auto-send: \(session.autoSend))")
         startRecordingAnimation()
         SoundPlayer.recordStart()
 
@@ -499,7 +540,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func hotkeyReleased() {
-        guard isHotkeyHeld else { return }
+        releaseSession(kind: .dictation)
+    }
+
+    func translateReleased() {
+        releaseSession(kind: .translate)
+    }
+
+    /// Shared release path for hold-mode sessions. The kind guard keeps one
+    /// business's key release from ending a session owned by the other
+    /// hotkey: a second business's press is refused while a session is held,
+    /// so its release edge must be inert too.
+    private func releaseSession(kind: DictationSession.Kind) {
+        guard isHotkeyHeld, activeSession?.kind == kind else { return }
         isHotkeyHeld = false
         syncEscapeInterception()
         AppLogger.shared.info("Hotkey released — stopping recording")
@@ -532,6 +585,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hotkeyReleased()
         } else {
             hotkeyPressed()
+        }
+    }
+
+    /// Tap/doubleTap translate bindings toggle a translate session — same
+    /// start/stop reuse as `toggleDictation`. A cross-business tap while a
+    /// dictation session is held is ignored rather than swapping modes.
+    private func toggleTranslate() {
+        if isHotkeyHeld {
+            guard activeSession?.kind == .translate else { return }
+            translateReleased()
+        } else {
+            translatePressed()
         }
     }
 
@@ -591,18 +656,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? DictionaryStore.shared.applyReplacements(to:)
             : { $0 }
 
-        if session.llmEnabled && llmRefiner.isConfigured {
-            AppLogger.shared.info("LLM enabled and configured — starting refinement")
-            floatingPanel.setText("Refining…")
+        // Dictionary replacements apply to the LLM input either way — the
+        // entries' preferred forms matter as much to a translation as to a
+        // correction.
+        let llmInput = applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated)
+
+        switch session.kind {
+        case .dictation:
+            if session.llmEnabled && llmRefiner.isConfigured {
+                AppLogger.shared.info("LLM enabled and configured — starting refinement")
+                floatingPanel.setText("Refining…")
+                floatingPanel.setUseOriginalVisible(true)
+                session.submittedText = trimmed
+                pendingSession = session
+                syncEscapeInterception()
+                llmRefiner.refine(text: llmInput, requestID: session.id)
+            } else {
+                AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
+                let output = applyReplacements(trimmed)
+                deliver(text: output, raw: trimmed, refined: nil, session: session)
+            }
+        case .translate:
+            // `llmEnabled` gates only *optional* dictation refinement — a
+            // translate session is meaningless without an LLM, so a
+            // configured profile is the whole gate. With none, park the
+            // transcript in History instead of injecting untranslated text
+            // the user never asked for.
+            guard llmRefiner.isConfigured else {
+                let output = applyReplacements(trimmed)
+                AppLogger.shared.warning("Translate session submitted with no configured LLM — parking transcript in History")
+                recordHistory(raw: trimmed, refined: nil, output: output, session: session)
+                floatingPanel.flash("Translation needs a configured LLM profile — transcript saved in History")
+                syncEscapeInterception()
+                return
+            }
+            AppLogger.shared.info("Translate session submitted — translating to \(session.translateTargetLanguage)")
+            floatingPanel.setText("Translating…")
             floatingPanel.setUseOriginalVisible(true)
             session.submittedText = trimmed
             pendingSession = session
             syncEscapeInterception()
-            llmRefiner.refine(text: applyReplacements(trimmedAnnotated.isEmpty ? trimmed : trimmedAnnotated), requestID: session.id)
-        } else {
-            AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
-            let output = applyReplacements(trimmed)
-            deliver(text: output, raw: trimmed, refined: nil, session: session)
+            llmRefiner.translate(text: llmInput, requestID: session.id, targetLanguage: session.translateTargetLanguage)
         }
     }
 
@@ -758,8 +852,8 @@ extension AppDelegate: SpeechRecognizerDelegate {
 
 extension AppDelegate: LLMRefinerDelegate {
     func llmRefinerDidStart(_ refiner: LLMRefiner, requestID: UUID) {
-        guard pendingSession?.id == requestID else { return }
-        AppLogger.shared.info("LLM refinement started")
+        guard let session = pendingSession, session.id == requestID else { return }
+        AppLogger.shared.info("LLM \(session.kind.stageName) started")
     }
 
     func llmRefiner(_ refiner: LLMRefiner, didStreamPartial text: String, requestID: UUID) {
@@ -774,14 +868,14 @@ extension AppDelegate: LLMRefinerDelegate {
             return
         }
         pendingSession = nil
-        AppLogger.shared.info("LLM refinement finished — result: \(text)", sensitive: true)
+        AppLogger.shared.info("LLM \(session.kind.stageName) finished — result: \(text)", sensitive: true)
         deliver(text: text, raw: session.submittedText, refined: text, session: session)
     }
 
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID) {
         guard let session = pendingSession, session.id == requestID else { return }
         pendingSession = nil
-        AppLogger.shared.error("LLM refinement failed: \(error.localizedDescription)")
+        AppLogger.shared.error("LLM \(session.kind.stageName) failed: \(error.localizedDescription)")
         let fallback = RefinementFallback.committedText(
             submittedText: session.submittedText,
             dictionaryDirectReplacement: session.dictionaryDirectReplacement,
