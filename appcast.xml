@@ -2,7 +2,7 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>VoiceInput Updates</title>
-    <link>https://git.roshanca.com/roshanca/voice_input/raw/branch/main/appcast.xml</link>
+    <link>https://raw.githubusercontent.com/roshanca/voice_input/main/appcast.xml</link>
     <description>Sparkle update feed for VoiceInput.</description>
     <language>en</language>
     <!--
@@ -12,11 +12,11 @@
 
       <item>
         <title>1.1</title>
-        <link>https://git.roshanca.com/roshanca/voice_input/releases</link>
+        <link>https://github.com/roshanca/voice_input/releases</link>
         <sparkle:version>20261015.1200</sparkle:version>
         <sparkle:shortVersionString>1.1</sparkle:shortVersionString>
         <pubDate>Thu, 15 Oct 2026 12:00:00 +0800</pubDate>
-        <enclosure url="https://git.roshanca.com/roshanca/voice_input/releases/download/v1.1/VoiceInput.dmg"
+        <enclosure url="https://github.com/roshanca/voice_input/releases/download/v1.1/VoiceInput.dmg"
                    sparkle:edSignature="…" length="…" type="application/octet-stream"/>
       </item>
     -->

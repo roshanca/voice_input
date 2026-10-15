@@ -78,10 +78,10 @@ background/layout can be added to the script later if wanted.
 ### Update feed (SUFeedURL)
 
 The feed lives **in this repository** as `appcast.xml` at the root, served
-via Gitea's raw-file endpoint:
+via GitHub's raw-file endpoint:
 
 ```
-https://git.roshanca.com/roshanca/voice_input/raw/branch/main/appcast.xml
+https://raw.githubusercontent.com/roshanca/voice_input/main/appcast.xml
 ```
 
 This requires the repository (or at least that file) to be reachable
@@ -126,7 +126,7 @@ signatures made by the new key.
    mkdir -p dist && mv VoiceInput.dmg dist/
    .build/artifacts/sparkle/Sparkle/bin/generate_appcast \
        --download-url-prefix \
-       "https://git.roshanca.com/roshanca/voice_input/releases/download/v<VERSION>/" \
+       "https://github.com/roshanca/voice_input/releases/download/v<VERSION>/" \
        -o appcast.xml dist/
    ```
 
@@ -134,7 +134,7 @@ signatures made by the new key.
    `<item>` with the `sparkle:edSignature`. Adjust
    `--download-url-prefix` to wherever the DMG will actually be hosted.
    Alternatively sign one archive manually with `bin/sign_update`.
-4. Create a Gitea release for tag `v<VERSION>` and attach `VoiceInput.dmg`
+4. Create a GitHub release for tag `v<VERSION>` and attach `VoiceInput.dmg`
    so the enclosure URL resolves.
 5. Commit the updated `appcast.xml` to `main` — clients pick the update up
    on their next scheduled check or via "Check for Updates…".

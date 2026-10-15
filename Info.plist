@@ -31,7 +31,7 @@
     <key>NSAppleEventsUsageDescription</key>
     <string>VoiceInput uses Apple Events to simulate keystrokes for text injection.</string>
     <key>SUFeedURL</key>
-    <string>https://git.roshanca.com/roshanca/voice_input/raw/branch/main/appcast.xml</string>
+    <string>https://raw.githubusercontent.com/roshanca/voice_input/main/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>Kl/HLyqUijKAtoXgAwZ6Q7qlYY9Zs481k0py3rmFQJA=</string>
 </dict>
