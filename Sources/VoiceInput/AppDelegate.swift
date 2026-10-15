@@ -434,7 +434,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         session.duration = Date().timeIntervalSince(session.startDate)
 
-        // Dictionary replacements apply to the text sent onward; history keeps the true ASR output.
+        // Dictionary replacements apply to the text sent onward; history keeps
+        // both the true ASR output and the text that was actually committed.
         let applyReplacements: (String) -> String = session.dictionaryDirectReplacement
             ? DictionaryStore.shared.applyReplacements(to:)
             : { $0 }
@@ -448,10 +449,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
             floatingPanel.hide()
-            TextInjector.shared.inject(text: applyReplacements(trimmed), keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
+            let output = applyReplacements(trimmed)
+            TextInjector.shared.inject(text: output, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
                 self?.reportInjectionOutcome(outcome)
             }
-            recordHistory(raw: trimmed, refined: nil, session: session)
+            recordHistory(raw: trimmed, refined: nil, output: output, session: session)
         }
     }
 
@@ -482,12 +484,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func recordHistory(raw: String, refined: String?, session: DictationSession) {
+    private func recordHistory(raw: String, refined: String?, output: String, session: DictationSession) {
         let record = DictationRecord(
             date: Date(),
             durationSeconds: session.duration,
             rawText: raw,
             refinedText: refined,
+            outputText: output,
             language: session.language
         )
         HistoryStore.shared.add(record)
@@ -580,7 +583,7 @@ extension AppDelegate: LLMRefinerDelegate {
         TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
             self?.reportInjectionOutcome(outcome)
         }
-        recordHistory(raw: session.submittedText, refined: text, session: session)
+        recordHistory(raw: session.submittedText, refined: text, output: text, session: session)
     }
 
     func llmRefiner(_ refiner: LLMRefiner, didFailWith error: Error, requestID: UUID) {
@@ -594,6 +597,6 @@ extension AppDelegate: LLMRefinerDelegate {
         TextInjector.shared.inject(text: fallback, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
             self?.reportInjectionOutcome(outcome)
         }
-        recordHistory(raw: session.submittedText, refined: nil, session: session)
+        recordHistory(raw: session.submittedText, refined: nil, output: fallback, session: session)
     }
 }

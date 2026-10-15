@@ -74,6 +74,13 @@ final class DictionaryStore: ObservableObject {
 
     /// Literal case-insensitive term → replacement applied to raw ASR text.
     func applyReplacements(to text: String) -> String {
+        Self.applyReplacements(to: text, entries: entries)
+    }
+
+    /// Pure form of the replacement pass — the rules a committed dictation
+    /// goes through, kept separate from the store so the pipeline logic is
+    /// testable without touching the singleton's file-backed state.
+    nonisolated static func applyReplacements(to text: String, entries: [DictionaryEntry]) -> String {
         var result = text
         for entry in entries {
             guard let replacement = entry.replacement, !replacement.isEmpty, replacement != entry.term else { continue }
