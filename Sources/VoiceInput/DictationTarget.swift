@@ -125,7 +125,7 @@ struct DictationTarget {
         }
         let current = ref as! AXUIElement
 
-        let verdict: Mismatch?
+        var verdict: Mismatch?
         if CFEqual(captured, current) {
             verdict = nil
         } else {
@@ -137,10 +137,32 @@ struct DictationTarget {
             }
         }
 
-        // The AX round-trips above take real time — the app check at the top
-        // can go stale while they run, so identity is verified one last time
-        // before the target is reported valid.
         if verdict == nil {
+            // Focus can move while the queries above run — re-read the
+            // focused element and require it to still verify. A different
+            // token isn't yet proof of a change (churned tokens are why the
+            // fingerprint exists), but the refetched element must then carry
+            // the same distinguishing evidence as the capture.
+            var confirmRef: CFTypeRef?
+            let confirmError = AXUIElementCopyAttributeValue(
+                appElement, kAXFocusedUIElementAttribute as CFString, &confirmRef
+            )
+            guard confirmError == .success, let confirmRef else {
+                return confirmError == .noValue ? .focusedElementChanged : .unverifiable
+            }
+            let confirmed = confirmRef as! AXUIElement
+            if !CFEqual(confirmed, current) {
+                AXUIElementSetMessagingTimeout(confirmed, Self.axTimeout)
+                switch compare(current: confirmed, includeGeometry: includeGeometry) {
+                case .same: break
+                case .different: return .focusedElementChanged
+                case .ambiguous: return .unverifiable
+                }
+            }
+
+            // The AX round-trips above take real time — the app check at the
+            // top can go stale while they run, so identity is verified one
+            // last time before the target is reported valid.
             guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
                 return .appTerminated
             }
@@ -151,11 +173,15 @@ struct DictationTarget {
 
     /// Fallback for apps whose element tokens churn between queries.
     ///
-    /// Equal nil attributes prove nothing — a match only counts when at least
-    /// one concrete attribute (identifier, title, … or the frame when
-    /// geometry is included) is present on both sides and equal. With zero
-    /// evidence the element can't be told apart from a sibling field, so the
-    /// result is `.ambiguous` and delivery is suppressed.
+    /// Two questions are answered separately:
+    /// - Consistency: every observed attribute must still match — any
+    ///   inequality means this is a different element.
+    /// - Evidence: consistency alone can't tell siblings apart (two fields
+    ///   in one window routinely share role, subrole like AXSearchField,
+    ///   and generic labels). Only attributes that actually identify one
+    ///   field — `AXIdentifier`, or the frame when geometry is in scope —
+    ///   can prove sameness. Without any, the comparison is `.ambiguous`
+    ///   and delivery is suppressed.
     private func compare(current element: AXUIElement, includeGeometry: Bool) -> ElementComparison {
         // Role is the baseline: a different kind of element is never the
         // same field, and it is too common to count as evidence by itself.
@@ -163,23 +189,38 @@ struct DictationTarget {
             return .different
         }
 
-        var evidence = 0
+        // Generic metadata vetoes but never proves — a shared subrole or
+        // label like "Search" describes a whole family of fields.
         for (attribute, capturedValue) in [
             (kAXSubroleAttribute, elementSubrole),
-            (kAXIdentifierAttribute, elementIdentifier),
             (kAXDescriptionAttribute, elementDescription),
             (kAXTitleAttribute, elementTitle),
         ] {
-            let currentValue = Self.stringAttribute(attribute, of: element)
-            guard currentValue == capturedValue else { return .different }
-            if capturedValue != nil { evidence += 1 }
+            guard Self.stringAttribute(attribute, of: element) == capturedValue else {
+                return .different
+            }
+        }
+
+        var distinguished = false
+
+        if let elementIdentifier {
+            guard Self.stringAttribute(kAXIdentifierAttribute, of: element) == elementIdentifier else {
+                return .different
+            }
+            distinguished = true
+        } else {
+            // Captured without an identifier — a present one now is new
+            // observable state, not proof of identity.
+            guard Self.stringAttribute(kAXIdentifierAttribute, of: element) == nil else {
+                return .different
+            }
         }
 
         if includeGeometry {
             switch (elementFrame, Self.frameOf(element)) {
             case let (capturedFrame?, currentFrame?):
                 guard capturedFrame == currentFrame else { return .different }
-                evidence += 1
+                distinguished = true
             case (nil, nil):
                 break
             default:
@@ -187,7 +228,7 @@ struct DictationTarget {
             }
         }
 
-        return evidence > 0 ? .same : .ambiguous
+        return distinguished ? .same : .ambiguous
     }
 
     private static var frontmostPID: pid_t? {
