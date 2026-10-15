@@ -373,16 +373,19 @@ final class TextInjector {
     }
 
     /// The clipboard content to restore when undoing `pending`'s write.
-    /// `snapshot` captured whatever the write replaced — but when that was
-    /// itself a write canceled before its paste fired, its captured text is
-    /// illegitimate and the true base is that write's own restore target.
-    /// Walks the chain so a run of overlapping canceled writes resolves to
-    /// the real pre-sequence clipboard; a predecessor that pasted (cancel
-    /// only suppressed its auto-send) or wasn't canceled ends the walk —
-    /// its text is legitimate content.
+    /// `snapshot` captured whatever the write replaced — but a captured
+    /// predecessor's write is not always a valid base. Walk past it when:
+    /// - it was canceled before its paste fired — the text never counted
+    ///   as clipboard content;
+    /// - it is a temporary write (requiresRestore) — its own snapshot
+    ///   defines what lies underneath, and may itself capture a canceled
+    ///   write's text.
+    /// Only content meant to stay — a live or pasted keepInClipboard
+    /// write — is a terminal base. The walk resolves through the chain to
+    /// the true pre-sequence clipboard.
     private static func restoreBase(of pending: PendingRestore) -> ClipboardSnapshot {
         if let overwritten = pending.overwritten,
-           overwritten.ticket.canceled && !overwritten.ticket.pasteFired {
+           (overwritten.ticket.canceled && !overwritten.ticket.pasteFired) || overwritten.requiresRestore {
             return restoreBase(of: overwritten)
         }
         return pending.snapshot
