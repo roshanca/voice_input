@@ -22,6 +22,13 @@ final class HotkeyManager {
     var onTranslateRelease: (() -> Void)?
     /// A tap/doubleTap gesture completed on a translate binding.
     var onTranslateToggle: (() -> Void)?
+    /// Rewrite-session hold edges — identical shape to translate's; the
+    /// delegate turns the transcript into an LLM instruction instead of
+    /// a translation input.
+    var onRewritePress: (() -> Void)?
+    var onRewriteRelease: (() -> Void)?
+    /// A tap/doubleTap gesture completed on a rewrite binding.
+    var onRewriteToggle: (() -> Void)?
     /// One edge of a selection-action chord (press or release) reaching the
     /// main actor. The delegate owns the decision entirely: on press it
     /// probes the selection and either runs the action immediately or falls
@@ -40,6 +47,9 @@ final class HotkeyManager {
     /// Translate bindings — push-to-talk like dictation's, but the session
     /// submits to the translation prompt instead of refinement.
     private(set) var translateBindings: [HotkeyBinding] = []
+    /// Rewrite bindings — push-to-talk like translate's, but the session
+    /// submits the transcript as an instruction to execute.
+    private(set) var rewriteBindings: [HotkeyBinding] = []
     /// Selection-action bindings — also `.hold`-dispatched, but the delegate
     /// decides per press whether they act on a selection or fall back to
     /// dictation, so both edges must reach it (unlike re-paste).
@@ -104,6 +114,15 @@ final class HotkeyManager {
         UserDefaults.standard.translateHotkeyBindings = bindings
     }
 
+    /// Persisted rewrite bindings. Defaults to ⌃⌥R; new key, no migration.
+    static var savedRewrite: [HotkeyBinding] {
+        UserDefaults.standard.rewriteHotkeyBindings
+    }
+
+    static func persistRewrite(_ bindings: [HotkeyBinding]) {
+        UserDefaults.standard.rewriteHotkeyBindings = bindings
+    }
+
     /// Persisted selection-action bindings. Each defaults to a ⌃⇧ chord
     /// (⌃⌥T was already taken by voice translate); new keys, no migration.
     static var savedSelectionTranslate: [HotkeyBinding] {
@@ -134,11 +153,13 @@ final class HotkeyManager {
     /// must be re-created when the event mask changes (Fn ↔ F-key);
     /// re-enabling is not enough.
     func update(dictation: [HotkeyBinding], rePaste: [HotkeyBinding],
-                translate: [HotkeyBinding], selectionTranslate: [HotkeyBinding],
+                translate: [HotkeyBinding], rewrite: [HotkeyBinding],
+                selectionTranslate: [HotkeyBinding],
                 selectionRewrite: [HotkeyBinding], addToDictionary: [HotkeyBinding]) {
         dictationBindings = dictation
         rePasteBindings = rePaste
         translateBindings = translate
+        rewriteBindings = rewrite
         selectionTranslateBindings = selectionTranslate
         selectionRewriteBindings = selectionRewrite
         addToDictionaryBindings = addToDictionary
@@ -146,6 +167,7 @@ final class HotkeyManager {
             dictation.map { RoutedBinding(business: .dictation, binding: $0) }
                 + rePaste.map { RoutedBinding(business: .rePaste, binding: $0) }
                 + translate.map { RoutedBinding(business: .translate, binding: $0) }
+                + rewrite.map { RoutedBinding(business: .rewrite, binding: $0) }
                 + selectionTranslate.map { RoutedBinding(business: .selectionTranslate, binding: $0) }
                 + selectionRewrite.map { RoutedBinding(business: .selectionRewrite, binding: $0) }
                 + addToDictionary.map { RoutedBinding(business: .addToDictionary, binding: $0) }
@@ -168,7 +190,8 @@ final class HotkeyManager {
     func start() {
         stop()
         let allBindings = dictationBindings + rePasteBindings + translateBindings
-            + selectionTranslateBindings + selectionRewriteBindings + addToDictionaryBindings
+            + rewriteBindings + selectionTranslateBindings + selectionRewriteBindings
+            + addToDictionaryBindings
         guard !allBindings.isEmpty else {
             AppLogger.shared.warning("No hotkey bindings — tap not installed")
             setTapActive(false)
@@ -327,6 +350,17 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
                     HotkeyManager.shared.onTranslateRelease?()
                 }
             }
+        case .rewrite:
+            // Same hold edges as translate — the release submits the spoken
+            // instruction for generation.
+            let isPress = routed.binding.hotkey.isPress(event: event)
+            Task { @MainActor in
+                if isPress {
+                    HotkeyManager.shared.onRewritePress?()
+                } else {
+                    HotkeyManager.shared.onRewriteRelease?()
+                }
+            }
         case .rePaste:
             // One action per physical press, auto-repeat keyDowns and the
             // release swallowed silently so the chord can't leak into the
@@ -386,6 +420,8 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
                     HotkeyManager.shared.onRePaste?()
                 case .translate:
                     HotkeyManager.shared.onTranslateToggle?()
+                case .rewrite:
+                    HotkeyManager.shared.onRewriteToggle?()
                 case .selectionTranslate, .selectionRewrite, .addToDictionary:
                     // A completed tap cycle on a selection binding means
                     // "act on the selection now": a press followed by its

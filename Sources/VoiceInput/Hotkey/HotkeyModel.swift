@@ -248,6 +248,10 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
     /// Push-to-talk into translation: same recording session as dictation,
     /// but the post-ASR stage translates instead of refining (⌃⌥T by default).
     case translate
+    /// Push-to-talk as an LLM prompt: the transcript is the instruction,
+    /// not text to polish — the generated answer is injected, or shown on
+    /// the Answer Card when the target can't take it (⌃⌥R by default).
+    case rewrite
     /// LLM-translates the current text selection in place (⌃⇧T by default).
     case selectionTranslate
     /// LLM-rewrites the current text selection in place (⌃⇧R by default).
@@ -263,9 +267,10 @@ enum HotkeyBusiness: String, Codable, CaseIterable {
         case .dictation: return 0
         case .rePaste: return 1
         case .translate: return 2
-        case .addToDictionary: return 3
-        case .selectionRewrite: return 4
-        case .selectionTranslate: return 5
+        case .rewrite: return 3
+        case .addToDictionary: return 4
+        case .selectionRewrite: return 5
+        case .selectionTranslate: return 6
         }
     }
 }

@@ -65,6 +65,7 @@ final class SettingsStore: ObservableObject {
             dictation: bindings,
             rePaste: HotkeyManager.savedRePaste,
             translate: HotkeyManager.savedTranslate,
+            rewrite: HotkeyManager.savedRewrite,
             selectionTranslate: HotkeyManager.savedSelectionTranslate,
             selectionRewrite: HotkeyManager.savedSelectionRewrite,
             addToDictionary: HotkeyManager.savedAddToDictionary
@@ -84,6 +85,12 @@ final class SettingsStore: ObservableObject {
     /// persisted and routed, but not editable from settings yet.
     var translateHotkeyDisplay: String {
         HotkeyManager.savedTranslate.first?.hotkey.displayName ?? "Unbound"
+    }
+
+    /// Read-only display of the first rewrite binding — same persisted-but-
+    /// not-editable status as the translate chord.
+    var rewriteHotkeyDisplay: String {
+        HotkeyManager.savedRewrite.first?.hotkey.displayName ?? "Unbound"
     }
 
     /// Display names of the persisted selection-action chords. Read-only —

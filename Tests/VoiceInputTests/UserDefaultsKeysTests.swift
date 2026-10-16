@@ -81,6 +81,31 @@ final class UserDefaultsKeysTests: XCTestCase {
                        .chord(keyCode: 9, modifiers: [.control, .command]))
     }
 
+    /// The rewrite feature ships with ⌃⌥R as its persisted default — a
+    /// brand-new install must decode exactly that binding (#22). The ⌃⌥
+    /// voice family pairs it with ⌃⌥T translate; ⌃⌘/⌃⇧ are taken.
+    func testRewriteHotkeyBindingsDefaultsToCtrlOptR() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.rewriteHotkeyBindings,
+                       [HotkeyBinding(hotkey: .chord(keyCode: 15, modifiers: [.control, .option]), behavior: .hold)])
+    }
+
+    func testRewriteHotkeyBindingsRoundTrip() {
+        let isolated = IsolatedDefaults()
+        let custom = [HotkeyBinding(hotkey: .chord(keyCode: 8, modifiers: [.control, .option]), behavior: .tap)]
+        isolated.defaults.rewriteHotkeyBindings = custom
+        XCTAssertEqual(isolated.defaults.rewriteHotkeyBindings, custom)
+    }
+
+    /// A corrupted or empty stored payload falls back to the ⌃⌥R default
+    /// rather than silently disabling rewrite.
+    func testRewriteHotkeyBindingsFallsBackOnEmptyPayload() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.set(Data("[]".utf8), forKey: "rewriteHotkeyBindings")
+        XCTAssertEqual(isolated.defaults.rewriteHotkeyBindings.first?.hotkey,
+                       .chord(keyCode: 15, modifiers: [.control, .option]))
+    }
+
     /// The translate feature ships with ⌃⌥T as its persisted default — a
     /// brand-new install must decode exactly that binding (#23).
     func testTranslateHotkeyBindingsDefaultsToCtrlOptT() {

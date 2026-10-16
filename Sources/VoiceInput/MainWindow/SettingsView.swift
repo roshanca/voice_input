@@ -120,6 +120,17 @@ struct SettingsView: View {
             }
 
             Section {
+                LabeledContent("Hotkey") {
+                    Text(store.rewriteHotkeyDisplay)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Label("Voice Rewrite", systemImage: "wand.and.stars")
+            } footer: {
+                Text("Hold \(store.rewriteHotkeyDisplay) and speak an instruction — on release the transcript is sent to the LLM as a command and the generated answer is inserted. When the focused app can't take text, the answer opens in a copyable card instead. Needs a configured LLM profile; works even when refinement is off.")
+            }
+
+            Section {
                 SelectionActionRow(
                     title: "Translate selection",
                     caption: "Translate the selected text, replacing it in place.",

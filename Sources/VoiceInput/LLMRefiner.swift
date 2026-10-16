@@ -61,6 +61,10 @@ final class LLMRefiner {
         /// custom prompt describes refinement, not translation, so this mode
         /// always uses its own prompt.
         case translate(targetLanguage: String)
+        /// Execute the transcript as a spoken instruction — the output is
+        /// generated content, not a corrected/echoed transcript. Always
+        /// uses its own prompt for the same reason translate does.
+        case rewrite
     }
 
     /// requestID binds every callback of this request to the dictation
@@ -77,6 +81,14 @@ final class LLMRefiner {
     /// settings change mid-flight can't redirect a committed request.
     func translate(text: String, requestID: UUID, targetLanguage: String, profileOverride: LLMConfig? = nil) {
         start(text: text, requestID: requestID, mode: .translate(targetLanguage: targetLanguage), profileOverride: profileOverride)
+    }
+
+    /// Rewrite session: identical streaming/cancel machinery to `refine`,
+    /// instruction-execution prompt. The transcript IS the command here —
+    /// nothing carries a target parameter because the whole configuration
+    /// lives in the prompt.
+    func rewrite(text: String, requestID: UUID, profileOverride: LLMConfig? = nil) {
+        start(text: text, requestID: requestID, mode: .rewrite, profileOverride: profileOverride)
     }
 
     private func start(text: String, requestID: UUID, mode: Mode, profileOverride: LLMConfig?) {
@@ -117,6 +129,8 @@ final class LLMRefiner {
             userContent = "Correct this speech transcript:\n<transcript>\n\(text)\n</transcript>"
         case .translate:
             userContent = TranslationPrompt.userContent(for: text)
+        case .rewrite:
+            userContent = RewritePrompt.userContent(for: text)
         }
 
         var body: [String: Any] = [
@@ -257,9 +271,11 @@ Output only the corrected text, with no introduction, labels, or markdown.
             base = custom.isEmpty ? LLMRefiner.defaultSystemPrompt : custom
         case .translate(let targetLanguage):
             base = TranslationPrompt.systemPrompt(targetLanguage: targetLanguage)
+        case .rewrite:
+            base = RewritePrompt.systemPrompt
         }
         // The custom-vocabulary fragment states preferred forms — as relevant
-        // to a translation target as to a correction.
+        // to a translation target or a generated answer as to a correction.
         return base + DictionaryStore.shared.promptFragment()
     }
 }

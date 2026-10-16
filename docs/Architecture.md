@@ -8,7 +8,8 @@ weaknesses, not aspirational.
 
 Menu-bar dictation: trigger a hotkey (hold, tap-to-toggle, or double-tap)
 → speak → recognized (optionally LLM-polished) text is typed into the
-focused app. A second hotkey swaps the polish step for LLM translation.
+focused app. A second hotkey swaps the polish step for LLM translation,
+a third sends the transcript to the LLM as an instruction (voice rewrite).
 No window by default; the SwiftUI main window opens on demand.
 
 ## Pipeline
@@ -42,6 +43,16 @@ session carries `kind`). submitSession forks on kind → LLMRefiner.translate
 TextInjector → HistoryStore. Unlike refinement this is not gated by
 `llmEnabled` — with no configured profile the transcript is parked in
 History + panel flash, nothing injected
+Rewrite: ⌃⌥R chord (HotkeyBusiness.rewrite, hold) → same machinery, but
+the transcript is the instruction itself (RewritePrompt — <instruction>
+tags mark what to execute, the inverse of the inert-text wrappers) →
+LLMRefiner.rewrite → answer delivery forks on the captured target's
+`isWritable` (AX settable-text-attribute probe; undecidable = not
+writable): writable → TextInjector → HistoryStore like dictation;
+not writable → AnswerCardPanel (copyable card, Esc-dismissible via the
+session-active Esc interception). A failed injection outcome (parked /
+clipboard undeliverable) surfaces the card too — the generated text is
+never lost. Same not-configured fallback as translate.
 
 Selection actions: ⌃⇧T / ⌃⇧R / ⌃⇧D chords send press+release edges to
 AppDelegate, which probes the selection on press (SelectedTextProbe):
@@ -73,16 +84,17 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 |---|---|
 | `App.swift` | `@main` NSApplicationDelegateAdaptor shell |
 | `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
-| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation, `rePaste`, `translate`, and three selection actions (`selectionTranslate`, `selectionRewrite`, `addToDictionary`) |
-| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
-| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > translate > rePaste > dictation). First matching routed binding owns the event |
+| `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation, `rePaste`, `translate`, `rewrite`, and three selection actions (`selectionTranslate`, `selectionRewrite`, `addToDictionary`) |
+| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
+| `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rewrite > translate > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
-| `LLMRefiner.swift` | SSE streaming refine **or** translate (`Mode` selects system prompt + user wrapper); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
+| `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
 | `LLMProfileRouting.swift` | Pure per-app profile routing: exact bundle-ID match wins, absent/dangling entries fall back to the global pick (selected id → first); resolved once at session start |
 | `TranslationPrompt.swift` | Pure prompt builder for translate sessions — bidirectional against Chinese (already-in-target input translates back to Chinese), `<transcript>` inert-text wrapper like refine |
+| `RewritePrompt.swift` | Pure prompt builder for rewrite sessions — the `<instruction>`-tagged transcript IS the command (inverse of the inert wrappers); output-only contract, ASR-noise-tolerant reading |
 | `TextInjector.swift` | clipboard swap + ⌘V + restore; CJK input-method aware; optional auto-Return; `InjectionTicket` tracks cancel-before/after-paste so a cancelled delivery suppresses send and deletes its history record |
-| `DictationTarget.swift` | Frontmost app + focused AX element captured before the panel steals focus (and at ⌃⌘V press for re-paste); re-validated before paste and before auto-Return; mismatch parks the result instead of sending |
+| `DictationTarget.swift` | Frontmost app + focused AX element captured before the panel steals focus (and at ⌃⌘V press for re-paste); re-validated before paste and before auto-Return; mismatch parks the result instead of sending. `isWritable` = capture-time probe of settable `AXValue`/`AXSelectedText`/`AXSelectedTextRange` — voice rewrite's inject-vs-card gate; undecidable resolves to not-writable |
 | `EscapeRouting.swift` | Pure Esc routing: consume only while a session is active; `PressOwnership` pins one decision per physical press (repeats + keyUp follow it); ⌘⌥⎋ always passes through |
 | `AutoSendRules.swift` | Pure per-app auto-send override resolution: `inherit` (absent entry) / on / off keyed by bundle ID; resolved once at session start |
 | `RefinementFallback.swift` | "Use Original" while LLM is pending: clears `pendingSession` before cancelling so racing callbacks fail the request-ID guard; exactly-one injection/history |
@@ -98,9 +110,10 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Storage/DictionaryStore.swift` | Custom dictionary; `DictionaryRules` pure replacements (unit-tested) |
 | `Storage/HistoryStore.swift` | Dictation records (no audio yet) |
 | `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides, `LLMProfileOverridesView` edits per-app profile routes |
+| `AnswerCardPanel.swift` | Floating card for a rewrite answer that can't be injected (unwritable target or failed delivery): scrollable read-only text + Copy/Close; counts as session work so Esc dismisses it through the normal interception |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing

@@ -16,6 +16,7 @@ extension UserDefaults {
         static let dictationHotkeyBindings = "dictationHotkeyBindings"
         static let rePasteHotkeyBindings = "rePasteHotkeyBindings"
         static let translateHotkeyBindings = "translateHotkeyBindings"
+        static let rewriteHotkeyBindings = "rewriteHotkeyBindings"
         static let selectionTranslateHotkeyBindings = "selectionTranslateHotkeyBindings"
         static let selectionRewriteHotkeyBindings = "selectionRewriteHotkeyBindings"
         static let addToDictionaryHotkeyBindings = "addToDictionaryHotkeyBindings"
@@ -174,6 +175,25 @@ extension UserDefaults {
         }
         set {
             set(try? JSONEncoder().encode(newValue), forKey: Keys.translateHotkeyBindings)
+        }
+    }
+
+    /// Rewrite-mode bindings — new key, no migration. `.hold` is real
+    /// push-to-talk: the press starts a rewrite session, the release sends
+    /// the transcript to the LLM as an instruction. Defaults to ⌃⌥R
+    /// (R = keyCode 15): R-ewrite sits in the same ⌃⌥ voice family as
+    /// ⌃⌥T translate — ⌃⌘ holds re-paste (V) and ⌃⇧ the selection trio.
+    var rewriteHotkeyBindings: [HotkeyBinding] {
+        get {
+            if let data = data(forKey: Keys.rewriteHotkeyBindings),
+               let decoded = try? JSONDecoder().decode([HotkeyBinding].self, from: data),
+               !decoded.isEmpty {
+                return decoded
+            }
+            return [HotkeyBinding(hotkey: .chord(keyCode: 15, modifiers: [.control, .option]), behavior: .hold)]
+        }
+        set {
+            set(try? JSONEncoder().encode(newValue), forKey: Keys.rewriteHotkeyBindings)
         }
     }
 
