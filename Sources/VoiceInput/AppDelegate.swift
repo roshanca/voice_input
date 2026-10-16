@@ -12,6 +12,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tapActive: Bool { HotkeyManager.shared.isTapActive }
 
     private let floatingPanel = FloatingPanel()
+    /// Answer Card: the fallback surface for a rewrite result that can't
+    /// be injected (unwritable target / failed delivery). Copyable and
+    /// Esc-dismissible — while it's up it counts as session work so the
+    /// Esc interception keeps routing the key to us.
+    private let answerCard = AnswerCardPanel()
     private let speechRecognizer = SpeechRecognizer()
     private let llmRefiner = LLMRefiner()
     /// Selection transforms get their own client — sharing `llmRefiner`
@@ -32,12 +37,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case dictation
             /// Always LLM: translate the transcript into the target language.
             case translate
+            /// Always LLM: the transcript is the instruction — the generated
+            /// answer is injected, or shown on the Answer Card when the
+            /// target can't take it.
+            case rewrite
 
-            /// The in-flight LLM stage's name for logs ("refinement"/"translation").
+            /// The in-flight LLM stage's name for logs ("refinement"/"translation"/"generation").
             var stageName: String {
                 switch self {
                 case .dictation: return "refinement"
                 case .translate: return "translation"
+                case .rewrite: return "generation"
+                }
+            }
+
+            /// Capitalized label for session-scoped log lines.
+            var logName: String {
+                switch self {
+                case .dictation: return "Dictation"
+                case .translate: return "Translate"
+                case .rewrite: return "Rewrite"
                 }
             }
         }
@@ -106,12 +125,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var selectionTransformInFlight = false
 
     /// Whether Esc currently means "cancel in-flight work": recording,
-    /// awaiting the final result, refining, delivering, or transforming a
-    /// selection. Mirrored into HotkeyManager so the event tap can decide
-    /// synchronously whether the keypress belongs to us or to the focused app.
+    /// awaiting the final result, refining, delivering, transforming a
+    /// selection, or dismissing the Answer Card. Mirrored into
+    /// HotkeyManager so the event tap can decide synchronously whether
+    /// the keypress belongs to us or to the focused app.
     private var isSessionActive: Bool {
         isHotkeyHeld || activeSession != nil || pendingSession != nil
             || inFlightInjections > 0 || selectionTransformInFlight
+            || answerCard.isShowing
     }
 
     private func syncEscapeInterception() {
@@ -138,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         speechRecognizer.delegate = self
         llmRefiner.delegate = self
         floatingPanel.onUseOriginal = { [weak self] in self?.useOriginalText() }
+        answerCard.onDismiss = { [weak self] in self?.syncEscapeInterception() }
         speechRecognizer.warmUp()
         setupHotkey()
     }
@@ -329,6 +351,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyManager.onTranslatePress = { [weak self] in self?.translatePressed() }
         hotkeyManager.onTranslateRelease = { [weak self] in self?.translateReleased() }
         hotkeyManager.onTranslateToggle = { [weak self] in self?.toggleTranslate() }
+        hotkeyManager.onRewritePress = { [weak self] in self?.rewritePressed() }
+        hotkeyManager.onRewriteRelease = { [weak self] in self?.rewriteReleased() }
+        hotkeyManager.onRewriteToggle = { [weak self] in self?.toggleRewrite() }
         hotkeyManager.onSelectionAction = { [weak self] business, edge in
             switch edge {
             case .press: self?.selectionActionPressed(business)
@@ -342,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dictation: HotkeyManager.savedDictation,
             rePaste: HotkeyManager.savedRePaste,
             translate: HotkeyManager.savedTranslate,
+            rewrite: HotkeyManager.savedRewrite,
             selectionTranslate: HotkeyManager.savedSelectionTranslate,
             selectionRewrite: HotkeyManager.savedSelectionRewrite,
             addToDictionary: HotkeyManager.savedAddToDictionary
@@ -465,6 +491,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionPressed(kind: .translate)
     }
 
+    /// Rewrite hotkey press — same session machinery again; the kind tag
+    /// reroutes the post-ASR stage so the transcript goes to the LLM as
+    /// an instruction rather than text to polish or translate.
+    func rewritePressed() {
+        sessionPressed(kind: .rewrite)
+    }
+
     private func sessionPressed(kind: DictationSession.Kind) {
         guard !isHotkeyHeld else { return }
         isHotkeyHeld = true
@@ -497,7 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         activeSession = session
         syncEscapeInterception()
-        AppLogger.shared.info("\(kind == .translate ? "Translate" : "Dictation") hotkey pressed — starting recording (target: \(target?.appName ?? "unknown"), auto-send: \(session.autoSend))")
+        AppLogger.shared.info("\(kind.logName) hotkey pressed — starting recording (target: \(target?.appName ?? "unknown"), auto-send: \(session.autoSend))")
         startRecordingAnimation()
         SoundPlayer.recordStart()
 
@@ -581,6 +614,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         releaseSession(kind: .translate)
     }
 
+    func rewriteReleased() {
+        releaseSession(kind: .rewrite)
+    }
+
     /// Shared release path for hold-mode sessions. The kind guard keeps one
     /// business's key release from ending a session owned by the other
     /// hotkey: a second business's press is refused while a session is held,
@@ -634,6 +671,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Tap/doubleTap rewrite bindings toggle a rewrite session — same
+    /// kind-guarded start/stop reuse as `toggleTranslate`.
+    private func toggleRewrite() {
+        if isHotkeyHeld {
+            guard activeSession?.kind == .rewrite else { return }
+            rewriteReleased()
+        } else {
+            rewritePressed()
+        }
+    }
+
     /// Esc during an active session: stop whichever stage is in flight —
     /// recording, awaiting the final result, refining, transforming a
     /// selection, or delivering — close the panel, and let the session /
@@ -663,6 +711,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         TextInjector.shared.cancelInFlight()
         floatingPanel.hide()
+        // An Esc that arrives for a visible Answer Card lands here too —
+        // the card is part of the "active work" the key cancels.
+        answerCard.dismiss()
         syncEscapeInterception()
     }
 
@@ -741,7 +792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startSelectionTransform(.translate, text: text, target: target)
         case .selectionRewrite:
             startSelectionTransform(.rewrite, text: text, target: target)
-        case .dictation, .rePaste, .translate:
+        case .dictation, .rePaste, .translate, .rewrite:
             break
         }
     }
@@ -928,6 +979,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pendingSession = session
             syncEscapeInterception()
             llmRefiner.translate(text: llmInput, requestID: session.id, targetLanguage: session.translateTargetLanguage)
+        case .rewrite:
+            // Same gate as translate: pressing the rewrite key is explicit
+            // intent, so `llmEnabled` (which gates only optional dictation
+            // polish) doesn't apply — but with no configured profile the
+            // transcript is an instruction addressed to nobody, so it parks
+            // in History instead of being injected verbatim.
+            guard llmRefiner.isConfigured else {
+                let output = applyReplacements(trimmed)
+                AppLogger.shared.warning("Rewrite session submitted with no configured LLM — parking transcript in History")
+                recordHistory(raw: trimmed, refined: nil, output: output, session: session)
+                floatingPanel.flash("Rewrite needs a configured LLM profile — transcript saved in History")
+                syncEscapeInterception()
+                return
+            }
+            AppLogger.shared.info("Rewrite session submitted — generating answer")
+            floatingPanel.setText("Generating…")
+            floatingPanel.setUseOriginalVisible(true)
+            session.submittedText = trimmed
+            pendingSession = session
+            syncEscapeInterception()
+            llmRefiner.rewrite(text: llmInput, requestID: session.id)
         }
     }
 
@@ -936,20 +1008,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// history. `inFlightInjections` keeps Esc's cancel window open until
     /// the delivery resolves; a `.cancelled` outcome removes the record the
     /// suppressed delivery never produced.
+    ///
+    /// Rewrite sessions reroute: a captured target whose focused element
+    /// can't take text gets the Answer Card instead of a doomed injection,
+    /// and an injection that still fails to land (parked / clipboard
+    /// undeliverable) surfaces the card with the generated text rather
+    /// than losing it to a clipboard write nobody may notice.
     private func deliver(text: String, raw: String, refined: String?, session: DictationSession) {
+        if session.kind == .rewrite, session.target?.isWritable != true {
+            AppLogger.shared.info("Rewrite target not writable — presenting Answer Card")
+            presentAnswerCard(text: text, raw: raw, refined: refined, session: session)
+            return
+        }
         floatingPanel.hide()
         inFlightInjections += 1
         syncEscapeInterception()
         TextInjector.shared.inject(text: text, keepInClipboard: session.copyToClipboard, sendReturn: session.autoSend, target: session.target) { [weak self] outcome in
             guard let self else { return }
             self.inFlightInjections -= 1
-            if case .cancelled = outcome {
+            switch outcome {
+            case .cancelled:
                 HistoryStore.shared.delete(id: session.id)
-            } else {
+            case .parked where session.kind == .rewrite,
+                 .clipboardNotDelivered where session.kind == .rewrite:
+                // The writability probe is a capture-time hint — delivery
+                // can still find no landing place, and the generated
+                // answer must not die in a parked clipboard write.
+                AppLogger.shared.info("Rewrite injection failed (\(outcome)) — presenting Answer Card")
+                self.answerCard.show(text: text)
+            default:
                 self.reportInjectionOutcome(outcome)
             }
             self.syncEscapeInterception()
         }
+        recordHistory(raw: raw, refined: refined, output: text, session: session)
+    }
+
+    /// Rewrite answer delivery when no injection can reach the target:
+    /// hide the dictation panel, show the copyable card, and still record
+    /// history — the answer exists in History even if the card's Copy
+    /// button is never used.
+    private func presentAnswerCard(text: String, raw: String, refined: String?, session: DictationSession) {
+        floatingPanel.hide()
+        answerCard.show(text: text)
+        syncEscapeInterception()
         recordHistory(raw: raw, refined: refined, output: text, session: session)
     }
 

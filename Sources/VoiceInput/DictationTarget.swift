@@ -38,6 +38,8 @@ struct DictationTarget {
     /// Token for the AX focused element at capture time; nil when AX could
     /// not read one, in which case validation falls back to the app level.
     private let focusedElement: AXUIElement?
+    /// Settable-text-attribute probe result at capture — see `isWritable`.
+    private let elementWritable: Bool
     private let elementRole: String?
     private let elementSubrole: String?
     private let elementIdentifier: String?
@@ -52,6 +54,18 @@ struct DictationTarget {
     /// element token keeps churning is reported unverifiable.
     private static let maxValidationPasses = 2
 
+    /// Whether the focused element advertises a settable text attribute —
+    /// `AXValue`, `AXSelectedText`, or `AXSelectedTextRange` — which is the
+    /// AX-level signal that a simulated paste has somewhere to land.
+    /// Buttons, labels, and read-only fields answer no to all three.
+    /// `false` whenever no focused element could be read: "undecidable"
+    /// resolves to "not writable" on purpose, so voice-rewrite falls back
+    /// to its Answer Card instead of pasting into an unverifiable focus.
+    /// It stays a capture-time hint — the injector's own re-validation
+    /// still guards the actual paste, and a stale or wrong probe resolves
+    /// through the normal mismatch/parking path.
+    var isWritable: Bool { elementWritable }
+
     /// Records the frontmost app and its focused element, if readable.
     /// Returns nil only when no frontmost app can be determined at all.
     static func capture() -> DictationTarget? {
@@ -59,6 +73,7 @@ struct DictationTarget {
         let pid = frontmost.processIdentifier
 
         var element: AXUIElement?
+        var writable = false
         var role: String?, subrole: String?, identifier: String?
         var description: String?, title: String?
         var frame: CGRect?
@@ -69,6 +84,7 @@ struct DictationTarget {
             if let focused = copyFocusedElement(of: appElement).element {
                 AXUIElementSetMessagingTimeout(focused, axTimeout)
                 element = focused
+                writable = isWritableElement(focused)
                 role = stringAttribute(kAXRoleAttribute, of: focused)
                 subrole = stringAttribute(kAXSubroleAttribute, of: focused)
                 identifier = stringAttribute(kAXIdentifierAttribute, of: focused)
@@ -83,6 +99,7 @@ struct DictationTarget {
             bundleID: frontmost.bundleIdentifier,
             appName: frontmost.localizedName,
             focusedElement: element,
+            elementWritable: writable,
             elementRole: role,
             elementSubrole: subrole,
             elementIdentifier: identifier,
@@ -237,6 +254,23 @@ struct DictationTarget {
         // An explicit "no value" means focus left the recorded element;
         // anything else means the answer never arrived.
         error == .noValue ? .focusedElementChanged : .unverifiable
+    }
+
+    /// Any of the insert-relevant attributes reported settable counts as
+    /// writable — a text field answers YES to at least one; non-text
+    /// elements don't carry them or report them unsettable (unsupported /
+    /// error answers count as false). Read-only text fields report none
+    /// settable, which is the honest answer for a paste — and keeps a
+    /// generated answer out of controls like secure fields.
+    private static func isWritableElement(_ element: AXUIElement) -> Bool {
+        for attribute in [kAXValueAttribute, kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute] {
+            var settable = DarwinBoolean(false)
+            if AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success,
+               settable.boolValue {
+                return true
+            }
+        }
+        return false
     }
 
     private static func stringAttribute(_ name: String, of element: AXUIElement) -> String? {
