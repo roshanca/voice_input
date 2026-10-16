@@ -18,6 +18,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Esc interception keeps routing the key to us.
     private let answerCard = AnswerCardPanel()
     private let speechRecognizer = SpeechRecognizer()
+    /// Remote-ASR backend (#28): file capture + batch upload. Parallel to
+    /// SpeechRecognizer — the session's `asrPlan` decides which owns a
+    /// recording.
+    private let remoteASRRecognizer = RemoteASRRecognizer()
     private let llmRefiner = LLMRefiner()
     /// Selection transforms get their own client — sharing `llmRefiner`
     /// would let a translate/rewrite cancel a refinement in flight.
@@ -82,6 +86,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         /// Where the result is meant to land — captured at recording start,
         /// re-validated before the paste and again before auto-send.
         let target: DictationTarget?
+        /// Which ASR backend owns this session's capture — resolved at
+        /// press time so a mid-session provider change can't reroute a
+        /// recording already in flight.
+        let asrPlan: ASRSessionPlan
+        /// Set when a remote capture fails while the key is still held —
+        /// the release then ends the session instead of waiting on an
+        /// upload that never started.
+        var captureFailed = false
         var rawText = ""
         var annotatedText = ""
         /// Set at submission on the LLM path: the committed text and the
@@ -162,10 +174,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = HistoryStore.shared
         _ = DictionaryStore.shared
         speechRecognizer.delegate = self
+        remoteASRRecognizer.delegate = self
         llmRefiner.delegate = self
         floatingPanel.onUseOriginal = { [weak self] in self?.useOriginalText() }
         answerCard.onDismiss = { [weak self] in self?.syncEscapeInterception() }
-        speechRecognizer.warmUp()
+        // Only the system provider needs the SFSpeechRecognizer warm-up —
+        // and the speech-authorization prompt it can trigger. Remote ASR
+        // never touches Speech, so when it's selected the permission stays
+        // unrequested (#28, permission-minimization).
+        if UserDefaults.standard.asrProvider == .system {
+            speechRecognizer.warmUp()
+        }
         setupHotkey()
     }
 
@@ -515,6 +534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             llmRefiner.cancel()
             pendingSession = nil
         }
+        // A previous session's remote upload is stale work the same way:
+        // the new press supersedes it (its callbacks would fail the
+        // session-id guards anyway — cancelling just stops the waste).
+        remoteASRRecognizer.cancelRecording()
         let target = DictationTarget.capture()
         // Auto-send resolves once, here, against the recorded target's own
         // bundle ID — re-checking at send time could apply a different app's
@@ -540,7 +563,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 configs: UserDefaults.standard.llmConfigs,
                 fallbackID: UserDefaults.standard.selectedConfigID
             ),
-            target: target
+            target: target,
+            // Provider + endpoint snapshot at press — a mid-session
+            // settings change must not reroute a running recording.
+            asrPlan: ASRSessionPlan.resolve(
+                provider: UserDefaults.standard.asrProvider,
+                remoteConfig: RemoteASRConfig(
+                    baseURL: UserDefaults.standard.remoteASRBaseURL,
+                    model: UserDefaults.standard.remoteASRModel
+                )
+            )
         )
         activeSession = session
         syncEscapeInterception()
@@ -564,7 +596,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let sessionID = session.id
             guard self.activeSession?.id == sessionID, self.isHotkeyHeld, !Task<Never, Never>.isCancelled else { return }
             do {
-                try await speechRecognizer.startRecording(sessionID: sessionID)
+                switch session.asrPlan {
+                case .system:
+                    try await speechRecognizer.startRecording(sessionID: sessionID)
+                case .remote(let config):
+                    try await remoteASRRecognizer.startRecording(sessionID: sessionID, config: config, language: session.language)
+                }
                 AppLogger.shared.info("Speech recording started successfully")
             } catch {
                 AppLogger.shared.error("Speech recording failed to start: \(error.localizedDescription)")
@@ -642,19 +679,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncEscapeInterception()
         AppLogger.shared.info("Hotkey released — stopping recording")
         recordingStartups.values.forEach { $0.cancel() }
-        speechRecognizer.stopRecording()
         stopRecordingAnimation()
         SoundPlayer.recordStop()
 
-        // Wait a bit for the final result
-        guard let sessionID = activeSession?.id else { return }
+        guard let session = activeSession else { return }
         resultTimeout?.invalidate()
-        resultTimeout = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                AppLogger.shared.info("Result timeout fired — processing final text")
-                self.submitSession(sessionID)
+        switch session.asrPlan {
+        case .system:
+            speechRecognizer.stopRecording()
+            // Wait a bit for the final result
+            resultTimeout = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    AppLogger.shared.info("Result timeout fired — processing final text")
+                    self.submitSession(session.id)
+                }
             }
+        case .remote:
+            // Batch ASR: release finalizes the WAV and starts the upload —
+            // the recognizer's finish/fail callbacks own the session from
+            // here, so no result timer is armed. "Transcribing…" is the
+            // honest interim state: a batch endpoint has no partial text
+            // to stream while recording.
+            let uploadStarted = remoteASRRecognizer.stopRecording()
+            if session.captureFailed {
+                // Capture already failed while held (error is on the
+                // panel) — no upload is coming; end the session instead
+                // of waiting on one.
+                activeSession = nil
+                floatingPanel.hide()
+            } else if uploadStarted {
+                floatingPanel.setText("Transcribing…")
+            } else if activeSession?.id == session.id {
+                // No upload started and no failure was flagged: either the
+                // recognizer already surfaced the error itself (it cleared
+                // the session — leave the panel's flash alone), or the
+                // release beat a still-starting capture — close the
+                // session and panel quietly.
+                activeSession = nil
+                floatingPanel.hide()
+            }
+            syncEscapeInterception()
         }
     }
 
@@ -719,6 +784,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectionTransformInFlight = false
         }
         speechRecognizer.cancelRecording()
+        // Cancels the remote path's capture AND its in-flight upload; a
+        // no-op when the session ran on the system provider.
+        remoteASRRecognizer.cancelRecording()
         stopRecordingAnimation()
         if wasRecording {
             SoundPlayer.recordStop()
@@ -1194,6 +1262,56 @@ extension AppDelegate: SpeechRecognizerDelegate {
     }
 
     func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float, sessionID: UUID) {
+        guard activeSession?.id == sessionID else { return }
+        floatingPanel.setWaveformRMS(CGFloat(rms))
+    }
+}
+
+// MARK: - RemoteASRRecognizerDelegate
+
+extension AppDelegate: RemoteASRRecognizerDelegate {
+    /// A batch endpoint produces no partials — the upload response is the
+    /// session's only transcript, and it commits through the identical
+    /// session-guarded path a system-ASR final result takes, so refine /
+    /// translate / rewrite / inject / history all work unchanged (#28).
+    func remoteASRRecognizer(_ recognizer: RemoteASRRecognizer, didFinishWithResult result: TranscriptionResult, sessionID: UUID) {
+        guard var session = activeSession, session.id == sessionID, !session.submitted else {
+            AppLogger.shared.info("Dropped stale remote-ASR result from a previous session")
+            return
+        }
+        session.rawText = result.text
+        session.annotatedText = result.annotatedText
+        activeSession = session
+        floatingPanel.setText(result.text)
+        submitSession(sessionID)
+    }
+
+    func remoteASRRecognizer(_ recognizer: RemoteASRRecognizer, didFailWithError error: Error, sessionID: UUID) {
+        guard var session = activeSession, session.id == sessionID else {
+            AppLogger.shared.debug("Dropped stale remote-ASR error from a previous session: \(error.localizedDescription)")
+            return
+        }
+        AppLogger.shared.error("Remote ASR error: \(error.localizedDescription)")
+        if isHotkeyHeld {
+            // Mid-record failure (e.g. the input route died): surface it
+            // the way the system path does, and flag the session so the
+            // release ends it instead of waiting on an upload that never
+            // started.
+            session.captureFailed = true
+            activeSession = session
+            floatingPanel.setText("Error: \(error.localizedDescription)")
+        } else {
+            // Post-release the only work in flight was the upload itself —
+            // it produced no transcript, so there is nothing to submit and
+            // nothing to record in History. The flash self-hides so the
+            // panel isn't left on a stale "Transcribing…".
+            activeSession = nil
+            floatingPanel.flash("Transcription failed: \(error.localizedDescription)")
+            syncEscapeInterception()
+        }
+    }
+
+    func remoteASRRecognizer(_ recognizer: RemoteASRRecognizer, didUpdateRMS rms: Float, sessionID: UUID) {
         guard activeSession?.id == sessionID else { return }
         floatingPanel.setWaveformRMS(CGFloat(rms))
     }

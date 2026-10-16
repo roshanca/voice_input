@@ -42,6 +42,22 @@ final class SettingsStore: ObservableObject {
     @Published var dictionaryDirectReplacement: Bool {
         didSet { UserDefaults.standard.dictionaryDirectReplacement = dictionaryDirectReplacement }
     }
+    /// ASR backend for new sessions — a running session already snapshotted
+    /// its plan, so this only takes effect on the next press.
+    @Published var asrProvider: ASRProvider {
+        didSet { UserDefaults.standard.asrProvider = asrProvider }
+    }
+    @Published var remoteASRBaseURL: String {
+        didSet { UserDefaults.standard.remoteASRBaseURL = remoteASRBaseURL }
+    }
+    @Published var remoteASRModel: String {
+        didSet { UserDefaults.standard.remoteASRModel = remoteASRModel }
+    }
+    /// In-memory staging only — written to the Keychain on change, never
+    /// to UserDefaults (same secret contract as LLM profile keys).
+    @Published var remoteASRAPIKey: String {
+        didSet { KeychainHelper.set(key: remoteASRAPIKey, account: RemoteASRConfig.keychainAccount) }
+    }
     /// The first dictation binding's hotkey — the settings UI edits a single
     /// binding today, but persistence already stores a binding list.
     @Published var hotkey: Hotkey {
@@ -128,6 +144,10 @@ final class SettingsStore: ObservableObject {
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage
+        asrProvider = defaults.asrProvider
+        remoteASRBaseURL = defaults.remoteASRBaseURL
+        remoteASRModel = defaults.remoteASRModel
+        remoteASRAPIKey = KeychainHelper.key(account: RemoteASRConfig.keychainAccount)
         hotkey = HotkeyManager.savedDictation.first?.hotkey ?? .fnKey
         hotkeyBehavior = HotkeyManager.savedDictation.first?.behavior ?? .hold
         llmConfigs = defaults.llmConfigs
@@ -149,6 +169,10 @@ final class SettingsStore: ObservableObject {
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage
+        asrProvider = defaults.asrProvider
+        remoteASRBaseURL = defaults.remoteASRBaseURL
+        remoteASRModel = defaults.remoteASRModel
+        remoteASRAPIKey = KeychainHelper.key(account: RemoteASRConfig.keychainAccount)
         inputDevices = AudioDeviceManager.inputDevices()
         llmConfigs = defaults.llmConfigs
         if let id = defaults.selectedConfigID, llmConfigs.contains(where: { $0.id == id }) {

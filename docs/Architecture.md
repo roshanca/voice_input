@@ -19,8 +19,12 @@ HotkeyManager (CGEvent tap)
   → AppDelegate.hotkeyPressed/Released        # owns session lifecycle
     (tap/doubleTap bindings → GestureRouting → onToggle → toggleDictation,
     which reuses the same pressed/released paths)
-  → SpeechRecognizer (SFSpeechRecognizer + AVAudioEngine)
-      partials → FloatingPanel (waveform + live text)
+  → ASR seam: the session snapshots an ASR plan at press (#28)
+      ├── .system → SpeechRecognizer (SFSpeechRecognizer + AVAudioEngine)
+      │     partials → FloatingPanel (waveform + live text)
+      └── .remote → RemoteASRRecognizer (same engine+tap, PCM → WAV file)
+            release → multipart POST {base}/audio/transcriptions →
+            {text} → final result → same submitSession path
   → on release: submitSession()
       ├── LLMRefiner (SSE stream, OpenAI-compatible / Ollama)
       │     streamed tokens → FloatingPanel
@@ -88,7 +92,13 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
 | `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rewrite > translate > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
-| `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
+| `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch (only when provider = system — remote never requests Speech auth) |
+| `ASR/ASRProvider.swift` | `ASRProvider` (system/remote) + `ASRSessionPlan` — the plan resolved at press and snapshotted into the session, so mid-session settings can't reroute a recording |
+| `ASR/RemoteASRRecognizer.swift` | Remote-ASR backend: engine + shared `AudioTapContext` teeing converted PCM into a WAV file; release finalizes → uploads → delegate contract mirrors SpeechRecognizer's minus partials. Upload tracked in `TrackedTaskStore`; Esc cancels capture + upload |
+| `ASR/AudioTapContext.swift` | Shared render-thread tap state (request **or** file sink, converter, RMS) — remote sessions set `fileSink`, system sessions set `request`; system path byte-identical when `fileSink` is nil |
+| `ASR/RecordingFileWriter.swift` | `AVAudioFile` WAV sink (16 kHz mono Float32 — accepted by every Whisper-compatible endpoint); `discard` deletes partials so canceled dictations leave nothing on disk |
+| `ASR/RemoteTranscriptionService.swift` | OpenAI-compatible `POST /audio/transcriptions`: pure request builder + response parser (`{text}`, `error.message`), BCP-47→ISO-639-1 language hint; `transcribe` is the only I/O. `RemoteASRError` is `LocalizedError` so panel text survives `Error` bridging |
+| `ASR/MultipartFormData.swift` | Pure multipart/form-data body builder, fixed field order, byte-exact tested |
 | `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
 | `LLMProfileRouting.swift` | Pure per-app profile routing: exact bundle-ID match wins, absent/dangling entries fall back to the global pick (selected id → first); resolved once at session start |
 | `TranslationPrompt.swift` | Pure prompt builder for translate sessions — bidirectional against Chinese (already-in-target input translates back to Chinese), `<transcript>` inert-text wrapper like refine |
@@ -113,14 +123,16 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `AnswerCardPanel.swift` | Floating card for a rewrite answer that can't be injected (unwritable target or failed delivery): scrollable read-only text + Copy/Close; counts as session work so Esc dismisses it through the normal interception |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map; `asrProvider`/`remoteASRBaseURL`/`remoteASRModel` select the ASR backend (the remote key lives in Keychain under account `remote-asr`, not here) |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing
 
 `Tests/VoiceInputTests/` — XCTest on pure logic only: dictionary rules,
 hotkey routing/decoding, selection policy, log redaction, task store,
-stats, UserDefaults keys, translation prompt contract. `TestHelpers.swift` provides isolated
+stats, UserDefaults keys, translation prompt contract, remote-ASR wire
+format (multipart layout, request shape, response/error parsing) and
+session-plan resolution. `TestHelpers.swift` provides isolated
 `UserDefaults` suites and temp dirs. **No TCC-dependent tests.**
 
 Run via `make test` (adds the rpath SwiftPM omits; see AGENTS.md).
@@ -144,4 +156,9 @@ Full workflow: `docs/Release.md`.
   settings UI edits a single dictation binding anyway.
 - App is **not sandboxed**; entitlements file only. Permission footprint:
   Accessibility, Microphone, Speech — keep it that way (see Voxt's
-  permission-minimization precedent).
+  permission-minimization precedent). The remote-ASR provider (#28) needs
+  only Microphone; Speech auth is skipped entirely while it's selected.
+- Remote ASR is **batch upload only** — no streaming/WebSocket
+  transcription; one remote config (no profile list like the LLM side);
+  the provider applies to dictation/translate/rewrite sessions alike —
+  selection-action transforms involve no ASR and are unaffected.

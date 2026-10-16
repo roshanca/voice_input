@@ -1,19 +1,32 @@
 import Foundation
 import Security
 
-/// Minimal generic-password Keychain wrapper for LLM API keys.
-/// Account = LLMConfig UUID string, service = bundle id.
+/// Minimal generic-password Keychain wrapper for secrets.
+/// LLM keys key by their profile UUID (account = id); secrets without a
+/// profile — e.g. the single remote-ASR key — key by a fixed string
+/// account. Service = bundle id for both.
 enum KeychainHelper {
     static let service = "com.voiceinput.app"
 
     static func set(key: String, for account: UUID) {
-        let accountString = account.uuidString
+        set(key: key, account: account.uuidString)
+    }
+
+    static func key(for account: UUID) -> String {
+        key(account: account.uuidString)
+    }
+
+    static func delete(account: UUID) {
+        delete(account: account.uuidString)
+    }
+
+    static func set(key: String, account: String) {
         let data = Data(key.utf8)
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: accountString
+            kSecAttrAccount as String: account
         ]
 
         if key.isEmpty {
@@ -32,11 +45,11 @@ enum KeychainHelper {
         }
     }
 
-    static func key(for account: UUID) -> String {
+    static func key(account: String) -> String {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account.uuidString,
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -49,11 +62,11 @@ enum KeychainHelper {
         return string
     }
 
-    static func delete(account: UUID) {
+    static func delete(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account.uuidString
+            kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
     }
