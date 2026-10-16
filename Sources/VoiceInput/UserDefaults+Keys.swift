@@ -9,6 +9,7 @@ extension UserDefaults {
         static let copyToClipboard = "copyToClipboard"
         static let autoSend = "autoSend"
         static let autoSendOverrides = "autoSendOverrides"
+        static let perAppLLMProfileOverrides = "perAppLLMProfileOverrides"
         static let interactionSounds = "interactionSounds"
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
@@ -67,6 +68,26 @@ extension UserDefaults {
             }
         }
         set { set(newValue, forKey: Keys.autoSendOverrides) }
+    }
+
+    /// Per-app LLM profile routing: bundle identifier → profile UUID string.
+    /// An app with no entry follows the global active profile — removing the
+    /// entry is how an override returns to inherit.
+    ///
+    /// Entries decode independently and only UUID-parseable strings are
+    /// kept: one malformed value must not wipe out every valid route (same
+    /// contract as `autoSendOverrides`). A value that parses but names a
+    /// deleted profile is *not* malformed — `LLMProfileRouting` falls back
+    /// for it at resolve time.
+    var perAppLLMProfileOverrides: [String: String] {
+        get {
+            guard let dict = dictionary(forKey: Keys.perAppLLMProfileOverrides) else { return [:] }
+            return dict.compactMapValues { value in
+                guard let raw = value as? String, UUID(uuidString: raw) != nil else { return nil }
+                return raw
+            }
+        }
+        set { set(newValue, forKey: Keys.perAppLLMProfileOverrides) }
     }
 
     var interactionSounds: Bool {

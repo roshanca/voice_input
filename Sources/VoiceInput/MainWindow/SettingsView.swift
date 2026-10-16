@@ -96,12 +96,15 @@ struct SettingsView: View {
                             Text(config.name).tag(Optional(config.id))
                         }
                     }
+                    LLMProfileOverridesView()
                 }
                 Button("Manage Profiles…") {
                     showLLMProfiles = true
                 }
             } header: {
                 Label("LLM Refinement", systemImage: "sparkles")
+            } footer: {
+                Text("Per-app rules pick the profile a session refines or translates with, based on the app you're dictating into. Apps without a rule use the active profile.")
             }
 
             Section {

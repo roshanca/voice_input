@@ -28,6 +28,11 @@ final class SettingsStore: ObservableObject {
     @Published var autoSendOverrides: [String: Bool] {
         didSet { UserDefaults.standard.autoSendOverrides = autoSendOverrides }
     }
+    /// Per-app LLM profile routes: bundle identifier → profile UUID string.
+    /// An app with no entry refines on the globally selected profile.
+    @Published var perAppLLMProfileOverrides: [String: String] {
+        didSet { UserDefaults.standard.perAppLLMProfileOverrides = perAppLLMProfileOverrides }
+    }
     @Published var interactionSounds: Bool {
         didSet { UserDefaults.standard.interactionSounds = interactionSounds }
     }
@@ -111,6 +116,7 @@ final class SettingsStore: ObservableObject {
         copyToClipboard = defaults.copyToClipboard
         autoSend = defaults.autoSend
         autoSendOverrides = defaults.autoSendOverrides
+        perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
@@ -131,6 +137,7 @@ final class SettingsStore: ObservableObject {
         copyToClipboard = defaults.copyToClipboard
         autoSend = defaults.autoSend
         autoSendOverrides = defaults.autoSendOverrides
+        perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
@@ -158,6 +165,20 @@ final class SettingsStore: ObservableObject {
         autoSendOverrides = overrides
     }
 
+    // MARK: - Per-app LLM profiles
+
+    /// Writes one app's profile route; nil removes the entry so the app
+    /// follows the global active profile again.
+    func setLLMProfileOverride(_ configID: UUID?, for bundleID: String) {
+        var overrides = perAppLLMProfileOverrides
+        if let configID {
+            overrides[bundleID] = configID.uuidString
+        } else {
+            overrides.removeValue(forKey: bundleID)
+        }
+        perAppLLMProfileOverrides = overrides
+    }
+
     // MARK: - LLM profiles
 
     func saveLLMConfig(_ config: LLMConfig, apiKey: String) {
@@ -179,6 +200,16 @@ final class SettingsStore: ObservableObject {
         persist(configs)
         if selectedConfigID == id {
             selectedConfigID = configs.first?.id
+        }
+        // Prune per-app routes pointing at the deleted profile. Resolve would
+        // fall back for dangling ids anyway, but dropping them keeps an app's
+        // settings row from advertising a profile that no longer exists.
+        var overrides = perAppLLMProfileOverrides
+        for (bundleID, raw) in overrides where raw == id.uuidString {
+            overrides.removeValue(forKey: bundleID)
+        }
+        if overrides != perAppLLMProfileOverrides {
+            perAppLLMProfileOverrides = overrides
         }
     }
 
