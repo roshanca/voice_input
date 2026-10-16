@@ -32,8 +32,18 @@ final class LLMRefiner {
     }
 
     var isConfigured: Bool {
-        !config.baseURL.isEmpty && !config.model.isEmpty &&
-        (config.providerType == .ollama || !resolvedAPIKey.isEmpty)
+        Self.isConfigured(config, apiKey: resolvedAPIKey)
+    }
+
+    /// Config check for an explicit profile — e.g. the per-app routed pick a
+    /// session snapshotted at start, which can differ from the global one.
+    /// `apiKey` lets callers pass an already-resolved key; nil looks the
+    /// profile's own Keychain entry up. A nil profile is never configured.
+    static func isConfigured(_ config: LLMConfig?, apiKey: String? = nil) -> Bool {
+        guard let config else { return false }
+        let key = apiKey ?? KeychainHelper.key(for: config.id)
+        return !config.baseURL.isEmpty && !config.model.isEmpty &&
+            (config.providerType == .ollama || !key.isEmpty)
     }
 
     init(config: LLMConfig? = nil, apiKeyOverride: String? = nil) {
@@ -55,26 +65,34 @@ final class LLMRefiner {
 
     /// requestID binds every callback of this request to the dictation
     /// session that issued it — the delegate drops callbacks whose id no
-    /// longer matches its current session.
-    func refine(text: String, requestID: UUID) {
-        start(text: text, requestID: requestID, mode: .refine)
+    /// longer matches its current session. `profileOverride` pins the
+    /// request to the profile the session routed to at recording start —
+    /// per-app routing would otherwise read the global pick at submit time.
+    func refine(text: String, requestID: UUID, profileOverride: LLMConfig? = nil) {
+        start(text: text, requestID: requestID, mode: .refine, profileOverride: profileOverride)
     }
 
     /// Translate session: identical streaming/cancel machinery to `refine`,
     /// translation prompt. `targetLanguage` arrives with the session so a
     /// settings change mid-flight can't redirect a committed request.
-    func translate(text: String, requestID: UUID, targetLanguage: String) {
-        start(text: text, requestID: requestID, mode: .translate(targetLanguage: targetLanguage))
+    func translate(text: String, requestID: UUID, targetLanguage: String, profileOverride: LLMConfig? = nil) {
+        start(text: text, requestID: requestID, mode: .translate(targetLanguage: targetLanguage), profileOverride: profileOverride)
     }
 
-    private func start(text: String, requestID: UUID, mode: Mode) {
-        AppLogger.shared.info("LLMRefiner request started — provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
+    private func start(text: String, requestID: UUID, mode: Mode, profileOverride: LLMConfig?) {
+        // A per-request override wins over the init-time and global picks:
+        // the session snapshotted the routed profile at recording start, and
+        // settings changed mid-flight must not swap configs under a request
+        // already committed.
+        let config = profileOverride ?? self.config
+        let apiKey = apiKeyOverride ?? KeychainHelper.key(for: config.id)
+        AppLogger.shared.info("LLMRefiner request started — profile: \(config.name), provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
         // A new request supersedes one still in flight: cancel it so its late
         // callbacks can't clobber the new session's result. Cancellation is
         // not instant, so the delegate must still check requestID.
         task?.cancel()
         task = nil
-        guard isConfigured else {
+        guard Self.isConfigured(config, apiKey: apiKey) else {
             AppLogger.shared.warning("LLMRefiner not configured — skipping request")
             delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
             return
@@ -89,7 +107,7 @@ final class LLMRefiner {
             return
         }
 
-        let systemPrompt = resolvedSystemPrompt(for: mode)
+        let systemPrompt = resolvedSystemPrompt(for: mode, config: config)
         let userContent: String
         switch mode {
         case .refine:
@@ -120,7 +138,6 @@ final class LLMRefiner {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let apiKey = resolvedAPIKey
         if !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
@@ -232,7 +249,7 @@ Rules:
 Output only the corrected text, with no introduction, labels, or markdown.
 """
 
-    private func resolvedSystemPrompt(for mode: Mode) -> String {
+    private func resolvedSystemPrompt(for mode: Mode, config: LLMConfig) -> String {
         let base: String
         switch mode {
         case .refine:

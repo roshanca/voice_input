@@ -55,6 +55,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         /// Translate sessions only — the language to translate into,
         /// snapshotted with the rest at session start.
         let translateTargetLanguage: String
+        /// The LLM profile this session's refinement/translation runs on —
+        /// resolved at recording start against the target app's bundle ID so
+        /// a mid-session app switch or profile change can't swap it
+        /// mid-flight. Nil when no profile exists at all.
+        let llmConfig: LLMConfig?
         /// Where the result is meant to land — captured at recording start,
         /// re-validated before the paste and again before auto-send.
         let target: DictationTarget?
@@ -493,6 +498,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ),
             dictionaryDirectReplacement: UserDefaults.standard.dictionaryDirectReplacement,
             translateTargetLanguage: UserDefaults.standard.translateTargetLanguage,
+            // The profile resolves once, here, against the recorded target's
+            // own bundle ID — like auto-send above, re-checking at submit
+            // time could apply a different app's rule after a focus switch.
+            llmConfig: LLMProfileRouting.resolve(
+                bundleID: target?.bundleID,
+                overrides: UserDefaults.standard.perAppLLMProfileOverrides,
+                configs: UserDefaults.standard.llmConfigs,
+                fallbackID: UserDefaults.standard.selectedConfigID
+            ),
             target: target
         )
         activeSession = session
@@ -894,14 +908,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch session.kind {
         case .dictation:
-            if session.llmEnabled && llmRefiner.isConfigured {
+            // The configured check runs against the session's routed
+            // profile — a per-app override can be usable even when the
+            // global pick isn't, and vice versa.
+            if session.llmEnabled && LLMRefiner.isConfigured(session.llmConfig) {
                 AppLogger.shared.info("LLM enabled and configured — starting refinement")
                 floatingPanel.setText("Refining…")
                 floatingPanel.setUseOriginalVisible(true)
                 session.submittedText = trimmed
                 pendingSession = session
                 syncEscapeInterception()
-                llmRefiner.refine(text: llmInput, requestID: session.id)
+                llmRefiner.refine(text: llmInput, requestID: session.id, profileOverride: session.llmConfig)
             } else {
                 AppLogger.shared.info("Injecting directly (LLM disabled or not configured)")
                 let output = applyReplacements(trimmed)
@@ -913,7 +930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // configured profile is the whole gate. With none, park the
             // transcript in History instead of injecting untranslated text
             // the user never asked for.
-            guard llmRefiner.isConfigured else {
+            guard LLMRefiner.isConfigured(session.llmConfig) else {
                 let output = applyReplacements(trimmed)
                 AppLogger.shared.warning("Translate session submitted with no configured LLM — parking transcript in History")
                 recordHistory(raw: trimmed, refined: nil, output: output, session: session)
@@ -927,7 +944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             session.submittedText = trimmed
             pendingSession = session
             syncEscapeInterception()
-            llmRefiner.translate(text: llmInput, requestID: session.id, targetLanguage: session.translateTargetLanguage)
+            llmRefiner.translate(text: llmInput, requestID: session.id, targetLanguage: session.translateTargetLanguage, profileOverride: session.llmConfig)
         }
     }
 
