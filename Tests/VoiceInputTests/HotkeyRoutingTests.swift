@@ -79,6 +79,11 @@ final class HotkeyRoutingTests: XCTestCase {
 
     /// ⌃⌘V — the persisted re-paste default (V = keyCode 9).
     private let ctrlCmdV = Hotkey.chord(keyCode: 9, modifiers: [.control, .command])
+    private var chordPresses: [Int64: [HotkeyRouting.ChordPress]] = [:]
+
+    private func route(_ entries: [RoutedBinding], _ event: CGEvent) -> RoutedBinding? {
+        HotkeyRouting.route(entries, event: event, chordPresses: &chordPresses)
+    }
 
     func testChordMatchesExactModifiersOnKeyDown() {
         XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: [.maskControl, .maskCommand])!))
@@ -107,15 +112,61 @@ final class HotkeyRoutingTests: XCTestCase {
         XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: true, flags: flags)!))
     }
 
-    func testChordKeyUpMatchesOnKeyCodeAloneSoPressAlwaysCloses() {
-        // Both phases match so the tap swallows the whole keystroke. keyUp
-        // ignores modifiers entirely — the user may release ⌃ first or add
-        // ⇧ mid-hold, and the press must still end (a dead next press is
-        // worse than a swallowed keyUp the app never acts on).
-        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskControl, .maskCommand])!))
-        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskCommand])!))
-        XCTAssertTrue(ctrlCmdV.matches(event: keyEvent(keyCode: 9, keyDown: false, flags: [.maskShift])!))
-        XCTAssertFalse(ctrlCmdV.matches(event: keyEvent(keyCode: 8, keyDown: false, flags: [])!))
+    func testChordKeyUpWithoutClaimedPressPassesThrough() {
+        let entries = [routedBinding(ctrlCmdV, .hold, .rePaste)]
+        XCTAssertNil(route(entries, keyEvent(keyCode: 9, keyDown: false)!))
+    }
+
+    /// Regression: plain T must keep its complete keyDown/keyUp pair even
+    /// though both voice and selection translate register chords on keyCode
+    /// 17. Swallowing only keyUp makes macOS show its press-and-hold menu.
+    func testPlainTypingOnChordLetterPassesBothEdges() {
+        let entries = HotkeyRouting.routed([
+            routedBinding(.chord(keyCode: 17, modifiers: [.control, .option]), .hold, .translate),
+            routedBinding(.chord(keyCode: 17, modifiers: [.control, .shift]), .hold, .selectionTranslate),
+        ])
+        XCTAssertNil(route(entries, keyEvent(keyCode: 17, keyDown: true)!))
+        XCTAssertNil(route(entries, keyEvent(keyCode: 17, keyDown: false)!))
+    }
+
+    /// Two default businesses share T. The release must return to the one
+    /// whose modifiers matched the press, even after every modifier is up.
+    func testChordReleaseReturnsToPressOwnerAfterModifiersChange() {
+        let translate = routedBinding(.chord(keyCode: 17, modifiers: [.control, .option]), .hold, .translate)
+        let selectionTranslate = routedBinding(.chord(keyCode: 17, modifiers: [.control, .shift]), .hold, .selectionTranslate)
+        let entries = HotkeyRouting.routed([translate, selectionTranslate])
+        let ctrlOpt: CGEventFlags = [.maskControl, .maskAlternate]
+
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 17, keyDown: true, flags: ctrlOpt)!), translate)
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 17, keyDown: false)!), translate)
+    }
+
+    /// A repeat is part of the original physical press. It must not switch
+    /// owners or leak to the app when the modifiers change mid-hold.
+    func testChordAutoRepeatKeepsOriginalPressOwner() {
+        let translate = routedBinding(.chord(keyCode: 17, modifiers: [.control, .option]), .hold, .translate)
+        let entries = [translate]
+        let ctrlOpt: CGEventFlags = [.maskControl, .maskAlternate]
+        let repeatEvent = keyEvent(keyCode: 17, keyDown: true)!
+        repeatEvent.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 17, keyDown: true, flags: ctrlOpt)!), translate)
+        XCTAssertEqual(route(entries, repeatEvent), translate)
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 17, keyDown: false)!), translate)
+    }
+
+    /// TextInjector's synthetic ⌘V can nest inside a held physical ⌃⌘V.
+    /// The unmatched synthetic press passes through with its own release and
+    /// leaves the physical chord's owner on the stack for its later keyUp.
+    func testNestedSyntheticPressDoesNotStealChordRelease() {
+        let rePaste = routedBinding(ctrlCmdV, .hold, .rePaste)
+        let entries = [rePaste]
+        let ctrlCmd: CGEventFlags = [.maskControl, .maskCommand]
+
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 9, keyDown: true, flags: ctrlCmd)!), rePaste)
+        XCTAssertNil(route(entries, keyEvent(keyCode: 9, keyDown: true, flags: .maskCommand)!))
+        XCTAssertNil(route(entries, keyEvent(keyCode: 9, keyDown: false, flags: .maskCommand)!))
+        XCTAssertEqual(route(entries, keyEvent(keyCode: 9, keyDown: false, flags: ctrlCmd)!), rePaste)
     }
 
     func testChordPressIsKeyDownOnly() {

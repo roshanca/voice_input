@@ -80,6 +80,9 @@ final class HotkeyManager {
     /// fires `onRePaste`, auto-repeat keyDowns are swallowed silently, and
     /// the flag clears on keyUp so the next press fires again.
     nonisolated(unsafe) fileprivate static var rePastePressed = false
+    /// Per-key press stacks for chord routing. Only a consumed keyDown owns
+    /// its keyUp; ordinary typing on the same letter must pass both edges.
+    nonisolated(unsafe) fileprivate static var chordPresses: [Int64: [HotkeyRouting.ChordPress]] = [:]
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -175,6 +178,7 @@ final class HotkeyManager {
         // A binding change mid-press must not inherit a half-counted
         // gesture or a stuck chord flag — drop all edge state with the list.
         Self.gestureStates = [:]
+        Self.chordPresses = [:]
         Self.doubleTapInterval = NSEvent.doubleClickInterval
         Self.rePastePressed = false
         stop()
@@ -318,10 +322,14 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
         }
     }
 
-    // First routed binding whose hotkey matches this physical event.
-    guard let routed = HotkeyManager.activeRoutedBindings.first(where: {
-        $0.binding.hotkey.matches(event: event)
-    }) else {
+    // First routed binding whose hotkey owns this physical event. Chord
+    // ownership spans the whole press, so a plain letter's keyUp cannot be
+    // swallowed merely because a binding uses the same key code.
+    guard let routed = HotkeyRouting.route(
+        HotkeyManager.activeRoutedBindings,
+        event: event,
+        chordPresses: &HotkeyManager.chordPresses
+    ) else {
         return Unmanaged.passUnretained(event)
     }
 

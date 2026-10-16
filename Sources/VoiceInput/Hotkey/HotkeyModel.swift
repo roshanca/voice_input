@@ -133,20 +133,18 @@ enum Hotkey: Codable, Equatable, Hashable {
         }
     }
 
-    /// Whether the event is of the expected type and carries this hotkey's
-    /// key code. Press vs release is decided separately by `isPress`.
+    /// Whether the event can be claimed by this hotkey. Press vs release is
+    /// decided separately by `isPress`; chord releases are the exception —
+    /// `HotkeyRouting` only routes them to the owner of a claimed keyDown.
     func matches(event: CGEvent) -> Bool {
         if case .chord(let keyCode, let modifiers) = self {
-            guard event.type == .keyDown || event.type == .keyUp,
+            guard event.type == .keyDown,
                   event.getIntegerValueField(.keyboardEventKeycode) == keyCode else {
                 return false
             }
-            // keyDown requires the exact chord — ⌃⌘⇧V and similar superset
-            // combinations keep belonging to the focused app. keyUp matches
-            // on keyCode alone: the press we swallowed must end even when
-            // the modifiers were released (or grew) before the key came up,
-            // and a stray keyUp is harmless — the app never saw the down.
-            if event.type == .keyUp { return true }
+            // A chord can only claim a fresh keyDown, with its exact modifier
+            // set. Its keyUp may arrive after the modifiers changed, so release
+            // matching depends on press ownership rather than event flags.
             return ModifierFlags(matching: event.flags) == modifiers
         }
         let typeMatches = usesFlagsChanged
@@ -283,6 +281,14 @@ struct RoutedBinding: Equatable {
 
 /// Pure matching and precedence rules shared by the event tap and tests.
 enum HotkeyRouting {
+    /// Which side owns one press of a key used by a chord. A stack per key
+    /// handles synthetic events nested inside a physical press — re-paste can
+    /// inject ⌘V while the user is still holding the re-paste chord.
+    enum ChordPress: Equatable {
+        case consumed(RoutedBinding)
+        case passed
+    }
+
     /// More modifiers and a concrete key make a more specific hotkey — a
     /// chord outranks a bare key, which outranks a modifier-only hotkey, so
     /// a plain `F5` press is never claimed by an `fn` binding.
@@ -304,5 +310,58 @@ enum HotkeyRouting {
             if behavior != 0 { return behavior > 0 }
             return a.business.routingPriority > b.business.routingPriority
         }
+    }
+
+    /// Route one event through an already-sorted binding list. Chord keyUps
+    /// return to the binding that claimed their keyDown, never to whichever
+    /// same-letter chord happens to sort first. Unclaimed presses pass both
+    /// edges through so ordinary typing keeps its complete keyDown/keyUp pair.
+    nonisolated static func route(
+        _ entries: [RoutedBinding],
+        event: CGEvent,
+        chordPresses: inout [Int64: [ChordPress]]
+    ) -> RoutedBinding? {
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+
+        if event.type == .keyUp,
+           var presses = chordPresses[keyCode], !presses.isEmpty {
+            let press = presses.removeLast()
+            if presses.isEmpty {
+                chordPresses.removeValue(forKey: keyCode)
+            } else {
+                chordPresses[keyCode] = presses
+            }
+            if case .consumed(let routed) = press {
+                return routed
+            }
+            return nil
+        }
+
+        // Repeats belong to the press that started them, even if the modifier
+        // flags have since changed enough to match another chord (or none).
+        if event.type == .keyDown,
+           event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
+           let press = chordPresses[keyCode]?.last {
+            if case .consumed(let routed) = press {
+                return routed
+            }
+            return nil
+        }
+
+        let routed = entries.first(where: {
+            $0.binding.hotkey.matches(event: event)
+        })
+
+        guard event.type == .keyDown,
+              entries.contains(where: {
+                  guard case .chord(let chordKeyCode, _) = $0.binding.hotkey else { return false }
+                  return chordKeyCode == keyCode
+              }) else {
+            return routed
+        }
+
+        let press = routed.map { ChordPress.consumed($0) } ?? .passed
+        chordPresses[keyCode, default: []].append(press)
+        return routed
     }
 }
