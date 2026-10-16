@@ -47,4 +47,32 @@ enum AudioDeviceManager {
         guard status == noErr, deviceID != 0 else { return nil }
         return deviceID
     }
+
+    /// Apply the user's preferred input device (`selectedMicUID`) to an
+    /// engine's input node. Both ASR backends call this before reading the
+    /// node's hardware format or installing the tap, so the tap's converter
+    /// sees the right source format either way.
+    @MainActor
+    static func applyPreferredInputDevice(to inputNode: AVAudioInputNode) {
+        guard let uid = UserDefaults.standard.selectedMicUID else { return }
+        if let deviceID = audioDeviceID(forUID: uid),
+           let audioUnit = inputNode.audioUnit {
+            var id = deviceID
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &id,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            if status == noErr {
+                AppLogger.shared.info("Using selected input device UID: \(uid)")
+            } else {
+                AppLogger.shared.warning("Failed to set input device (status \(status)); falling back to system default")
+            }
+        } else {
+            AppLogger.shared.warning("Selected input device UID not present: \(uid); using system default")
+        }
+    }
 }

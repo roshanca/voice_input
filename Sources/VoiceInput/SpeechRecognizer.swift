@@ -16,162 +16,10 @@ protocol SpeechRecognizerDelegate: AnyObject {
     func speechRecognizer(_ recognizer: SpeechRecognizer, didUpdateRMS rms: Float, sessionID: UUID)
 }
 
-/// Render-thread state owned by one recording session. The audio tap
-/// callback does not run on the main actor, so everything it can touch —
-/// the session's recognition request (swapped by the on-device→server
-/// fallback), its lazily created converter, the RMS counter, and the
-/// liveness flag — lives behind a single lock. Buffer processing is then
-/// atomic against stopRecording/teardown and the request swap, and because
-/// each session gets a fresh context object, an obsolete engine's tap can
-/// never reach a newer session's resources at all.
-private final class AudioTapContext: @unchecked Sendable {
-    let sessionID: UUID
-    let targetFormat: AVAudioFormat
-
-    private struct State {
-        var request: SFSpeechAudioBufferRecognitionRequest?
-        var converter: AVAudioConverter?
-        /// The session's history clip — written with the same converted
-        /// buffers the request gets. Sealed by deactivateAndEndAudio
-        /// (graceful stop → clip survives for the record) and deleted by
-        /// deactivate (cancel/teardown → no record, no clip).
-        var audioWriter: HistoryAudioWriter?
-        var rmsLogCounter = 0
-        /// Flipped by stopRecording/teardown: drained or in-flight buffers
-        /// are dropped instead of touching released state.
-        var active = true
-    }
-    private let state = OSAllocatedUnfairLock(initialState: State())
-
-    init(sessionID: UUID, targetFormat: AVAudioFormat) {
-        self.sessionID = sessionID
-        self.targetFormat = targetFormat
-    }
-
-    /// The request this session's tap appends to. Set at task creation and
-    /// swapped by the on-device→server fallback — both under the lock, so a
-    /// tap buffer can never observe a half-replaced request.
-    var request: SFSpeechAudioBufferRecognitionRequest? {
-        get { state.withLock { $0.request } }
-        set { state.withLock { $0.request = newValue } }
-    }
-
-    /// Set once from the main actor right after the context is created.
-    /// Stored under the lock so the render thread's per-buffer write is
-    /// atomic with the request append and with finish/discard.
-    var audioWriter: HistoryAudioWriter? {
-        get { state.withLock { $0.audioWriter } }
-        set { state.withLock { $0.audioWriter = newValue } }
-    }
-
-    func deactivate() {
-        state.withLock {
-            $0.active = false
-            $0.audioWriter?.discard()
-            $0.audioWriter = nil
-        }
-    }
-
-    /// Ordered stop for the tap, atomic under the lock: deactivate first so
-    /// in-flight process() calls finish and new buffers are rejected, then
-    /// end audio on the request — no buffer can be appended after endAudio.
-    /// Also seals the session's history clip: by the time this runs the tap
-    /// is already removed, so no in-flight write can race the file close.
-    /// Returns the request that was ended, for delayed-cleanup identity checks.
-    @discardableResult
-    func deactivateAndEndAudio() -> SFSpeechAudioBufferRecognitionRequest? {
-        state.withLock {
-            $0.active = false
-            $0.request?.endAudio()
-            $0.audioWriter?.finish()
-            $0.audioWriter = nil
-            return $0.request
-        }
-    }
-
-    /// Convert (when needed) and append one buffer to this session's
-    /// request; returns the normalized waveform RMS, or nil once the
-    /// context has been deactivated.
-    func process(buffer: AVAudioPCMBuffer) -> Float? {
-        logDebug("Audio buffer received - frameLength: \(buffer.frameLength), format: \(buffer.format)")
-        return state.withLock { state in
-            guard state.active, let request = state.request else { return nil }
-
-            if state.converter == nil {
-                state.converter = AVAudioConverter(from: buffer.format, to: targetFormat)
-                if state.converter == nil {
-                    logError("Failed to create AVAudioConverter from \(buffer.format) to \(targetFormat)")
-                }
-            }
-
-            guard let converter = state.converter else {
-                request.append(buffer)
-                // The raw-format fallback appends the unconverted buffer;
-                // the writer skips it when its format can't fit the clip.
-                state.audioWriter?.write(buffer)
-                return normalizedRMS(of: buffer, state: &state)
-            }
-
-            let capacity = UInt32(Double(buffer.frameLength) * Double(targetFormat.sampleRate) / Double(buffer.format.sampleRate)) + 1
-            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
-                logError("Failed to create converted AVAudioPCMBuffer")
-                request.append(buffer)
-                state.audioWriter?.write(buffer)
-                return normalizedRMS(of: buffer, state: &state)
-            }
-
-            var error: NSError?
-            converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
-                outStatus.pointee = .haveData
-                return buffer
-            }
-
-            if let error {
-                logError("Audio conversion error: \(error)")
-                request.append(buffer)
-                state.audioWriter?.write(buffer)
-                return normalizedRMS(of: buffer, state: &state)
-            }
-
-            convertedBuffer.frameLength = convertedBuffer.frameCapacity
-            logDebug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
-            request.append(convertedBuffer)
-            // The clip tees exactly what the recognizer was fed — same
-            // buffer, same format, so playback matches the transcript.
-            state.audioWriter?.write(convertedBuffer)
-            return normalizedRMS(of: convertedBuffer, state: &state)
-        }
-    }
-
-    private func normalizedRMS(of buffer: AVAudioPCMBuffer, state: inout State) -> Float {
-        guard let data = buffer.floatChannelData?[0] else { return 0 }
-        let frameLength = Int(buffer.frameLength)
-
-        var sum: Float = 0
-        for i in 0..<frameLength {
-            sum += data[i] * data[i]
-        }
-        let rms = sqrt(sum / Float(frameLength))
-        let db = 20 * log10(max(rms, 1e-10))
-        let normalized = min(max((db + 60) / 60, 0), 1)
-
-        state.rmsLogCounter += 1
-        if state.rmsLogCounter <= 5 || normalized > 0.1 {
-            logDebug("RMS: \(String(format: "%.4f", rms)), normalized: \(String(format: "%.3f", normalized))")
-        }
-        return normalized
-    }
-
-    /// AppLogger is @MainActor — hop instead of touching it (or its entries
-    /// buffer) from the render thread.
-    private func logDebug(_ message: String) {
-        Task { @MainActor in AppLogger.shared.debug(message) }
-    }
-
-    private func logError(_ message: String) {
-        Task { @MainActor in AppLogger.shared.error(message) }
-    }
-}
+// AudioTapContext — the tap's render-thread state — lives in
+// ASR/AudioTapContext.swift: the remote ASR provider shares it to tee
+// converted PCM into a file sink (#28), and the history clip writer
+// hangs off the same context (#25).
 
 @MainActor
 final class SpeechRecognizer: NSObject {
@@ -410,27 +258,7 @@ final class SpeechRecognizer: NSObject {
         // Apply the user's preferred input device, if any. Must happen before
         // reading outputFormat / installing the tap so the converter sees the
         // right source format.
-        if let uid = UserDefaults.standard.selectedMicUID {
-            if let deviceID = AudioDeviceManager.audioDeviceID(forUID: uid),
-               let audioUnit = inputNode.audioUnit {
-                var id = deviceID
-                let status = AudioUnitSetProperty(
-                    audioUnit,
-                    kAudioOutputUnitProperty_CurrentDevice,
-                    kAudioUnitScope_Global,
-                    0,
-                    &id,
-                    UInt32(MemoryLayout<AudioDeviceID>.size)
-                )
-                if status == noErr {
-                    AppLogger.shared.info("Using selected input device UID: \(uid)")
-                } else {
-                    AppLogger.shared.warning("Failed to set input device (status \(status)); falling back to system default")
-                }
-            } else {
-                AppLogger.shared.warning("Selected input device UID not present: \(uid); using system default")
-            }
-        }
+        AudioDeviceManager.applyPreferredInputDevice(to: inputNode)
 
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         AppLogger.shared.info("Hardware input format: \(hardwareFormat)")
@@ -629,7 +457,8 @@ final class SpeechRecognizer: NSObject {
 
     /// The record-permission enum's raw values are fourccs
     /// ('grnt' = 1735552628) — unreadable in logs, so map them to names.
-    private static func permissionName(_ status: AVAudioApplication.recordPermission) -> String {
+    /// Shared with RemoteASRRecognizer, which runs the same permission flow.
+    static func permissionName(_ status: AVAudioApplication.recordPermission) -> String {
         switch status {
         case .granted: return "granted"
         case .denied: return "denied"

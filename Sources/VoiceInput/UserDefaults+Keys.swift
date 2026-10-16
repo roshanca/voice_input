@@ -22,6 +22,9 @@ extension UserDefaults {
         static let selectionRewriteHotkeyBindings = "selectionRewriteHotkeyBindings"
         static let addToDictionaryHotkeyBindings = "addToDictionaryHotkeyBindings"
         static let translateTargetLanguage = "translateTargetLanguage"
+        static let asrProvider = "asrProvider"
+        static let remoteASRBaseURL = "remoteASRBaseURL"
+        static let remoteASRModel = "remoteASRModel"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
@@ -256,6 +259,34 @@ extension UserDefaults {
         // D = keyCode 2.
         get { selectionBindings(Keys.addToDictionaryHotkeyBindings, defaultChord: .chord(keyCode: 2, modifiers: [.control, .shift])) }
         set { persistSelectionBindings(newValue, key: Keys.addToDictionaryHotkeyBindings) }
+    }
+
+    /// ASR backend for new sessions. Unknown/absent values read as
+    /// `.system` — a corrupted default must never silently disable
+    /// dictation. Snapshotted into the session at press time (#28).
+    var asrProvider: ASRProvider {
+        get { string(forKey: Keys.asrProvider).flatMap(ASRProvider.init(rawValue:)) ?? .system }
+        set { set(newValue.rawValue, forKey: Keys.asrProvider) }
+    }
+
+    /// Remote-ASR endpoint base — the upload POSTs `{base}/audio/
+    /// transcriptions`. Defaults to blank (unconfigured): an unset value
+    /// must never be guessed into a host audio gets sent to. Trimming on
+    /// read keeps a spaces-only field from passing the configured check.
+    var remoteASRBaseURL: String {
+        get { (string(forKey: Keys.remoteASRBaseURL) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+        set { set(newValue, forKey: Keys.remoteASRBaseURL) }
+    }
+
+    /// Remote-ASR model (e.g. "whisper-1", "whisper-large-v3"). Blank
+    /// normalizes to "whisper-1" — the API requires the field and a stored
+    /// blank would just produce malformed requests.
+    var remoteASRModel: String {
+        get {
+            let stored = (string(forKey: Keys.remoteASRModel) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return stored.isEmpty ? RemoteASRConfig.placeholderModel : stored
+        }
+        set { set(newValue, forKey: Keys.remoteASRModel) }
     }
 
     var llmConfigs: [LLMConfig] {

@@ -4,6 +4,7 @@ struct SettingsView: View {
     @ObservedObject private var store = SettingsStore.shared
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
     @State private var showLLMProfiles = false
+    @State private var showRemoteASRKey = false
 
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
@@ -36,6 +37,33 @@ struct SettingsView: View {
                 }
             } header: {
                 Label("Language", systemImage: "globe")
+            }
+
+            Section {
+                Picker("Provider", selection: $store.asrProvider) {
+                    ForEach(ASRProvider.allCases, id: \.self) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                if store.asrProvider == .remote {
+                    TextField("Base URL", text: $store.remoteASRBaseURL, prompt: Text(RemoteASRConfig.placeholderBaseURL))
+                    TextField("Model", text: $store.remoteASRModel, prompt: Text(RemoteASRConfig.placeholderModel))
+                    HStack {
+                        if showRemoteASRKey {
+                            TextField("API Key", text: $store.remoteASRAPIKey, prompt: Text("sk-... (optional for self-hosted)"))
+                        } else {
+                            SecureField("API Key", text: $store.remoteASRAPIKey, prompt: Text("sk-... (optional for self-hosted)"))
+                        }
+                        Button(showRemoteASRKey ? "Hide" : "Show") { showRemoteASRKey.toggle() }
+                    }
+                }
+            } header: {
+                Label("Speech Recognition", systemImage: "waveform")
+            } footer: {
+                if store.asrProvider == .remote {
+                    Text("Remote uploads the recording to the server above on key release — audio leaves your device. Any OpenAI-compatible /audio/transcriptions endpoint works (OpenAI, Groq, whisper.cpp).")
+                }
             }
 
             Section {
