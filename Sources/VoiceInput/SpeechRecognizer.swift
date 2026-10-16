@@ -471,14 +471,18 @@ final class SpeechRecognizer: NSObject {
         transcription.formattedString
     }
 
-    enum RecognizerError: Error {
+    /// `LocalizedError` (not a plain `localizedDescription` property) is
+    /// deliberate: errors cross an `Error` existential on their way to the
+    /// floating panel, and only `errorDescription` survives the NSError
+    /// bridge with the intended text.
+    enum RecognizerError: LocalizedError {
         case notAuthorized
         case microphoneDenied
         case recognizerUnavailable
         case audioEngineFailure
         case audioEngineConfigurationChanged
 
-        var localizedDescription: String {
+        var errorDescription: String? {
             switch self {
             case .notAuthorized: return "Speech recognition not authorized"
             case .microphoneDenied: return "Microphone access denied. Please enable it in System Settings → Privacy & Security → Microphone."
