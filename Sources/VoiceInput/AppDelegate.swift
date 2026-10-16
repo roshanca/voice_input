@@ -90,6 +90,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         /// press time so a mid-session provider change can't reroute a
         /// recording already in flight.
         let asrPlan: ASRSessionPlan
+        /// Voice end command (#26): the enabled flag and the parsed
+        /// trigger list, snapshotted at session start like the rest of
+        /// the settings.
+        let endCommandEnabled: Bool
+        let endCommandPhrases: [String]
+        /// The phrase that fired the end command — set by the partial
+        /// that ended in a trigger. The final result (and any late
+        /// partial still draining) uses it to strip a re-emitted or
+        /// mid-string trigger before the text is submitted.
+        var endCommandPhrase: String?
         /// Set when a remote capture fails while the key is still held —
         /// the release then ends the session instead of waiting on an
         /// upload that never started.
@@ -581,6 +591,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     baseURL: UserDefaults.standard.remoteASRBaseURL,
                     model: UserDefaults.standard.remoteASRModel
                 )
+            ),
+            // Same snapshot rule as above — the toggle and phrase list
+            // are read once, at press.
+            endCommandEnabled: UserDefaults.standard.voiceEndCommandEnabled,
+            endCommandPhrases: EndCommandMatcher.phrases(
+                from: UserDefaults.standard.voiceEndCommandPhrases
             )
         )
         activeSession = session
@@ -1008,6 +1024,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingPanel.flash(text)
     }
 
+    /// Strip the voice end command out of a recognized transcript (#26).
+    /// Once a partial fired the trigger (`endCommandPhrase`), the phrase
+    /// can sit mid-string in a later result — post-command audio kept
+    /// transcribing until the engine stopped — so it's truncated at its
+    /// last word-bounded occurrence. With no trigger fired yet only the
+    /// tail counts: "over the moon" is content, not a command.
+    private func stripEndCommand(from text: String, session: DictationSession) -> String {
+        guard session.endCommandEnabled else { return text }
+        if let phrase = session.endCommandPhrase {
+            return EndCommandMatcher.match(in: text, phrases: [phrase])?.strippedText
+                ?? EndCommandMatcher.truncateAfterTrigger(text, phrase: phrase)
+                ?? text
+        }
+        return EndCommandMatcher.match(in: text, phrases: session.endCommandPhrases)?.strippedText ?? text
+    }
+
     /// Commit the session's text exactly once. The first of the final
     /// recognition result or the 1.5s result timeout to arrive wins and owns
     /// the submission; the loser finds the session already gone (or flagged
@@ -1260,9 +1292,25 @@ extension AppDelegate: NSMenuDelegate {
 extension AppDelegate: SpeechRecognizerDelegate {
     func speechRecognizer(_ recognizer: SpeechRecognizer, didReceivePartialResult result: TranscriptionResult, sessionID: UUID) {
         guard var session = activeSession, session.id == sessionID, !session.submitted else { return }
-        session.rawText = result.text
+        // Voice end command (#26): a trigger phrase at the transcript tail
+        // ends the session through the same release path the key takes —
+        // checked before the text is stored, so the phrase itself can
+        // never reach the output. Partials keep arriving until the
+        // final lands, so once a trigger has fired late results only get
+        // stripped (below), never re-triggered.
+        if session.endCommandEnabled, session.endCommandPhrase == nil,
+           let match = EndCommandMatcher.match(in: result.text, phrases: session.endCommandPhrases) {
+            session.rawText = match.strippedText
+            session.endCommandPhrase = match.phrase
+            activeSession = session
+            floatingPanel.setText(match.strippedText)
+            AppLogger.shared.info("Voice end command heard — ending session", metadata: ["phrase": SensitiveLogValue(match.phrase)])
+            releaseSession(kind: session.kind)
+            return
+        }
+        session.rawText = stripEndCommand(from: result.text, session: session)
         activeSession = session
-        floatingPanel.setText(result.text)
+        floatingPanel.setText(session.rawText)
         AppLogger.shared.debug("Partial result: \(result.text)", sensitive: true)
     }
 
@@ -1271,10 +1319,13 @@ extension AppDelegate: SpeechRecognizerDelegate {
             AppLogger.shared.info("Dropped stale final result from a previous session")
             return
         }
-        session.rawText = result.text
-        session.annotatedText = result.annotatedText
+        // The final can re-contain the trigger phrase — even mid-string,
+        // when audio spoken after the command was still in flight — so
+        // the same strip runs before the text is stored for submit.
+        session.rawText = stripEndCommand(from: result.text, session: session)
+        session.annotatedText = stripEndCommand(from: result.annotatedText, session: session)
         activeSession = session
-        floatingPanel.setText(result.text)
+        floatingPanel.setText(session.rawText)
         AppLogger.shared.info("Final result: \(result.text)", sensitive: true)
         AppLogger.shared.info("Annotated result: \(result.annotatedText)", sensitive: true)
         submitSession(sessionID)
@@ -1309,10 +1360,13 @@ extension AppDelegate: RemoteASRRecognizerDelegate {
             AppLogger.shared.info("Dropped stale remote-ASR result from a previous session")
             return
         }
-        session.rawText = result.text
-        session.annotatedText = result.annotatedText
+        // Batch ASR can't fire the command mid-record — the transcript
+        // only exists after release — but a spoken trigger still lands at
+        // its tail, so the same strip applies before submit (#26).
+        session.rawText = stripEndCommand(from: result.text, session: session)
+        session.annotatedText = stripEndCommand(from: result.annotatedText, session: session)
         activeSession = session
-        floatingPanel.setText(result.text)
+        floatingPanel.setText(session.rawText)
         submitSession(sessionID)
     }
 

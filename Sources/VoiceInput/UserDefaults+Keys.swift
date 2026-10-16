@@ -25,6 +25,8 @@ extension UserDefaults {
         static let asrProvider = "asrProvider"
         static let remoteASRBaseURL = "remoteASRBaseURL"
         static let remoteASRModel = "remoteASRModel"
+        static let voiceEndCommandEnabled = "voiceEndCommandEnabled"
+        static let voiceEndCommandPhrases = "voiceEndCommandPhrases"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
@@ -287,6 +289,30 @@ extension UserDefaults {
             return stored.isEmpty ? RemoteASRConfig.placeholderModel : stored
         }
         set { set(newValue, forKey: Keys.remoteASRModel) }
+    }
+
+    /// Voice end command (#26): say a trigger phrase at the end of a
+    /// dictation to release the session without touching the key —
+    /// defaults on, it's the feature itself. Snapshotted into the session
+    /// at press, so a mid-session toggle applies to the next dictation.
+    var voiceEndCommandEnabled: Bool {
+        get { object(forKey: Keys.voiceEndCommandEnabled) as? Bool ?? true }
+        set { set(newValue, forKey: Keys.voiceEndCommandEnabled) }
+    }
+
+    /// Raw trigger list for the end command — comma/line separated, parsed
+    /// by `EndCommandMatcher.phrases(from:)` at session start. Defaults to
+    /// "over,完毕": a conservative EN+CN pair — "结束" was rejected as too
+    /// common in dictated prose to end every sentence it closes. A blank
+    /// stored value restores the default rather than silently disabling
+    /// the command; the toggle is the way to turn it off.
+    var voiceEndCommandPhrases: String {
+        get {
+            let stored = string(forKey: Keys.voiceEndCommandPhrases)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return stored.isEmpty ? "over,完毕" : stored
+        }
+        set { set(newValue, forKey: Keys.voiceEndCommandPhrases) }
     }
 
     var llmConfigs: [LLMConfig] {

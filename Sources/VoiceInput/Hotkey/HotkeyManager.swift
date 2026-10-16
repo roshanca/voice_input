@@ -327,6 +327,17 @@ private func hotkeyEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, e
 
     switch routed.binding.behavior {
     case .hold:
+        // Auto-repeat keyDowns re-fire the press edge while a key is held
+        // (fn/right-modifier keys are flagsChanged and never repeat — this
+        // only affects fKey/chord bindings). They used to be absorbed by
+        // the delegate's isHotkeyHeld guard, but the voice end command
+        // (#26) ends the session while the key is still down — without
+        // this gate each repeat would start a fresh session under the
+        // same physical hold.
+        if routed.binding.hotkey.isPress(event: event),
+           event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+            return nil
+        }
         // Matched hotkey events are swallowed so they never reach the focused
         // app (e.g. an Fn press would otherwise trigger system actions).
         switch routed.business {
