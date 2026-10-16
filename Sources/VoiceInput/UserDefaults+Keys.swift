@@ -25,6 +25,7 @@ extension UserDefaults {
         static let asrProvider = "asrProvider"
         static let remoteASRBaseURL = "remoteASRBaseURL"
         static let remoteASRModel = "remoteASRModel"
+        static let hasCompletedOnboarding = "hasCompletedOnboarding"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
         static let hotkeyData = "hotkeyData"
@@ -287,6 +288,14 @@ extension UserDefaults {
             return stored.isEmpty ? RemoteASRConfig.placeholderModel : stored
         }
         set { set(newValue, forKey: Keys.remoteASRModel) }
+    }
+
+    /// Gates the first-run onboarding window at launch (#27): absent/false
+    /// means the flow has never finished or been skipped, so it opens.
+    /// Re-running from Settings writes the same flag — no reset needed.
+    var hasCompletedOnboarding: Bool {
+        get { bool(forKey: Keys.hasCompletedOnboarding) }
+        set { set(newValue, forKey: Keys.hasCompletedOnboarding) }
     }
 
     var llmConfigs: [LLMConfig] {

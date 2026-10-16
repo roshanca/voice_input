@@ -37,6 +37,15 @@ final class UserDefaultsKeysTests: XCTestCase {
         XCTAssertNil(isolated.defaults.hotkeyData)
     }
 
+    /// The launch gate reads absent as "never onboarded" (#27) — a fresh
+    /// install must open the flow, and only finish/skip sets it.
+    func testHasCompletedOnboardingDefaultsFalseAndRoundTrips() {
+        let isolated = IsolatedDefaults()
+        XCTAssertFalse(isolated.defaults.hasCompletedOnboarding)
+        isolated.defaults.hasCompletedOnboarding = true
+        XCTAssertTrue(isolated.defaults.hasCompletedOnboarding)
+    }
+
     func testSelectedConfigIDRoundTrip() {
         let isolated = IsolatedDefaults()
         XCTAssertNil(isolated.defaults.selectedConfigID)

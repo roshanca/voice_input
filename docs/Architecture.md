@@ -10,7 +10,10 @@ Menu-bar dictation: trigger a hotkey (hold, tap-to-toggle, or double-tap)
 → speak → recognized (optionally LLM-polished) text is typed into the
 focused app. A second hotkey swaps the polish step for LLM translation,
 a third sends the transcript to the LLM as an instruction (voice rewrite).
-No window by default; the SwiftUI main window opens on demand.
+No window by default; the SwiftUI main window opens on demand — except on
+first launch, when a paged onboarding flow (permissions → mic → hotkey
+practice → LLM pointer) runs before the flag `hasCompletedOnboarding`
+settles the app into the menu bar (#27).
 
 ## Pipeline
 
@@ -98,7 +101,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | Path | Role |
 |---|---|
 | `App.swift` | `@main` NSApplicationDelegateAdaptor shell |
-| `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
+| `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring, launch gate for onboarding (first run swaps the standalone Accessibility modal for the flow's permissions step and polls so the tap still activates on grant). **Known god object** — refactor boundary, split before adding more features |
 | `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation, `rePaste`, `translate`, `rewrite`, and three selection actions (`selectionTranslate`, `selectionRewrite`, `addToDictionary`) |
 | `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
 | `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rewrite > translate > rePaste > dictation). First matching routed binding owns the event |
@@ -133,11 +136,12 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Storage/HistoryAudioStore.swift` | Clip directory (`Application Support/VoiceInput/History Audio/`): `<sessionID>.caf` naming convention, path-contained file ops; dir injectable for tests |
 | `Storage/HistoryAudioWriter.swift` | Per-session CAF capture owned by `AudioTapContext`: write() on the render thread under its lock (real-time safe), finish seals on graceful stop (empty clips deleted), discard deletes on cancel; write errors latch off |
 | `Storage/HistoryAudioRetention.swift` | Pure newest-N clip policy: which `audioFileName`s to delete so only the newest N audio-bearing records keep theirs |
-| `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides, `LLMProfileOverridesView` edits per-app profile routes; `HistoryAudioPlayer` = shared single-slot play/pause for History rows |
+| `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides, `LLMProfileOverridesView` edits per-app profile routes; `HistoryAudioPlayer` = shared single-slot play/pause for History rows; Settings → General hosts the "Re-run Onboarding" affordance |
+| `Onboarding/` | First-run paged flow (#27): `OnboardingStep` (pure step order — permissions before the hotkey practice because the tap needs Accessibility) → `OnboardingView` pager inside `OnboardingWindowController` (plain NSWindow — the floating panel is nonactivating session UI, wrong shape here). Permissions step embeds `PermissionsSection` verbatim (same checks + Settings deep links); mic step reuses the `SettingsStore` picker; the hotkey step shows the persisted `savedDictation` binding — the live tap makes a press there a real dictation — and LLM step only deep-links to Settings (no rebuilt editor). `show()` reinstalls the root view so re-runs restart at welcome; finish/skip writes `hasCompletedOnboarding`, mid-flow close doesn't |
 | `AnswerCardPanel.swift` | Floating card for a rewrite answer that can't be injected (unwritable target or failed delivery): scrollable read-only text + Copy/Close; counts as session work so Esc dismisses it through the normal interception |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map, `historyAudioEnabled` defaults on (bounds: 100-clip retention); `asrProvider`/`remoteASRBaseURL`/`remoteASRModel` select the ASR backend (the remote key lives in Keychain under account `remote-asr`, not here) |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map, `historyAudioEnabled` defaults on (bounds: 100-clip retention); `asrProvider`/`remoteASRBaseURL`/`remoteASRModel` select the ASR backend (the remote key lives in Keychain under account `remote-asr`, not here); `hasCompletedOnboarding` gates the first-run flow (#27) |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing
