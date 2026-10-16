@@ -270,6 +270,15 @@ struct SettingsView: View {
                         (NSApp.delegate as? AppDelegate)?.openLogsWindow()
                     }
                 }
+                // Re-run affordance for the first-run flow (#27) — the flag
+                // stays set, so this never re-arms the launch gate.
+                HStack {
+                    Text("Onboarding")
+                    Spacer()
+                    Button("Re-run Onboarding…") {
+                        OnboardingWindowController.shared.show()
+                    }
+                }
                 HStack {
                     Text("Version")
                     Spacer()

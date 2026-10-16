@@ -196,6 +196,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             speechRecognizer.warmUp()
         }
         setupHotkey()
+        // First run gets the onboarding walkthrough before the user is
+        // left at the menu bar with no guidance (#27).
+        if !UserDefaults.standard.hasCompletedOnboarding {
+            OnboardingWindowController.shared.show()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -408,8 +413,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         if !hotkeyManager.isTapActive {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.showAccessibilityAlert()
+            if UserDefaults.standard.hasCompletedOnboarding {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self?.showAccessibilityAlert()
+                }
+            } else {
+                // Onboarding's permissions step is the grant UI this launch
+                // — a modal would stack over its window. Keep polling so the
+                // tap still comes up the moment the user flips the switch,
+                // which is what makes the hotkey practice step live.
+                startAccessibilityPolling()
             }
         }
     }
