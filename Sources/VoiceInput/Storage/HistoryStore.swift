@@ -12,8 +12,12 @@ struct DictationRecord: Codable, Identifiable, Equatable {
     let outputText: String
     let wordCount: Int
     let language: String
+    /// Clip file name inside HistoryAudioStore's directory (`<id>.caf`).
+    /// Nil for records predating audio capture, for sessions that produced
+    /// no clip, and once retention prunes it — var so pruning can clear it.
+    var audioFileName: String?
 
-    init(id: UUID = UUID(), date: Date, durationSeconds: Double, rawText: String, refinedText: String?, outputText: String, language: String) {
+    init(id: UUID = UUID(), date: Date, durationSeconds: Double, rawText: String, refinedText: String?, outputText: String, language: String, audioFileName: String? = nil) {
         self.id = id
         self.date = date
         self.durationSeconds = durationSeconds
@@ -22,6 +26,7 @@ struct DictationRecord: Codable, Identifiable, Equatable {
         self.outputText = outputText
         self.wordCount = DictationRecord.countWords(rawText)
         self.language = language
+        self.audioFileName = audioFileName
     }
 
     /// Records written before `outputText` existed committed `refinedText ?? rawText`.
@@ -35,6 +40,9 @@ struct DictationRecord: Codable, Identifiable, Equatable {
         outputText = try container.decodeIfPresent(String.self, forKey: .outputText) ?? refinedText ?? rawText
         wordCount = try container.decodeIfPresent(Int.self, forKey: .wordCount) ?? DictationRecord.countWords(rawText)
         language = try container.decode(String.self, forKey: .language)
+        // Records written before audio capture decode to nil — the row
+        // simply shows no playback control.
+        audioFileName = try container.decodeIfPresent(String.self, forKey: .audioFileName)
     }
 
     /// Latin scripts: whitespace-separated words. CJK: non-whitespace characters.
@@ -66,8 +74,14 @@ final class HistoryStore: ObservableObject {
     static let shared = HistoryStore()
 
     private static let maxRecords = 5000
+    /// Only the newest `maxAudioRecords` audio-bearing records keep their
+    /// clip. Bounds disk at ~100 CAFs (~64 KB/s of 16 kHz Float32 PCM ≈
+    /// tens of MB worst case) while retaining every recent clip.
+    private static let maxAudioRecords = 100
 
     @Published private(set) var records: [DictationRecord] = []  // newest first
+
+    private let audioStore = HistoryAudioStore.shared
 
     private let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -80,23 +94,39 @@ final class HistoryStore: ObservableObject {
 
     private init() {
         load()
+        reconcileAudioFiles()
     }
 
     func add(_ record: DictationRecord) {
         records.insert(record, at: 0)
         if records.count > Self.maxRecords {
+            // Records dropped by the record cap take their clips with them —
+            // a record no longer in the store can never reference the file.
+            for removed in records.suffix(from: Self.maxRecords) {
+                if let name = removed.audioFileName {
+                    audioStore.delete(fileName: name)
+                }
+            }
             records.removeLast(records.count - Self.maxRecords)
         }
+        pruneAudio()
         scheduleSave()
     }
 
     func delete(id: UUID) {
+        // The record's clip goes with its row — e.g. a delivery canceled by
+        // Esc rolls back the record and must not leave the audio behind.
+        let doomed = records.filter { $0.id == id }.compactMap(\.audioFileName)
         records.removeAll { $0.id == id }
+        for name in doomed {
+            audioStore.delete(fileName: name)
+        }
         scheduleSave()
     }
 
     func clearAll() {
         records.removeAll()
+        audioStore.deleteAll()
         scheduleSave()
     }
 
@@ -104,6 +134,36 @@ final class HistoryStore: ObservableObject {
         saveWorkItem?.cancel()
         saveWorkItem = nil
         save()
+    }
+
+    // MARK: - Audio clips
+
+    /// Newest-first cap on clips: audio survives only on the first
+    /// `maxAudioRecords` records that carry one. Doomed files are deleted
+    /// and their record's `audioFileName` cleared, so the row stops
+    /// offering playback instead of pointing at a missing file.
+    private func pruneAudio() {
+        let doomed = HistoryAudioRetention.fileNamesToDelete(records: records, keepNewest: Self.maxAudioRecords)
+        guard !doomed.isEmpty else { return }
+        for name in doomed {
+            audioStore.delete(fileName: name)
+        }
+        for index in records.indices where records[index].audioFileName.map(doomed.contains) == true {
+            records[index].audioFileName = nil
+        }
+        scheduleSave()
+    }
+
+    /// Deletes clips no record references — leftovers from sessions killed
+    /// mid-write — then applies the retention cap to records restored from
+    /// disk. Init-only: later sweeps could race a live session's
+    /// still-unreferenced clip.
+    private func reconcileAudioFiles() {
+        let referenced = Set(records.compactMap(\.audioFileName))
+        for name in audioStore.audioFileNames() where !referenced.contains(name) {
+            audioStore.delete(fileName: name)
+        }
+        pruneAudio()
     }
 
     // MARK: - Persistence

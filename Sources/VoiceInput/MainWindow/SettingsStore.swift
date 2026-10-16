@@ -36,6 +36,9 @@ final class SettingsStore: ObservableObject {
     @Published var interactionSounds: Bool {
         didSet { UserDefaults.standard.interactionSounds = interactionSounds }
     }
+    @Published var historyAudioEnabled: Bool {
+        didSet { UserDefaults.standard.historyAudioEnabled = historyAudioEnabled }
+    }
     @Published var selectedMicUID: String? {
         didSet { UserDefaults.standard.selectedMicUID = selectedMicUID }
     }
@@ -125,6 +128,7 @@ final class SettingsStore: ObservableObject {
         autoSendOverrides = defaults.autoSendOverrides
         perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
         interactionSounds = defaults.interactionSounds
+        historyAudioEnabled = defaults.historyAudioEnabled
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage
@@ -146,6 +150,7 @@ final class SettingsStore: ObservableObject {
         autoSendOverrides = defaults.autoSendOverrides
         perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
         interactionSounds = defaults.interactionSounds
+        historyAudioEnabled = defaults.historyAudioEnabled
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage

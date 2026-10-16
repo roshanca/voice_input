@@ -13,6 +13,7 @@ extension UserDefaults {
         static let interactionSounds = "interactionSounds"
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
+        static let historyAudioEnabled = "historyAudioEnabled"
         static let dictationHotkeyBindings = "dictationHotkeyBindings"
         static let rePasteHotkeyBindings = "rePasteHotkeyBindings"
         static let translateHotkeyBindings = "translateHotkeyBindings"
@@ -99,6 +100,15 @@ extension UserDefaults {
     var selectedMicUID: String? {
         get { string(forKey: Keys.selectedMicUID) }
         set { set(newValue, forKey: Keys.selectedMicUID) }
+    }
+
+    /// Defaults to true — audio capture is the point of history playback,
+    /// and disk use stays bounded by HistoryStore's clip retention cap.
+    /// Snapshotted at recording start, so toggling it mid-session takes
+    /// effect on the next dictation.
+    var historyAudioEnabled: Bool {
+        get { object(forKey: Keys.historyAudioEnabled) as? Bool ?? true }
+        set { set(newValue, forKey: Keys.historyAudioEnabled) }
     }
 
     /// Defaults to true — dictionary replacements apply directly to ASR output.

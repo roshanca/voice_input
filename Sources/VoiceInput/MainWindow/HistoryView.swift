@@ -48,6 +48,10 @@ struct HistoryView: View {
                         .contextMenu {
                             Button("Copy") { copy(record.outputText) }
                             Button("Delete", role: .destructive) {
+                                // Deleting the row removes its clip from
+                                // disk; stop playback first so the player
+                                // isn't left holding a deleted file.
+                                HistoryAudioPlayer.shared.stopIfPlaying(fileName: record.audioFileName)
                                 history.delete(id: record.id)
                             }
                         }
@@ -57,6 +61,7 @@ struct HistoryView: View {
         }
         .confirmationDialog("Clear all history?", isPresented: $showClearConfirmation) {
             Button("Clear All", role: .destructive) {
+                HistoryAudioPlayer.shared.stop()
                 history.clearAll()
             }
             Button("Cancel", role: .cancel) {}
@@ -73,6 +78,13 @@ struct HistoryView: View {
 
 private struct HistoryRow: View {
     let record: DictationRecord
+    /// Shared single-slot player — the row only needs to know whether ITS
+    /// clip is the one currently loaded and playing.
+    @ObservedObject private var audioPlayer = HistoryAudioPlayer.shared
+
+    private var isPlayingThis: Bool {
+        audioPlayer.isPlaying && audioPlayer.playingFileName == record.audioFileName
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -85,6 +97,19 @@ private struct HistoryRow: View {
                     .lineLimit(2)
             }
             HStack(spacing: 8) {
+                // Records predating audio capture (or sessions that captured
+                // none) have no clip — no button, same look as before.
+                if let audioFileName = record.audioFileName {
+                    Button {
+                        audioPlayer.toggle(fileName: audioFileName)
+                    } label: {
+                        Image(systemName: isPlayingThis ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help(isPlayingThis ? "Pause recording" : "Play recording")
+                }
                 Text(record.date, style: .relative)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

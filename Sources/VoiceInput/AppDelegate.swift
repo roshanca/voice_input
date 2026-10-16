@@ -514,6 +514,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLogger.shared.info("New session started — canceling pending \(pending.kind.stageName)")
             llmRefiner.cancel()
             pendingSession = nil
+            // A canceled refinement writes no record — its clip would
+            // orphan on disk.
+            discardSessionAudio(pending.id)
+        }
+        // A press landing while a stopped session still awaits its final
+        // result/timeout supersedes it: the timer was just invalidated, so
+        // it can never submit — no record, no clip.
+        if let superseded = activeSession {
+            discardSessionAudio(superseded.id)
         }
         let target = DictationTarget.capture()
         // Auto-send resolves once, here, against the recorded target's own
@@ -708,11 +717,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isHotkeyHeld = false
         resultTimeout?.invalidate()
         resultTimeout = nil
+        // The canceled session writes no record, so its clip goes too —
+        // whether it's still being written (teardown's discard deletes the
+        // file; this call is then a no-op) or already sealed on stop.
+        if let canceled = activeSession {
+            discardSessionAudio(canceled.id)
+        }
         activeSession = nil
         recordingStartups.values.forEach { $0.cancel() }
-        if pendingSession != nil {
+        if let pending = pendingSession {
             llmRefiner.cancel()
             pendingSession = nil
+            discardSessionAudio(pending.id)
         }
         if selectionTransformInFlight {
             selectionTransformer.cancel()
@@ -939,6 +955,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLogger.shared.info("submitSession called — raw length: \(session.rawText.count), trimmed length: \(trimmed.count)")
         guard !trimmed.isEmpty else {
             AppLogger.shared.warning("submitSession — trimmed text is empty, hiding panel")
+            // No record is written for an empty session — its clip goes too.
+            discardSessionAudio(session.id)
             floatingPanel.hide()
             syncEscapeInterception()
             return
@@ -1132,9 +1150,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rawText: raw,
             refinedText: refined,
             outputText: output,
-            language: session.language
+            language: session.language,
+            // The clip is attached only if it exists on disk — sessions that
+            // captured nothing (opt-out, empty file, failure) produce a
+            // text-only record, same as pre-feature history.
+            audioFileName: HistoryAudioStore.shared.existingFileName(forSessionID: session.id)
         )
         HistoryStore.shared.add(record)
+    }
+
+    /// Deletes a session's clip for sessions that end without a record —
+    /// empty transcript, canceled refinement, superseded pending session.
+    /// A recording-session cancel needs no call here: teardown discards
+    /// the writer's file itself.
+    private func discardSessionAudio(_ sessionID: UUID) {
+        HistoryAudioStore.shared.deleteAudio(forSessionID: sessionID)
     }
 }
 
