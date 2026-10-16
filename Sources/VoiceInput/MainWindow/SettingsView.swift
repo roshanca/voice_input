@@ -117,6 +117,28 @@ struct SettingsView: View {
             }
 
             Section {
+                SelectionActionRow(
+                    title: "Translate selection",
+                    caption: "Translate the selected text, replacing it in place.",
+                    chord: store.selectionTranslateChordLabel
+                )
+                SelectionActionRow(
+                    title: "Rewrite selection",
+                    caption: "Polish the selected text, replacing it in place.",
+                    chord: store.selectionRewriteChordLabel
+                )
+                SelectionActionRow(
+                    title: "Add selection to dictionary",
+                    caption: "Teach the selected term to the custom dictionary.",
+                    chord: store.addToDictionaryChordLabel
+                )
+            } header: {
+                Label("Selection Actions", systemImage: "character.cursor.ibeam")
+            } footer: {
+                Text("With no text selected, these keys hold-to-dictate instead. Translation uses the target language above.")
+            }
+
+            Section {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Dictate")
@@ -184,5 +206,28 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Read-only label + chord row for the selection-action list — the
+/// persisted bindings have no editor UI yet (a later issue adds one), so
+/// the row only advertises what the chord is.
+private struct SelectionActionRow: View {
+    let title: String
+    let caption: String
+    let chord: String
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(chord)
+                .foregroundStyle(.secondary)
+        }
     }
 }

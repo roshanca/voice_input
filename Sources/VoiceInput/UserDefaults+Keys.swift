@@ -15,6 +15,9 @@ extension UserDefaults {
         static let dictationHotkeyBindings = "dictationHotkeyBindings"
         static let rePasteHotkeyBindings = "rePasteHotkeyBindings"
         static let translateHotkeyBindings = "translateHotkeyBindings"
+        static let selectionTranslateHotkeyBindings = "selectionTranslateHotkeyBindings"
+        static let selectionRewriteHotkeyBindings = "selectionRewriteHotkeyBindings"
+        static let addToDictionaryHotkeyBindings = "addToDictionaryHotkeyBindings"
         static let translateTargetLanguage = "translateTargetLanguage"
         // Legacy key: single scalar hotkey, superseded by the binding list
         // above but kept in sync for downgrade compatibility.
@@ -156,6 +159,7 @@ extension UserDefaults {
     /// The language translate sessions translate into — interpolated verbatim
     /// into the LLM prompt, so any language name works. A blank stored value
     /// falls back to English rather than producing a broken prompt.
+    /// Shared by voice translate (#23) and translate-selection (#21).
     var translateTargetLanguage: String {
         get {
             let stored = string(forKey: Keys.translateTargetLanguage)?
@@ -163,6 +167,44 @@ extension UserDefaults {
             return stored.isEmpty ? "English" : stored
         }
         set { set(newValue, forKey: Keys.translateTargetLanguage) }
+    }
+
+    /// Selection-action chord bindings — all new keys, no legacy migration.
+    /// Defaults are ⌃⇧T (translate), ⌃⇧R (rewrite), ⌃⇧D (add to
+    /// dictionary): ⌃⌥ was the first pick but voice translate already owns
+    /// ⌃⌥T, and ⌃⌘ already holds re-paste (⌃⌘V) — ⌃⇧ keeps the trio on one
+    /// modifier family with mnemonic letters. `.hold` is load-bearing:
+    /// the press probes the selection and either runs the action or falls
+    /// back to hold-to-dictate, which needs the release edge to stop.
+    private func selectionBindings(_ key: String, defaultChord: Hotkey) -> [HotkeyBinding] {
+        if let data = data(forKey: key),
+           let decoded = try? JSONDecoder().decode([HotkeyBinding].self, from: data),
+           !decoded.isEmpty {
+            return decoded
+        }
+        return [HotkeyBinding(hotkey: defaultChord, behavior: .hold)]
+    }
+
+    private func persistSelectionBindings(_ bindings: [HotkeyBinding], key: String) {
+        set(try? JSONEncoder().encode(bindings), forKey: key)
+    }
+
+    var selectionTranslateHotkeyBindings: [HotkeyBinding] {
+        // T = keyCode 17.
+        get { selectionBindings(Keys.selectionTranslateHotkeyBindings, defaultChord: .chord(keyCode: 17, modifiers: [.control, .shift])) }
+        set { persistSelectionBindings(newValue, key: Keys.selectionTranslateHotkeyBindings) }
+    }
+
+    var selectionRewriteHotkeyBindings: [HotkeyBinding] {
+        // R = keyCode 15.
+        get { selectionBindings(Keys.selectionRewriteHotkeyBindings, defaultChord: .chord(keyCode: 15, modifiers: [.control, .shift])) }
+        set { persistSelectionBindings(newValue, key: Keys.selectionRewriteHotkeyBindings) }
+    }
+
+    var addToDictionaryHotkeyBindings: [HotkeyBinding] {
+        // D = keyCode 2.
+        get { selectionBindings(Keys.addToDictionaryHotkeyBindings, defaultChord: .chord(keyCode: 2, modifiers: [.control, .shift])) }
+        set { persistSelectionBindings(newValue, key: Keys.addToDictionaryHotkeyBindings) }
     }
 
     var llmConfigs: [LLMConfig] {

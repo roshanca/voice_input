@@ -56,11 +56,19 @@ final class SettingsStore: ObservableObject {
     private func persistDictationBinding() {
         let bindings = [HotkeyBinding(hotkey: hotkey, behavior: hotkeyBehavior)]
         HotkeyManager.persistDictation(bindings)
-        HotkeyManager.shared.update(dictation: bindings, rePaste: HotkeyManager.savedRePaste, translate: HotkeyManager.savedTranslate)
+        HotkeyManager.shared.update(
+            dictation: bindings,
+            rePaste: HotkeyManager.savedRePaste,
+            translate: HotkeyManager.savedTranslate,
+            selectionTranslate: HotkeyManager.savedSelectionTranslate,
+            selectionRewrite: HotkeyManager.savedSelectionRewrite,
+            addToDictionary: HotkeyManager.savedAddToDictionary
+        )
     }
 
     /// Language the translate hotkey translates into — free-form, read
     /// verbatim into the LLM prompt; the accessor normalizes blank to English.
+    /// Shared by voice translate and translate-selection.
     @Published var translateTargetLanguage: String {
         didSet {
             guard translateTargetLanguage != oldValue else { return }
@@ -71,6 +79,21 @@ final class SettingsStore: ObservableObject {
     /// persisted and routed, but not editable from settings yet.
     var translateHotkeyDisplay: String {
         HotkeyManager.savedTranslate.first?.hotkey.displayName ?? "Unbound"
+    }
+
+    /// Display names of the persisted selection-action chords. Read-only —
+    /// the settings UI has no chord editor yet, and nothing else writes
+    /// these keys, so there's nothing to publish.
+    var selectionTranslateChordLabel: String {
+        HotkeyManager.savedSelectionTranslate.first?.hotkey.displayName ?? "—"
+    }
+
+    var selectionRewriteChordLabel: String {
+        HotkeyManager.savedSelectionRewrite.first?.hotkey.displayName ?? "—"
+    }
+
+    var addToDictionaryChordLabel: String {
+        HotkeyManager.savedAddToDictionary.first?.hotkey.displayName ?? "—"
     }
 
     /// Available audio input devices; refreshed when the settings window appears.
@@ -91,6 +114,7 @@ final class SettingsStore: ObservableObject {
         interactionSounds = defaults.interactionSounds
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
+        translateTargetLanguage = defaults.translateTargetLanguage
         hotkey = HotkeyManager.savedDictation.first?.hotkey ?? .fnKey
         hotkeyBehavior = HotkeyManager.savedDictation.first?.behavior ?? .hold
         llmConfigs = defaults.llmConfigs
