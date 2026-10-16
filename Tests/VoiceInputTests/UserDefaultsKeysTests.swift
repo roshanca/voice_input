@@ -196,6 +196,27 @@ final class UserDefaultsKeysTests: XCTestCase {
         XCTAssertEqual(isolated.defaults.translateTargetLanguage, "English")
     }
 
+    /// The voice end command ships enabled (#26) — it's the feature's
+    /// hands-free completion path, not an opt-in.
+    func testVoiceEndCommandEnabledDefaultsToTrue() {
+        let isolated = IsolatedDefaults()
+        XCTAssertTrue(isolated.defaults.voiceEndCommandEnabled)
+        isolated.defaults.voiceEndCommandEnabled = false
+        XCTAssertFalse(isolated.defaults.voiceEndCommandEnabled)
+    }
+
+    /// Default triggers are the conservative EN+CN pair "over,完毕" — and
+    /// a blank stored value restores the default rather than silently
+    /// disabling the command.
+    func testVoiceEndCommandPhrasesDefaultsAndNormalizesBlank() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.voiceEndCommandPhrases, "over,完毕")
+        isolated.defaults.voiceEndCommandPhrases = "done,完了"
+        XCTAssertEqual(isolated.defaults.voiceEndCommandPhrases, "done,完了")
+        isolated.defaults.voiceEndCommandPhrases = "   "
+        XCTAssertEqual(isolated.defaults.voiceEndCommandPhrases, "over,完毕")
+    }
+
     func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
         let isolated = IsolatedDefaults()
         let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,

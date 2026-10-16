@@ -91,6 +91,24 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle(isOn: $store.voiceEndCommandEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("End dictation with a spoken word")
+                        Text("Say an end word while dictating to finish — same as releasing the key.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if store.voiceEndCommandEnabled {
+                    TextField("End words", text: $store.voiceEndCommandPhrases, prompt: Text("over,完毕"))
+                }
+            } header: {
+                Label("Voice End Command", systemImage: "checkmark.circle")
+            } footer: {
+                Text("Separate words with commas. Only a word at the very end of the transcript ends the session — it is also stripped from the inserted text. Works for dictation, translate, and rewrite; with a remote provider the word is removed at release.")
+            }
+
+            Section {
                 Picker("Microphone", selection: $store.selectedMicUID) {
                     Text("System Default").tag(String?.none)
                     ForEach(store.inputDevices) { device in

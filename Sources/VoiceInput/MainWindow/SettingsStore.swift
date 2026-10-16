@@ -45,6 +45,16 @@ final class SettingsStore: ObservableObject {
     @Published var dictionaryDirectReplacement: Bool {
         didSet { UserDefaults.standard.dictionaryDirectReplacement = dictionaryDirectReplacement }
     }
+    /// Voice end command (#26): a running session already snapshotted its
+    /// flag and phrase list, so this only takes effect on the next press.
+    @Published var voiceEndCommandEnabled: Bool {
+        didSet { UserDefaults.standard.voiceEndCommandEnabled = voiceEndCommandEnabled }
+    }
+    /// Raw phrase list as typed — comma/line separated; parsed into
+    /// triggers by `EndCommandMatcher.phrases(from:)` at session start.
+    @Published var voiceEndCommandPhrases: String {
+        didSet { UserDefaults.standard.voiceEndCommandPhrases = voiceEndCommandPhrases }
+    }
     /// ASR backend for new sessions — a running session already snapshotted
     /// its plan, so this only takes effect on the next press.
     @Published var asrProvider: ASRProvider {
@@ -148,6 +158,8 @@ final class SettingsStore: ObservableObject {
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage
+        voiceEndCommandEnabled = defaults.voiceEndCommandEnabled
+        voiceEndCommandPhrases = defaults.voiceEndCommandPhrases
         asrProvider = defaults.asrProvider
         remoteASRBaseURL = defaults.remoteASRBaseURL
         remoteASRModel = defaults.remoteASRModel
@@ -174,6 +186,8 @@ final class SettingsStore: ObservableObject {
         selectedMicUID = defaults.selectedMicUID
         dictionaryDirectReplacement = defaults.dictionaryDirectReplacement
         translateTargetLanguage = defaults.translateTargetLanguage
+        voiceEndCommandEnabled = defaults.voiceEndCommandEnabled
+        voiceEndCommandPhrases = defaults.voiceEndCommandPhrases
         asrProvider = defaults.asrProvider
         remoteASRBaseURL = defaults.remoteASRBaseURL
         remoteASRModel = defaults.remoteASRModel

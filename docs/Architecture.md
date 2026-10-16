@@ -22,9 +22,17 @@ HotkeyManager (CGEvent tap)
   → ASR seam: the session snapshots an ASR plan at press (#28)
       ├── .system → SpeechRecognizer (SFSpeechRecognizer + AVAudioEngine)
       │     partials → FloatingPanel (waveform + live text)
+      │     every partial also runs through EndCommandMatcher (#26): a
+      │     configured trigger phrase at the transcript tail ends the
+      │     session via the same releaseSession path the key takes, and
+      │     the phrase is stripped from the stored text — the final
+      │     result re-strips (a mid-string occurrence means post-command
+      │     audio kept transcribing, so it's truncated there)
       └── .remote → RemoteASRRecognizer (same engine+tap, PCM → WAV file)
             release → multipart POST {base}/audio/transcriptions →
-            {text} → final result → same submitSession path
+            {text} → final result → same submitSession path — batch ASR
+            can't fire the command mid-record; the same tail-strip still
+            removes a spoken trigger before submit
   → on release: submitSession()
       ├── LLMRefiner (SSE stream, OpenAI-compatible / Ollama)
       │     streamed tokens → FloatingPanel
@@ -100,7 +108,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `App.swift` | `@main` NSApplicationDelegateAdaptor shell |
 | `AppDelegate.swift` | Coordinator: menu bar, session lifecycle, wiring. **Known god object** — refactor boundary, split before adding more features |
 | `Hotkey/HotkeyModel.swift` | `HotkeyBinding` (hotkey + behavior) list model, Codable; `Hotkey` = fn/right-modifier/F-key/`chord` (key + exact `ModifierFlags`); `HotkeyBusiness` = dictation, `rePaste`, `translate`, `rewrite`, and three selection actions (`selectionTranslate`, `selectionRewrite`, `addToDictionary`) |
-| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
+| `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Hold-mode press edges drop auto-repeat keyDowns at the tap — required since #26: the voice end command clears `isHotkeyHeld` while the key is still down, and an unfiltered repeat would restart a session under the same hold. Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
 | `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rewrite > translate > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch (only when provider = system — remote never requests Speech auth). `AudioTapContext` also tees the converted PCM into the session's `HistoryAudioWriter` when `historyAudioEnabled` is on |
@@ -118,6 +126,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `DictationTarget.swift` | Frontmost app + focused AX element captured before the panel steals focus (and at ⌃⌘V press for re-paste); re-validated before paste and before auto-Return; mismatch parks the result instead of sending. `isWritable` = capture-time probe of settable `AXValue`/`AXSelectedText`/`AXSelectedTextRange` — voice rewrite's inject-vs-card gate; undecidable resolves to not-writable |
 | `EscapeRouting.swift` | Pure Esc routing: consume only while a session is active; `PressOwnership` pins one decision per physical press (repeats + keyUp follow it); ⌘⌥⎋ always passes through |
 | `AutoSendRules.swift` | Pure per-app auto-send override resolution: `inherit` (absent entry) / on / off keyed by bundle ID; resolved once at session start |
+| `EndCommandMatcher.swift` | Pure voice-end-command matching (#26): tail-only, word-boundary-aware (Latin glue chars only — CJK phrases need no boundary), tolerant of ASR trailing punctuation; `truncateAfterTrigger` drops a re-emitted/mid-string trigger plus post-command audio from late results; `phrases(from:)` parses the comma/line-separated setting |
 | `RefinementFallback.swift` | "Use Original" while LLM is pending: clears `pendingSession` before cancelling so racing callbacks fail the request-ID guard; exactly-one injection/history |
 | `Selection/SelectedTextProbe.swift` | Selected-text read: AX `AXSelectedText` (0.2 s timeout, caret-only early-exit) → ⌘C clipboard fallback with snapshot/restore + `changeCount` ownership check; drives the selection-action chords |
 | `Selection/SelectionPolicy.swift` | Pure policy deciding caret vs real selection and dictionary-term validity; untested surface = system IO only |
@@ -137,17 +146,18 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `AnswerCardPanel.swift` | Floating card for a rewrite answer that can't be injected (unwritable target or failed delivery): scrollable read-only text + Copy/Close; counts as session work so Esc dismisses it through the normal interception |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map, `historyAudioEnabled` defaults on (bounds: 100-clip retention); `asrProvider`/`remoteASRBaseURL`/`remoteASRModel` select the ASR backend (the remote key lives in Keychain under account `remote-asr`, not here) |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map, `historyAudioEnabled` defaults on (bounds: 100-clip retention); `asrProvider`/`remoteASRBaseURL`/`remoteASRModel` select the ASR backend (the remote key lives in Keychain under account `remote-asr`, not here); `voiceEndCommandEnabled`/`voiceEndCommandPhrases` drive the voice end command — default on, phrases default to "over,完毕", blank restores the default |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing
 
 `Tests/VoiceInputTests/` — XCTest on pure logic only: dictionary rules,
 hotkey routing/decoding, selection policy, log redaction, task store,
-stats, UserDefaults keys, translation prompt contract, remote-ASR wire
-format (multipart layout, request shape, response/error parsing) and
-session-plan resolution. `TestHelpers.swift` provides isolated
-`UserDefaults` suites and temp dirs. **No TCC-dependent tests.**
+stats, UserDefaults keys, translation prompt contract, end-command tail
+matching/truncation, remote-ASR wire format (multipart layout, request
+shape, response/error parsing) and session-plan resolution.
+`TestHelpers.swift` provides isolated `UserDefaults` suites and temp
+dirs. **No TCC-dependent tests.**
 
 Run via `make test` (adds the rpath SwiftPM omits; see AGENTS.md).
 
