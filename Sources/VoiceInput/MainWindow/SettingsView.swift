@@ -82,6 +82,21 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle(isOn: $store.historyAudioEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Save recordings to History")
+                        Text("Attach the captured audio to each dictation so it can be replayed from the History page.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Label("History", systemImage: "clock")
+            } footer: {
+                Text("Clips are kept for the 100 most recent dictations with audio; older ones are pruned automatically.")
+            }
+
+            Section {
                 Toggle(isOn: $store.llmEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Enable LLM refinement")

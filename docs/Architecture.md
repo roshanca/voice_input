@@ -63,6 +63,17 @@ AppDelegate, which probes the selection on press (SelectedTextProbe):
   - nothing selected → the press falls back to hold-to-dictate and its
     release routes to hotkeyReleased(); a key already released before the
     probe answers resolves to a no-op (a dictation could never stop)
+
+History audio (#25): the tap tees the same converted PCM it appends to the
+recognition request into a per-session CAF (HistoryAudioWriter inside
+AudioTapContext, `History Audio/<sessionID>.caf`). Graceful stop seals the
+clip; teardown/Esc discard it; sessions that never produce a record (empty
+transcript, superseded/canceled pending session) delete it from AppDelegate.
+recordHistory attaches `audioFileName` only when the clip exists on disk →
+History rows get a play/pause button driven by the shared single-slot
+HistoryAudioPlayer. Deleting a record or clearing history removes its clip;
+HistoryAudioRetention keeps clips only on the newest 100 audio-bearing
+records, and a launch-time reconcile sweeps files no record references.
 ```
 
 **Session identity:** `AppDelegate` owns `activeSession: {id, generation,
@@ -88,7 +99,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Hotkey/HotkeyManager.swift` | CGEvent tap, binding storage + legacy migration, dispatch. Re-paste chords swallow keyDown+keyUp and fire once per press (`rePastePressed` gates auto-repeat — the injected ⌘V's own keyUp can clear it mid-hold). Translate and rewrite bindings dispatch press/release edges like dictation's. Selection chords hand both edges to the delegate via `onSelectionAction` — the press's probe is async, so fallback state lives on the main actor, not the tap |
 | `HotkeyRouting` (in HotkeyModel) | Pure routing: chords > regular keys > modifier-only, then `doubleTap > hold > tap`, then business priority (selectionTranslate > selectionRewrite > addToDictionary > rewrite > translate > rePaste > dictation). First matching routed binding owns the event |
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
-| `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch |
+| `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch. `AudioTapContext` also tees the converted PCM into the session's `HistoryAudioWriter` when `historyAudioEnabled` is on |
 | `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
 | `LLMProfileRouting.swift` | Pure per-app profile routing: exact bundle-ID match wins, absent/dangling entries fall back to the global pick (selected id → first); resolved once at session start |
 | `TranslationPrompt.swift` | Pure prompt builder for translate sessions — bidirectional against Chinese (already-in-target input translates back to Chinese), `<transcript>` inert-text wrapper like refine |
@@ -108,12 +119,15 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `DiagnosticsExporter.swift` | `NSSavePanel` export: version, OS, permission tri-state, redacted logs |
 | `LogsWindow.swift` | AppKit log viewer + export button |
 | `Storage/DictionaryStore.swift` | Custom dictionary; `DictionaryRules` pure replacements (unit-tested) |
-| `Storage/HistoryStore.swift` | Dictation records (no audio yet) |
-| `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides, `LLMProfileOverridesView` edits per-app profile routes |
+| `Storage/HistoryStore.swift` | Dictation records incl. `audioFileName` (`decodeIfPresent` — pre-audio records decode to nil); record-cap trims, `delete` and `clearAll` remove the clips too; `maxAudioRecords` = 100 clip retention |
+| `Storage/HistoryAudioStore.swift` | Clip directory (`Application Support/VoiceInput/History Audio/`): `<sessionID>.caf` naming convention, path-contained file ops; dir injectable for tests |
+| `Storage/HistoryAudioWriter.swift` | Per-session CAF capture owned by `AudioTapContext`: write() on the render thread under its lock (real-time safe), finish seals on graceful stop (empty clips deleted), discard deletes on cancel; write errors latch off |
+| `Storage/HistoryAudioRetention.swift` | Pure newest-N clip policy: which `audioFileName`s to delete so only the newest N audio-bearing records keep theirs |
+| `MainWindow/` | SwiftUI: Home / History / Dictionary / LLM profiles / Settings / permissions; `AutoSendOverridesView` edits per-app send overrides, `LLMProfileOverridesView` edits per-app profile routes; `HistoryAudioPlayer` = shared single-slot play/pause for History rows |
 | `AnswerCardPanel.swift` | Floating card for a rewrite answer that can't be injected (unwritable target or failed delivery): scrollable read-only text + Copy/Close; counts as session work so Esc dismisses it through the normal interception |
 | `FloatingPanel.swift`, `WaveformView.swift`, `SoundPlayer.swift` | Recording indicator UI + sounds |
 | `LLMConfig.swift`, `KeychainHelper.swift` | Profiles config; API keys in Keychain |
-| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map |
+| `UserDefaults+Keys.swift` | Typed preference accessors + legacy `hotkeyData` → binding-list migration; `rePasteHotkeyBindings` defaults to ⌃⌘V, `translateHotkeyBindings` to ⌃⌥T (⌃⌥Space rejected — macOS's input-source switch), `rewriteHotkeyBindings` to ⌃⌥R, selection-action bindings to ⌃⇧T/⌃⇧R/⌃⇧D, `translateTargetLanguage` to English (shared by voice translate and translate-selection), `perAppLLMProfileOverrides` = bundle-ID → profile-UUID map, `historyAudioEnabled` defaults on (bounds: 100-clip retention) |
 | `AudioDeviceManager.swift`, `InputMethodManager.swift`, `LanguageManager.swift`, `LaunchAtLoginManager.swift` | Small single-purpose managers |
 
 ## Testing

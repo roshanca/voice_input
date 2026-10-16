@@ -129,4 +129,58 @@ final class DictationRecordTests: XCTestCase {
         )
         XCTAssertEqual(record.wordCount, 3)
     }
+
+    // MARK: - audioFileName (issue #25)
+
+    /// Records written before audio capture existed carry no such key —
+    /// they must decode with a nil clip name so old history files keep
+    /// loading and simply show no playback control.
+    func testDecodesRecordWithoutAudioFileName() throws {
+        let json = """
+        [{
+            "id": "00000000-0000-0000-0000-000000000003",
+            "date": 700000000.0,
+            "durationSeconds": 1.0,
+            "rawText": "hello",
+            "outputText": "hello",
+            "wordCount": 1,
+            "language": "en"
+        }]
+        """
+        let record = try XCTUnwrap(decode(json).first)
+        XCTAssertNil(record.audioFileName)
+    }
+
+    func testDecodesAudioFileNameWhenPresent() throws {
+        let json = """
+        [{
+            "id": "00000000-0000-0000-0000-000000000004",
+            "date": 700000000.0,
+            "durationSeconds": 1.0,
+            "rawText": "hello",
+            "outputText": "hello",
+            "wordCount": 1,
+            "language": "en",
+            "audioFileName": "00000000-0000-0000-0000-000000000004.caf"
+        }]
+        """
+        let record = try XCTUnwrap(decode(json).first)
+        XCTAssertEqual(record.audioFileName, "00000000-0000-0000-0000-000000000004.caf")
+    }
+
+    func testRoundTripPreservesAudioFileName() throws {
+        let record = DictationRecord(
+            date: Date(timeIntervalSinceReferenceDate: 700000000),
+            durationSeconds: 2.0,
+            rawText: "hello",
+            refinedText: nil,
+            outputText: "hello",
+            language: "en",
+            audioFileName: "some-clip.caf"
+        )
+        let data = try JSONEncoder().encode([record])
+        let decoded = try XCTUnwrap(decode(String(decoding: data, as: UTF8.self)).first)
+        XCTAssertEqual(decoded, record)
+        XCTAssertEqual(decoded.audioFileName, "some-clip.caf")
+    }
 }

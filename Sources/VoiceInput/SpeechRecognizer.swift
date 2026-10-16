@@ -31,6 +31,11 @@ private final class AudioTapContext: @unchecked Sendable {
     private struct State {
         var request: SFSpeechAudioBufferRecognitionRequest?
         var converter: AVAudioConverter?
+        /// The session's history clip — written with the same converted
+        /// buffers the request gets. Sealed by deactivateAndEndAudio
+        /// (graceful stop → clip survives for the record) and deleted by
+        /// deactivate (cancel/teardown → no record, no clip).
+        var audioWriter: HistoryAudioWriter?
         var rmsLogCounter = 0
         /// Flipped by stopRecording/teardown: drained or in-flight buffers
         /// are dropped instead of touching released state.
@@ -51,19 +56,35 @@ private final class AudioTapContext: @unchecked Sendable {
         set { state.withLock { $0.request = newValue } }
     }
 
+    /// Set once from the main actor right after the context is created.
+    /// Stored under the lock so the render thread's per-buffer write is
+    /// atomic with the request append and with finish/discard.
+    var audioWriter: HistoryAudioWriter? {
+        get { state.withLock { $0.audioWriter } }
+        set { state.withLock { $0.audioWriter = newValue } }
+    }
+
     func deactivate() {
-        state.withLock { $0.active = false }
+        state.withLock {
+            $0.active = false
+            $0.audioWriter?.discard()
+            $0.audioWriter = nil
+        }
     }
 
     /// Ordered stop for the tap, atomic under the lock: deactivate first so
     /// in-flight process() calls finish and new buffers are rejected, then
     /// end audio on the request — no buffer can be appended after endAudio.
+    /// Also seals the session's history clip: by the time this runs the tap
+    /// is already removed, so no in-flight write can race the file close.
     /// Returns the request that was ended, for delayed-cleanup identity checks.
     @discardableResult
     func deactivateAndEndAudio() -> SFSpeechAudioBufferRecognitionRequest? {
         state.withLock {
             $0.active = false
             $0.request?.endAudio()
+            $0.audioWriter?.finish()
+            $0.audioWriter = nil
             return $0.request
         }
     }
@@ -85,6 +106,9 @@ private final class AudioTapContext: @unchecked Sendable {
 
             guard let converter = state.converter else {
                 request.append(buffer)
+                // The raw-format fallback appends the unconverted buffer;
+                // the writer skips it when its format can't fit the clip.
+                state.audioWriter?.write(buffer)
                 return normalizedRMS(of: buffer, state: &state)
             }
 
@@ -92,6 +116,7 @@ private final class AudioTapContext: @unchecked Sendable {
             guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
                 logError("Failed to create converted AVAudioPCMBuffer")
                 request.append(buffer)
+                state.audioWriter?.write(buffer)
                 return normalizedRMS(of: buffer, state: &state)
             }
 
@@ -104,12 +129,16 @@ private final class AudioTapContext: @unchecked Sendable {
             if let error {
                 logError("Audio conversion error: \(error)")
                 request.append(buffer)
+                state.audioWriter?.write(buffer)
                 return normalizedRMS(of: buffer, state: &state)
             }
 
             convertedBuffer.frameLength = convertedBuffer.frameCapacity
             logDebug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
             request.append(convertedBuffer)
+            // The clip tees exactly what the recognizer was fed — same
+            // buffer, same format, so playback matches the transcript.
+            state.audioWriter?.write(convertedBuffer)
             return normalizedRMS(of: convertedBuffer, state: &state)
         }
     }
@@ -351,6 +380,14 @@ final class SpeechRecognizer: NSObject {
         // recognition task so the task can publish its request through it.
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         let tapContext = AudioTapContext(sessionID: sessionID, targetFormat: targetFormat)
+        // History clip capture: one CAF per session, named by session id so
+        // recordHistory links file ↔ record by convention. An opt-out or an
+        // unwritable directory leaves audioWriter nil — the record simply
+        // carries no audio. Snapshotted at session start like the rest of
+        // the settings, so a mid-session toggle can't split a recording.
+        if UserDefaults.standard.historyAudioEnabled {
+            tapContext.audioWriter = HistoryAudioWriter(sessionID: sessionID, format: targetFormat)
+        }
         audioTap = tapContext
 
         // Prefer on-device recognition: no server session to establish, so the
@@ -414,7 +451,15 @@ final class SpeechRecognizer: NSObject {
         }
 
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // The engine never delivered a buffer — tear down so the
+            // task/request and the just-opened clip aren't leaked into the
+            // next session.
+            teardown()
+            throw error
+        }
         isRecording = true
 
         // Snapshot the route the engine actually adopted, for comparison in

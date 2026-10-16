@@ -18,6 +18,15 @@ final class UserDefaultsKeysTests: XCTestCase {
         XCTAssertFalse(isolated.defaults.dictionaryDirectReplacement)
     }
 
+    /// Audio capture ships enabled (#25) — it's the point of history
+    /// playback, and the newest-100 clip cap keeps disk use bounded.
+    func testHistoryAudioEnabledDefaultsToTrue() {
+        let isolated = IsolatedDefaults()
+        XCTAssertTrue(isolated.defaults.historyAudioEnabled)
+        isolated.defaults.historyAudioEnabled = false
+        XCTAssertFalse(isolated.defaults.historyAudioEnabled)
+    }
+
     func testBooleanFlagsDefaultToFalse() {
         let isolated = IsolatedDefaults()
         XCTAssertFalse(isolated.defaults.llmEnabled)
