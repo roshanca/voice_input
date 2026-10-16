@@ -5,6 +5,28 @@ struct SettingsView: View {
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
     @State private var showLLMProfiles = false
     @State private var showRemoteASRKey = false
+    @State private var customTargetLanguageSelected = false
+
+    private static let targetLanguages = ["English", "Japanese", "Korean", "French", "German", "Spanish"]
+    private static let customTargetLanguageID = "__custom__"
+
+    private var usesCustomTargetLanguage: Bool {
+        customTargetLanguageSelected || !Self.targetLanguages.contains(store.translateTargetLanguage)
+    }
+
+    private var targetLanguageSelection: Binding<String> {
+        Binding(
+            get: { usesCustomTargetLanguage ? Self.customTargetLanguageID : store.translateTargetLanguage },
+            set: { selection in
+                if selection == Self.customTargetLanguageID {
+                    customTargetLanguageSelected = true
+                } else {
+                    customTargetLanguageSelected = false
+                    store.translateTargetLanguage = selection
+                }
+            }
+        )
+    }
 
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
@@ -91,21 +113,14 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle(isOn: $store.voiceEndCommandEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("End dictation with a spoken word")
-                        Text("Say an end word while dictating to finish — same as releasing the key.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                Toggle("End with a spoken word", isOn: $store.voiceEndCommandEnabled)
                 if store.voiceEndCommandEnabled {
                     TextField("End words", text: $store.voiceEndCommandPhrases, prompt: Text("over,完毕"))
                 }
             } header: {
                 Label("Voice End Command", systemImage: "checkmark.circle")
             } footer: {
-                Text("Separate words with commas. Only a word at the very end of the transcript ends the session — it is also stripped from the inserted text. Works for dictation, translate, and rewrite; with a remote provider the word is removed at release.")
+                Text("Separate words with commas. The last word ends the session and isn’t inserted.")
             }
 
             Section {
@@ -169,7 +184,16 @@ struct SettingsView: View {
             }
 
             Section {
-                TextField("Target language", text: $store.translateTargetLanguage)
+                Picker("Target language", selection: targetLanguageSelection) {
+                    ForEach(Self.targetLanguages, id: \.self) { language in
+                        Text(language).tag(language)
+                    }
+                    Divider()
+                    Text("Custom").tag(Self.customTargetLanguageID)
+                }
+                if usesCustomTargetLanguage {
+                    TextField("Custom language", text: $store.translateTargetLanguage, prompt: Text("e.g. Italian"))
+                }
                 LabeledContent("Hotkey") {
                     Text(store.translateHotkeyDisplay)
                         .foregroundStyle(.secondary)
@@ -177,7 +201,7 @@ struct SettingsView: View {
             } header: {
                 Label("Voice Translation", systemImage: "translate")
             } footer: {
-                Text("Hold \(store.translateHotkeyDisplay) and speak — on release the transcript is translated into the target language (or into Chinese when it is already in it). Needs a configured LLM profile; works even when refinement is off.")
+                Text("Hold \(store.translateHotkeyDisplay) and speak. Release to translate into the target language, or back to Chinese.")
             }
 
             Section {
@@ -188,7 +212,7 @@ struct SettingsView: View {
             } header: {
                 Label("Voice Rewrite", systemImage: "wand.and.stars")
             } footer: {
-                Text("Hold \(store.rewriteHotkeyDisplay) and speak an instruction — on release the transcript is sent to the LLM as a command and the generated answer is inserted. When the focused app can't take text, the answer opens in a copyable card instead. Needs a configured LLM profile; works even when refinement is off.")
+                Text("Hold \(store.rewriteHotkeyDisplay) and speak an instruction. Release to generate and insert the answer.")
             }
 
             Section {
