@@ -144,12 +144,12 @@ final class RemoteASRRecognizer: NSObject {
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         let tapContext = AudioTapContext(sessionID: sessionID, targetFormat: targetFormat)
         // Dedicated owner-only directory (#35): raw mic audio must not sit
-        // world-visible in the shared temp root. The frame cap is the
-        // recording-duration limit (#34): at the fixed 16 kHz format it
-        // bounds the WAV, the upload, and the in-memory multipart body
-        // all at once.
-        try tempStore.ensureDirectory()
-        let writer = try RecordingFileWriter(url: tempStore.fileURL(forSessionID: sessionID), format: targetFormat, maxFrames: ResourceLimits.asrMaxRecordingFrames)
+        // world-visible in the shared temp root, and the store's flock
+        // keeps the launch sweep from reclaiming a live capture. The frame
+        // cap is the recording-duration limit (#34): at the fixed 16 kHz
+        // format it bounds the WAV, the upload, and the in-memory
+        // multipart body all at once.
+        let writer = try RecordingFileWriter(sessionID: sessionID, format: targetFormat, store: tempStore, maxFrames: ResourceLimits.asrMaxRecordingFrames)
         tapContext.fileSink = writer
         fileWriter = writer
         // Remote sessions land in History like system ones — tee the same

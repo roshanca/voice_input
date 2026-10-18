@@ -168,4 +168,52 @@ final class RecordingFileWriterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertNil(context.process(buffer: makeBuffer()))
     }
+
+    // MARK: - store-backed lock (#35)
+
+    /// Isolated store: a nonexistent legacy path keeps sweepOrphans off
+    /// the real temp root.
+    private func makeStore(dir: URL) -> RecordingTempStore {
+        RecordingTempStore(
+            directoryURL: dir,
+            legacyDirectoryURL: tempDir.url.appendingPathComponent("no-such-legacy", isDirectory: true)
+        )
+    }
+
+    /// A writer created through the store holds the flock for its whole
+    /// life: even if its file is somehow old enough to look expired, the
+    /// sweep must leave it alone while the session owns it.
+    func testStoreWriterKeepsFileLockedAgainstSweep() throws {
+        let store = makeStore(dir: tempDir.url)
+        let id = UUID()
+        var writer: RecordingFileWriter? = try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)
+        writer?.write(makeBuffer())
+        let url = store.fileURL(forSessionID: id)
+        let past = Date().addingTimeInterval(-(RecordingTempStore.orphanMaxAge + 60))
+        try FileManager.default.setAttributes(
+            [.modificationDate: past, .creationDate: past],
+            ofItemAtPath: url.path
+        )
+
+        XCTAssertEqual(store.sweepOrphans(), 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        // Dropping the writer releases the lock and cleans up anyway —
+        // the deinit fallback removes the file before the sweep could.
+        writer = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// A symlink where the recording directory should be must fail the
+    /// recording, not write audio through the link.
+    func testStoreWriterRejectsSymlinkedDirectory() throws {
+        let external = tempDir.url.appendingPathComponent("External", isDirectory: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        let dirURL = tempDir.url.appendingPathComponent("VoiceInput-ASR", isDirectory: true)
+        try FileManager.default.createSymbolicLink(atPath: dirURL.path, withDestinationPath: external.path)
+
+        let store = makeStore(dir: dirURL)
+        XCTAssertThrowsError(try RecordingFileWriter(sessionID: UUID(), format: format, store: store, maxFrames: .max))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: external.path).isEmpty)
+    }
 }

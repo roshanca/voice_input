@@ -180,9 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLogger.shared.info("Migrated LLM API keys to Keychain")
         }
         // Sweep remote-ASR recordings a previous process left behind
-        // (#35). Launch-only, and even here the store's age gate skips
-        // files young enough to belong to a live capture — so a sweep
-        // can never delete a recording still being written.
+        // (#35). Launch-only, and even here a live session's file fails
+        // the store's exclusive-flock check — a sweep can never delete
+        // a recording still being written.
         let swept = RecordingTempStore.shared.sweepOrphans()
         if swept > 0 {
             AppLogger.shared.info("Swept \(swept) orphaned remote-ASR recording(s) from temp")

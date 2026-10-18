@@ -17,6 +17,11 @@ final class RecordingFileWriter {
     /// Hard ceiling on accepted frames — the recording-duration cap that
     /// bounds the WAV on disk and the bytes loaded for upload (#34).
     private let maxFrames: UInt64
+    /// Exclusive flock on the recording, held from creation until deinit —
+    /// the launch sweep takes this lock non-blockingly before deleting, so
+    /// a file a live session still owns can never be swept out from under
+    /// it. -1 for writers created without a store (tests).
+    private var lockFD: Int32 = -1
     /// Frames actually written. Read on the main actor after finish():
     /// the tap lock's happens-before makes the count visible, and zero
     /// means capture produced nothing a server could transcribe.
@@ -29,9 +34,30 @@ final class RecordingFileWriter {
     /// report the same failure once per buffer.
     private var didLogWriteError = false
 
+    /// Production init: the file is created inside the store's validated
+    /// directory under an exclusive flock — the sweep can't reclaim it
+    /// while this writer (or the process) lives.
+    init(sessionID: UUID, format: AVAudioFormat, store: RecordingTempStore, maxFrames: UInt64) throws {
+        self.url = store.fileURL(forSessionID: sessionID)
+        self.maxFrames = maxFrames
+        self.lockFD = try store.openRecordingFileDescriptor(forSessionID: sessionID)
+        do {
+            try self.openAudioFile(format: format)
+        } catch {
+            close(lockFD)
+            lockFD = -1
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
     init(url: URL, format: AVAudioFormat, maxFrames: UInt64) throws {
         self.url = url
         self.maxFrames = maxFrames
+        try openAudioFile(format: format)
+    }
+
+    private func openAudioFile(format: AVAudioFormat) throws {
         // The .wav extension makes AVAudioFile wrap the LPCM stream in a
         // WAVE container; the explicit commonFormat/interleaved arguments
         // pin processingFormat to exactly what the tap delivers (Float32,
@@ -87,6 +113,11 @@ final class RecordingFileWriter {
     /// strand its recording. The upload path is unaffected: it still holds
     /// the writer, and its own defer removes the file first.
     deinit {
+        // Unlink while the lock is still held — after close() the sweep
+        // could take it and delete the same file (harmless, same outcome).
         try? FileManager.default.removeItem(at: url)
+        if lockFD >= 0 {
+            close(lockFD)
+        }
     }
 }
