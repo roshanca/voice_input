@@ -171,7 +171,10 @@ enum RemoteTranscriptionService {
     /// as CancellationError — the caller treats it as an expected unwind.
     /// Logging stays with the caller: this type does I/O, the recognizer
     /// decides what a failure means for the session.
-    static func transcribe(fileURL: URL, config: RemoteASRConfig, apiKey: String, language: String?) async throws -> String {
+    /// `fileName` is the multipart filename claim — the URL may be an
+    /// inode-bound `/dev/fd` path whose last component is meaningless
+    /// to a server (#35), so the convention name is passed explicitly.
+    static func transcribe(fileURL: URL, fileName: String? = nil, config: RemoteASRConfig, apiKey: String, language: String?) async throws -> String {
         // Bound the upload before loading it — `Data(contentsOf:)` pulls
         // the whole file into memory, so a recording past the ceiling is
         // refused by its on-disk size, not after allocation (#34).
@@ -181,7 +184,7 @@ enum RemoteTranscriptionService {
             throw RemoteASRError.uploadTooLarge
         }
         let fileData = try Data(contentsOf: fileURL)
-        let request = try makeRequest(config: config, apiKey: apiKey, language: language, fileName: fileURL.lastPathComponent, fileData: fileData)
+        let request = try makeRequest(config: config, apiKey: apiKey, language: language, fileName: fileName ?? fileURL.lastPathComponent, fileData: fileData)
         // One wall-clock ceiling for connect + upload + response — the
         // request's idle timeout can't stop a POST that trickles forever.
         let (data, response) = try await TotalRequestTimeout.run(seconds: ResourceLimits.asrTotalRequestDuration) {

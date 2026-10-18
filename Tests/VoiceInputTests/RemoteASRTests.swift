@@ -304,6 +304,24 @@ final class RemoteASRTests: XCTestCase {
         isolated.defaults.remoteASRModel = "   "
         XCTAssertEqual(isolated.defaults.remoteASRModel, "whisper-1")
     }
+
+    // MARK: - Quit entry (#35)
+
+    /// applicationWillTerminate calls cancelRecording — on an idle
+    /// recognizer it must be a harmless no-op: no crash, nothing deleted,
+    /// nothing written.
+    func testCancelRecordingOnIdleRecognizerIsNoOp() async throws {
+        let tempDir = try TemporaryDirectory()
+        let store = RecordingTempStore(
+            directoryURL: tempDir.url,
+            legacyDirectoryURL: tempDir.url.appendingPathComponent("no-such-legacy", isDirectory: true)
+        )
+        await MainActor.run {
+            RemoteASRRecognizer(tempStore: store).cancelRecording()
+        }
+        let contents = try FileManager.default.contentsOfDirectory(atPath: tempDir.url.path)
+        XCTAssertTrue(contents.filter { $0 != "no-such-legacy" }.isEmpty)
+    }
 }
 
 private extension Data {
