@@ -127,6 +127,16 @@ final class LogRedactorTests: XCTestCase {
         XCTAssertFalse(out.contains("word"))
     }
 
+    /// A `secret=value` hit inside userinfo must not eat the "@" that
+    /// bounds it — userinfo masks before the generic patterns run, so no
+    /// credential prefix survives.
+    func testSecretPatternInsideUserinfoMasksWhole() {
+        XCTAssertEqual(
+            LogRedactor.redactText("POST https://alice:prefix-token=abc@gw.example.com/v1 failed"),
+            "POST https://\(LogRedactor.placeholder)@gw.example.com/v1 failed"
+        )
+    }
+
     /// A URL without userinfo must survive text redaction untouched.
     func testURLWithoutUserinfoIsUntouched() {
         XCTAssertEqual(
@@ -294,6 +304,23 @@ final class LogRedactorTests: XCTestCase {
         let logs = AppLogger.shared.formattedLogs()
         XCTAssertTrue(logs.contains("https://\(LogRedactor.placeholder) failed"))
         XCTAssertTrue(logs.contains("https://\(LogRedactor.placeholder)@gw.example.com/v1 failed"))
+    }
+
+    /// Regression for the round-3 review: `token=abc` inside userinfo
+    /// used to be eaten by the generic secret pattern first, taking the
+    /// "@" boundary with it and leaving `alice:prefix-token=` standing.
+    /// With userinfo masked first, the whole credential span collapses.
+    @MainActor
+    func testSecretPatternInsideUserinfoKeepsBoundary() {
+        AppLogger.shared.clear()
+        AppLogger.shared.error("POST https://alice:prefix-token=abc@gw.example.com/v1 failed")
+
+        for surface in [AppLogger.shared.formattedLogs(), DiagnosticsExporter.makeReport()] {
+            XCTAssertFalse(surface.contains("alice"), surface)
+            XCTAssertFalse(surface.contains("prefix"), surface)
+            XCTAssertFalse(surface.contains("abc"), surface)
+            XCTAssertTrue(surface.contains("https://\(LogRedactor.placeholder)@gw.example.com/v1"), surface)
+        }
     }
 
     func testHomeDirectoryIsShortened() {

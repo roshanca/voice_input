@@ -54,10 +54,14 @@ enum LogRedactor {
         return sensitiveKeyWords.contains { normalized.hasSuffix($0) }
     }
 
-    /// Scrubs secrets embedded in free-text messages — key=value secrets,
-    /// bearer headers, URL userinfo — and shortens home paths.
+    /// Scrubs secrets embedded in free-text messages — URL userinfo,
+    /// key=value secrets, bearer headers — and shortens home paths.
     static func redactText(_ text: String) -> String {
-        var output = text
+        // Userinfo masks FIRST: a `secret=value` pattern hit inside
+        // `user:pass token=x@host` would otherwise swallow the "@" plus
+        // everything after it, and the sweep would find no boundary —
+        // leaving the credentials' prefix standing.
+        var output = scrubURLUserinfo(text)
         for pattern in compiledPatterns {
             output = pattern.stringByReplacingMatches(
                 in: output,
@@ -65,7 +69,6 @@ enum LogRedactor {
                 withTemplate: "$1\(placeholder)"
             )
         }
-        output = scrubURLUserinfo(output)
         let home = NSHomeDirectory()
         if !home.isEmpty {
             output = output.replacingOccurrences(of: home, with: "~")
