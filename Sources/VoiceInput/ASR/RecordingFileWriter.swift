@@ -144,14 +144,19 @@ final class RecordingFileWriter {
 
     /// Identity-checked removal: store-backed writers unlink through the
     /// pinned directory only while `name` still binds the locked inode —
-    /// a planted lookalike is left untouched. Path-based removal is the
-    /// store-less (test) fallback only.
+    /// a planted lookalike is left untouched. And a store writer whose
+    /// lock fd is -1 never got a recording from the store (the open threw
+    /// — rejected dir, or the name is locked by another live session), so
+    /// it removes nothing at all: path-deleting then would unlink a
+    /// planted sentinel or somebody else's locked file. The path remove
+    /// is the store-less (test) fallback only.
     private func removeRecording() {
-        if let store, lockFD >= 0 {
-            store.removeRecordingFile(named: name, lockedFD: lockFD)
-        } else {
+        guard let store else {
             try? FileManager.default.removeItem(at: url)
+            return
         }
+        guard lockFD >= 0 else { return }
+        store.removeRecordingFile(named: name, lockedFD: lockFD)
     }
 
     /// Last-resort cleanup (#35): a writer released without a finish→upload

@@ -273,4 +273,45 @@ final class RecordingFileWriterTests: XCTestCase {
             atPath: moved.appendingPathComponent(RecordingTempStore.fileName(forSessionID: id)).path
         ))
     }
+
+    /// A failed init still runs deinit (all stored props are set before
+    /// the throwing store open). With the dir a symlink to an external
+    /// dir that holds a same-named sentinel, the rejected init's cleanup
+    /// must not path-delete the sentinel — nothing was handed to us, so
+    /// nothing is ours to remove.
+    func testRejectedInitLeavesSentinelFileAlone() throws {
+        let external = tempDir.url.appendingPathComponent("External", isDirectory: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: false)
+        let id = UUID()
+        let sentinel = external.appendingPathComponent(RecordingTempStore.fileName(forSessionID: id))
+        try Data("sentinel".utf8).write(to: sentinel)
+        let dirURL = tempDir.url.appendingPathComponent("VoiceInput-ASR", isDirectory: true)
+        try FileManager.default.createSymbolicLink(atPath: dirURL.path, withDestinationPath: external.path)
+
+        let store = makeStore(dir: dirURL)
+        XCTAssertThrowsError(try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)) { error in
+            XCTAssertEqual(error as? RecordingTempStoreError, .insecureDirectory)
+        }
+        XCTAssertEqual(try String(contentsOf: sentinel), "sentinel")
+    }
+
+    /// Lock conflict on init: session A holds the recording's flock, so
+    /// session B's same-ID init throws `recordingLocked`. B's deinit ran
+    /// with lockFD == -1 — it must leave A's recording on disk, not
+    /// remove it by path.
+    func testLockConflictedInitLeavesActiveRecordingAlone() throws {
+        let dirURL = tempDir.url.appendingPathComponent("VoiceInput-ASR", isDirectory: true)
+        let store = makeStore(dir: dirURL)
+        let id = UUID()
+        let writerA = try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)
+        writerA.write(makeBuffer())
+
+        XCTAssertThrowsError(try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)) { error in
+            XCTAssertEqual(error as? RecordingTempStoreError, .recordingLocked)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.fileURL(forSessionID: id).path))
+
+        writerA.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.fileURL(forSessionID: id).path))
+    }
 }
