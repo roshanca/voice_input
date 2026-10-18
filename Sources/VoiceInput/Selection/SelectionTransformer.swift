@@ -60,13 +60,33 @@ final class SelectionTransformer {
     }
 
     private var task: Task<Void, Never>?
+    /// Identity of the request allowed to invoke callbacks. A new `transform`
+    /// restamps it before superseding the old task and `cancel()` clears it —
+    /// either way a stale task's late events (a partial, a failure, even a
+    /// URLError.cancelled surfacing as a generic error) find a mismatched or
+    /// absent identity and drop before reaching the caller.
+    private var currentRequestID: UUID?
+
+    private let overrideConfig: LLMConfig?
+    /// Explicit key for ad-hoc configs (e.g. testing an unsaved profile);
+    /// otherwise the key is resolved from the Keychain by config id.
+    private let apiKeyOverride: String?
+    /// Streaming request transport — injectable so tests can drive scripted
+    /// cancellation races without touching the network.
+    private let session: URLSession
+
+    init(config: LLMConfig? = nil, apiKeyOverride: String? = nil, session: URLSession = .shared) {
+        self.overrideConfig = config
+        self.apiKeyOverride = apiKeyOverride
+        self.session = session
+    }
 
     private var config: LLMConfig {
-        UserDefaults.standard.currentLLMConfig ?? LLMConfig.default
+        overrideConfig ?? UserDefaults.standard.currentLLMConfig ?? LLMConfig.default
     }
 
     private var resolvedAPIKey: String {
-        KeychainHelper.key(for: config.id)
+        apiKeyOverride ?? KeychainHelper.key(for: config.id)
     }
 
     var isConfigured: Bool {
@@ -78,14 +98,20 @@ final class SelectionTransformer {
     /// arrives; `completion` fires exactly once with the trimmed result or
     /// the failure — except after `cancel()`, which fires neither (the
     /// caller treats cancellation as the end of the press, same contract as
-    /// the refiner's dropped callbacks).
+    /// the refiner's dropped callbacks). `requestID` binds every callback
+    /// of this request to the caller's current press — callbacks for a
+    /// superseded or cancelled id are dropped.
     ///
     /// A new call supersedes a request still in flight: the old task is
     /// cancelled so its late result can't inject text after the user has
     /// already re-pressed with a different selection.
-    func transform(kind: Kind, text: String,
+    func transform(kind: Kind, text: String, requestID: UUID,
                    onPartial: @escaping (String) -> Void,
                    completion: @escaping (Result<String, Error>) -> Void) {
+        // Restamp identity BEFORE cancelling the in-flight task: the old
+        // task can still run callbacks while it unwinds, and they must
+        // already read as stale.
+        currentRequestID = requestID
         task?.cancel()
         task = nil
         guard isConfigured else {
@@ -138,9 +164,10 @@ final class SelectionTransformer {
         request.timeoutInterval = 15
 
         AppLogger.shared.info("Selection transform started (\(kind)) — streaming request to \(urlString)")
-        let requestTask = Task {
+        let requestTask = Task { [weak self] in
+            guard let self else { return }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                let (bytes, response) = try await self.session.bytes(for: request)
 
                 if let httpResponse = response as? HTTPURLResponse {
                     AppLogger.shared.info("Selection transform HTTP status: \(httpResponse.statusCode)")
@@ -151,6 +178,7 @@ final class SelectionTransformer {
                             if bodyString.count > 2000 { break }
                         }
                         AppLogger.shared.error("Selection transform failed — status: \(httpResponse.statusCode), body: \(bodyString)", sensitive: true)
+                        guard self.isLive(requestID) else { return }
                         completion(.failure(SelectionTransformError.httpStatus(httpResponse.statusCode)))
                         return
                     }
@@ -169,10 +197,17 @@ final class SelectionTransformer {
                           let delta = first["delta"] as? [String: Any],
                           let content = delta["content"] as? String else { continue }
                     accumulated += content
+                    // A late partial from a superseded/cancelled request
+                    // must not reach the caller's panel.
+                    guard self.isLive(requestID) else { return }
                     onPartial(accumulated)
                 }
 
                 let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Final delivery gate: identity and cancellation are
+                // re-checked so a stale request can never resolve the
+                // caller's in-flight state or inject its result.
+                guard self.isLive(requestID) else { return }
                 guard !trimmed.isEmpty else {
                     AppLogger.shared.warning("Selection transform returned empty content")
                     completion(.failure(SelectionTransformError.emptyResponse))
@@ -182,6 +217,15 @@ final class SelectionTransformer {
             } catch is CancellationError {
                 AppLogger.shared.info("Selection transform canceled")
             } catch {
+                // URLSession reports a cancelled load as URLError.cancelled
+                // (-999), not CancellationError — either shape is a cancel,
+                // which fires no completion. A genuine error reports only
+                // while this request is still the live one.
+                guard !Task.isCancelled, (error as? URLError)?.code != .cancelled else {
+                    AppLogger.shared.info("Selection transform canceled")
+                    return
+                }
+                guard self.isLive(requestID) else { return }
                 AppLogger.shared.error("Selection transform error: \(error.localizedDescription)")
                 completion(.failure(error))
             }
@@ -192,9 +236,20 @@ final class SelectionTransformer {
         TrackedTaskStore.shared.track(requestTask, label: "selection-transform")
     }
 
+    /// A request is live only while it is the identity the caller waits on
+    /// and its task hasn't been asked to cancel — the first half catches a
+    /// superseded request, the second a cancelled one whose awaits haven't
+    /// unwound yet.
+    private func isLive(_ requestID: UUID) -> Bool {
+        currentRequestID == requestID && !Task.isCancelled
+    }
+
     /// Cancellation is a request, not completion: the tracked task stays
-    /// observable in TrackedTaskStore until its body actually exits.
+    /// observable in TrackedTaskStore until its body actually exits. Identity
+    /// is cleared BEFORE cancel() so a callback fired during the unwind
+    /// finds no live request and drops.
     func cancel() {
+        currentRequestID = nil
         task?.cancel()
         task = nil
     }

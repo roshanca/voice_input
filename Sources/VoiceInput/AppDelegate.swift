@@ -148,8 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case fellBack
     }
     private var selectionPresses: [HotkeyBusiness: SelectionPressState] = [:]
-    /// A translate/rewrite request is in flight — Esc should cancel it.
-    private var selectionTransformInFlight = false
+    /// Identity of the in-flight translate/rewrite request — non-nil means
+    /// Esc should cancel it. Callbacks arriving for any other id are stale
+    /// and dropped, so a superseded or cancelled request can't clear the
+    /// state its successor is still using.
+    private var selectionTransformRequestID: UUID?
 
     /// Whether Esc currently means "cancel in-flight work": recording,
     /// awaiting the final result, refining, delivering, transforming a
@@ -158,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the keypress belongs to us or to the focused app.
     private var isSessionActive: Bool {
         isHotkeyHeld || activeSession != nil || pendingSession != nil
-            || inFlightInjections > 0 || selectionTransformInFlight
+            || inFlightInjections > 0 || selectionTransformRequestID != nil
             || answerCard.isShowing
     }
 
@@ -824,9 +827,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pendingSession = nil
             discardSessionAudio(pending.id)
         }
-        if selectionTransformInFlight {
+        if selectionTransformRequestID != nil {
+            // Invalidate identity before cancelling: the unwinding task can
+            // still fire a last callback, and it must find nothing to match.
+            selectionTransformRequestID = nil
             selectionTransformer.cancel()
-            selectionTransformInFlight = false
         }
         speechRecognizer.cancelRecording()
         // Cancels the remote path's capture AND its in-flight upload; a
@@ -963,23 +968,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             flashIfPanelFree("Set up an LLM profile to use selection actions")
             return
         }
-        selectionTransformInFlight = true
+        let requestID = UUID()
+        selectionTransformRequestID = requestID
         syncEscapeInterception()
         floatingPanel.setText(kind.progressLabel)
         floatingPanel.show()
         AppLogger.shared.info("Selection transform started: \(kind)", metadata: ["selection": SensitiveLogValue(text)])
-        selectionTransformer.transform(kind: kind, text: text, onPartial: { [weak self] partial in
+        selectionTransformer.transform(kind: kind, text: text, requestID: requestID, onPartial: { [weak self] partial in
             // A dictation started mid-request owns the panel — don't let
-            // late tokens overwrite its live transcript.
-            guard let self, !self.isHotkeyHeld, self.activeSession == nil, self.pendingSession == nil else { return }
+            // late tokens overwrite its live transcript; a superseded
+            // request's tokens are dropped outright.
+            guard let self, self.selectionTransformRequestID == requestID,
+                  !self.isHotkeyHeld, self.activeSession == nil, self.pendingSession == nil else { return }
             self.floatingPanel.setText(partial)
         }, completion: { [weak self] result in
-            self?.selectionTransformCompleted(kind: kind, result: result, target: target)
+            self?.selectionTransformCompleted(kind: kind, result: result, target: target, requestID: requestID)
         })
     }
 
-    private func selectionTransformCompleted(kind: SelectionTransformer.Kind, result: Result<String, Error>, target: DictationTarget?) {
-        selectionTransformInFlight = false
+    private func selectionTransformCompleted(kind: SelectionTransformer.Kind, result: Result<String, Error>, target: DictationTarget?, requestID: UUID) {
+        // Only the live request resolves in-flight state — a superseded or
+        // cancelled request's late completion must not release Esc
+        // interception while its successor is still running.
+        guard selectionTransformRequestID == requestID else {
+            AppLogger.shared.info("Dropped stale selection-transform completion")
+            return
+        }
+        selectionTransformRequestID = nil
         switch result {
         case .success(let text):
             AppLogger.shared.info("Selection transform finished (\(kind)) — injecting", metadata: ["output": SensitiveLogValue(text)])
