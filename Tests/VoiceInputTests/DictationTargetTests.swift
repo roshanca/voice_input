@@ -78,9 +78,66 @@ final class DictationTargetTests: XCTestCase {
     }
 
     /// The explicit per-app opt-in stands the verdict down to app-level
-    /// checks — which still pass here, so delivery may proceed.
+    /// checks — which still pass here, so delivery may proceed. The
+    /// allowlisted path still performs the focus probe: an exhausted
+    /// script answers `.cannotComplete`, i.e. the outcome is a waived
+    /// "cannot verify", not a skipped check.
     func testAllowlistedAppWithMissingFocusPasses() {
         XCTAssertNil(mismatch(target(allowlisted: true), focusReads: []))
+    }
+
+    /// Reviewer finding on 7e3acb5: with no captured token the waiver
+    /// must still probe the current focus — a definitive `.noValue`
+    /// ("focus is nowhere") is positive evidence and blocks at the
+    /// pre-paste gate, not just "cannot verify".
+    func testAllowlistedNoTokenNoValueBlocksPrePaste() {
+        let target = target(allowlisted: true)
+        var readCount = 0
+        let verdict = target.mismatch(
+            appIsAlive: { _ in true },
+            frontmostPID: { self.pid },
+            fetchFocusedElement: {
+                readCount += 1
+                return (nil, .noValue)
+            }
+        )
+        XCTAssertEqual(verdict, .focusedElementChanged)
+        XCTAssertEqual(readCount, 1)
+    }
+
+    /// Same `.noValue` contract at the pre-Return gate — the
+    /// `includeGeometry: false` validation must not pass either.
+    func testAllowlistedNoTokenNoValueBlocksPreReturn() {
+        let target = target(allowlisted: true)
+        XCTAssertEqual(
+            mismatch(target, includeGeometry: false, focusReads: [(nil, .noValue)]),
+            .focusedElementChanged
+        )
+    }
+
+    /// A successful-but-empty read is the same definitive "nothing
+    /// focused" answer as `.noValue` — still blocked.
+    func testAllowlistedNoTokenEmptyAnswerBlocks() {
+        let target = target(allowlisted: true)
+        XCTAssertEqual(
+            mismatch(target, focusReads: [(nil, .success)]),
+            .focusedElementChanged
+        )
+    }
+
+    /// Still unreadable at delivery — precisely the "cannot verify" the
+    /// user opted into: allowed.
+    func testAllowlistedNoTokenReadErrorPasses() {
+        let target = target(allowlisted: true)
+        XCTAssertNil(mismatch(target, focusReads: [(nil, .cannotComplete)]))
+    }
+
+    /// Focus is somewhere — an element exists even though its identity
+    /// can't be checked: allowed.
+    func testAllowlistedNoTokenFocusPresentPasses() {
+        let target = target(allowlisted: true)
+        let read = probe(FakeToken()) { self.evidence(identifier: "field") }
+        XCTAssertNil(mismatch(target, focusReads: [read]))
     }
 
     /// The allowlist waives "cannot verify focus" — never "wrong app".

@@ -94,8 +94,9 @@ struct DictationTarget {
     /// The user's explicit per-app opt-in for unverifiable-focus delivery
     /// (#31), resolved at capture time so a mid-flight settings change
     /// can't retroactively trust a target. The waiver covers "cannot
-    /// verify" outcomes only — positive evidence that focus moved still
-    /// blocks, and app identity is always re-checked.
+    /// verify" outcomes only — a definitive "focus is nowhere" answer and
+    /// positive evidence that focus moved still block, and app identity
+    /// is always re-checked.
     let allowsUnverifiedFocus: Bool
 
     /// Direct initializer — production builds targets through `capture`;
@@ -244,12 +245,29 @@ struct DictationTarget {
         return appLevelMismatch()
     }
 
+    /// Validation for a capture that never got an element token.
+    /// Unverifiable unless the user allowlisted this app — and even then
+    /// the current focus is still probed once: a definitive "focus is
+    /// nowhere" answer (`.noValue`, or a successful-but-empty read) is
+    /// positive evidence the waiver does not cover. An unreadable answer
+    /// is exactly the "cannot verify" the user opted into; an element
+    /// being present means focus is somewhere, which is all the waiver
+    /// asks.
+    private func unverifiableCaptureMismatch(read: () -> FocusRead) -> Mismatch? {
+        guard allowsUnverifiedFocus else { return .unverifiable }
+        let (current, error) = read()
+        if current != nil, error == .success { return nil }
+        return error == .noValue || error == .success
+            ? .focusedElementChanged
+            : .unverifiable
+    }
+
     /// The element-level half of validation: re-read the focused element
     /// until one read confirms itself. A capture without an element token
-    /// is unverifiable — there is nothing to compare against; whether the
-    /// app's allowlist entry stands that down is the caller's decision.
+    /// resolves through `unverifiableCaptureMismatch` — an allowlist
+    /// waiver never skips the current-focus probe entirely.
     private func focusMismatch(read: () -> FocusRead, includeGeometry: Bool) -> Mismatch? {
-        guard let captured = focusToken else { return .unverifiable }
+        guard let captured = focusToken else { return unverifiableCaptureMismatch(read: read) }
 
         let (fetched, fetchError) = read()
         guard var current = fetched else { return Self.fetchMismatch(fetchError) }
