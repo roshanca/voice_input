@@ -274,6 +274,10 @@ final class RemoteASRRecognizer: NSObject {
 
         guard writer.totalFrames > 0 else {
             try? FileManager.default.removeItem(at: writer.url)
+            // Logged here, once — the delegate callback does no error
+            // logging of its own (see #32: failure lines live at their
+            // origin, the delegate only drives session/panel state).
+            AppLogger.shared.error("Remote ASR capture produced zero audio frames — nothing to upload")
             delegate?.remoteASRRecognizer(self, didFailWithError: RemoteASRError.noAudioCaptured, sessionID: sessionID)
             return false
         }
@@ -282,7 +286,7 @@ final class RemoteASRRecognizer: NSObject {
         // path reads profile keys at submit time.
         let apiKey = KeychainHelper.key(account: RemoteASRConfig.keychainAccount)
         let language = languageHint.flatMap(RemoteTranscriptionService.languageParameter(for:))
-        AppLogger.shared.info("Remote ASR upload started — baseURL: \(config.baseURL), model: \(config.model), language: \(language ?? "auto")")
+        AppLogger.shared.info("Remote ASR upload started — baseURL: \(LogRedactor.sanitizedURL(config.baseURL)), model: \(config.model), language: \(language ?? "auto")")
 
         let task = Task { [weak self] in
             // The temp recording is removed on every exit — success,
@@ -302,7 +306,14 @@ final class RemoteASRRecognizer: NSObject {
                 AppLogger.shared.info("Remote ASR upload canceled")
             } catch {
                 guard let self, self.sessionID == sessionID else { return }
-                AppLogger.shared.error("Remote ASR upload failed: \(error.localizedDescription)")
+                // The stable code is the log line; `localizedDescription`
+                // for .httpStatus embeds the server's own message — body
+                // echo that must stay out of logs — so it rides as a
+                // SensitiveLogValue and renders as <redacted> (#32).
+                AppLogger.shared.error("Remote ASR upload failed", metadata: [
+                    "errorCode": LogRedactor.errorCode(error),
+                    "detail": SensitiveLogValue(error.localizedDescription)
+                ])
                 self.delegate?.remoteASRRecognizer(self, didFailWithError: error, sessionID: sessionID)
             }
         }

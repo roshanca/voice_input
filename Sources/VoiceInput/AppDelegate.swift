@@ -1365,10 +1365,11 @@ extension AppDelegate: SpeechRecognizerDelegate {
 
     func speechRecognizer(_ recognizer: SpeechRecognizer, didFailWithError error: Error, sessionID: UUID) {
         guard activeSession?.id == sessionID else {
-            AppLogger.shared.debug("Dropped stale recognition error from a previous session: \(error.localizedDescription)")
+            AppLogger.shared.debug("Dropped stale recognition error from a previous session", metadata: ["errorCode": LogRedactor.errorCode(error)])
             return
         }
-        AppLogger.shared.error("Speech recognition error: \(error.localizedDescription)")
+        // No error log here — the recognizer already logged the failure at
+        // its origin; a second line only duplicated it (#32).
         if isHotkeyHeld {
             floatingPanel.setText("Error: \(error.localizedDescription)")
         }
@@ -1404,10 +1405,12 @@ extension AppDelegate: RemoteASRRecognizerDelegate {
 
     func remoteASRRecognizer(_ recognizer: RemoteASRRecognizer, didFailWithError error: Error, sessionID: UUID) {
         guard var session = activeSession, session.id == sessionID else {
-            AppLogger.shared.debug("Dropped stale remote-ASR error from a previous session: \(error.localizedDescription)")
+            AppLogger.shared.debug("Dropped stale remote-ASR error from a previous session", metadata: ["errorCode": LogRedactor.errorCode(error)])
             return
         }
-        AppLogger.shared.error("Remote ASR error: \(error.localizedDescription)")
+        // No error log here — the recognizer logs each failure once at its
+        // origin. Re-logging `localizedDescription` also echoed remote
+        // response bodies into ordinary logs (#32).
         if isHotkeyHeld {
             // Mid-record failure (e.g. the input route died): surface it
             // the way the system path does, and flag the session so the

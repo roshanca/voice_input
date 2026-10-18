@@ -143,7 +143,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; writes no history. Caller-stamped `requestID` gates every callback: identity is restamped/cleared before `task.cancel()`, and partial/failure/success emissions re-check it plus `Task.isCancelled` — `URLError.cancelled` counts as a cancel, never a failure. `config`/`session` injectable for the scripted-URLProtocol tests |
 | `Selection/SelectionPrompts.swift` | Whole-instruction system prompts for the transforms — the selection itself is the user message |
 | `TrackedTaskStore.swift` | Retains tasks (incl. cancelled) until actual exit; drained in `applicationWillTerminate`. **Cancellation ≠ release** |
-| `AppLogger.swift` + `LogRedactor.swift` | In-memory ring buffer; all lines redacted before storage (sensitive-key suffix match + `SensitiveLogValue` + free-text secret scrub + `~` home shortening) |
+| `AppLogger.swift` + `LogRedactor.swift` | In-memory ring buffer; all lines redacted before storage (sensitive-key suffix match + `SensitiveLogValue` + free-text secret/userinfo scrub + `~` home shortening); endpoint URLs log via `sanitizedURL` (scheme/host/port + allowlisted path/query, userinfo never), failures via stable `errorCode` — server bodies and `localizedDescription` echo never reach a line |
 | `DiagnosticsExporter.swift` | `NSSavePanel` export: version, OS, permission tri-state, redacted logs |
 | `LogsWindow.swift` | AppKit log viewer + export button |
 | `Storage/DictionaryStore.swift` | Custom dictionary; `DictionaryRules` pure replacements (unit-tested) |
