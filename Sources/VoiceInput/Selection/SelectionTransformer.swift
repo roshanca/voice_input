@@ -95,18 +95,21 @@ final class SelectionTransformer {
     }
 
     /// Streaming transform: `onPartial` reports accumulated text as it
-    /// arrives; `completion` fires exactly once with the trimmed result or
-    /// the failure — except after `cancel()`, which fires neither (the
-    /// caller treats cancellation as the end of the press, same contract as
-    /// the refiner's dropped callbacks). `requestID` binds every callback
-    /// of this request to the caller's current press — callbacks for a
-    /// superseded or cancelled id are dropped.
+    /// arrives — the sink is `@Sendable async` because the exchange runs on
+    /// a nonisolated task and emissions hop back to this actor for the
+    /// identity gate; `completion` fires exactly once on the MainActor with
+    /// the trimmed result or the failure — except after `cancel()`, which
+    /// fires neither (the caller treats cancellation as the end of the
+    /// press, same contract as the refiner's dropped callbacks).
+    /// `requestID` binds every callback of this request to the caller's
+    /// current press — callbacks for a superseded or cancelled id are
+    /// dropped.
     ///
     /// A new call supersedes a request still in flight: the old task is
     /// cancelled so its late result can't inject text after the user has
     /// already re-pressed with a different selection.
     func transform(kind: Kind, text: String, requestID: UUID,
-                   onPartial: @escaping (String) -> Void,
+                   onPartial: @escaping @Sendable (String) async -> Void,
                    completion: @escaping (Result<String, Error>) -> Void) {
         // Restamp identity BEFORE cancelling the in-flight task: the old
         // task can still run callbacks while it unwinds, and they must
@@ -167,58 +170,42 @@ final class SelectionTransformer {
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let (bytes, response) = try await self.session.bytes(for: request)
+                // Same resource ceilings as the refiner's stream (#34) —
+                // connect, headers, and the body inside one wall-clock
+                // race that cancels the stream-owning task when it fires.
+                // The injected session stays the transport so scripted
+                // cancellation tests still drive this path.
+                let outcome = try await SSEStreamExchange.run(
+                    request: request,
+                    seconds: ResourceLimits.llmTotalRequestDuration,
+                    session: self.session
+                ) { partial in
+                    await self.deliverPartial(partial, requestID: requestID, onPartial: onPartial)
+                }
 
-                if let httpResponse = response as? HTTPURLResponse {
-                    AppLogger.shared.info("Selection transform HTTP status: \(httpResponse.statusCode)")
-                    guard (200...299).contains(httpResponse.statusCode) else {
-                        var bodyString = ""
-                        for try await line in bytes.lines {
-                            bodyString += line
-                            if bodyString.count > 2000 { break }
-                        }
-                        // Same shape as the refiner's: status stays
-                        // visible, the untrusted body is withheld.
-                        AppLogger.shared.error("Selection transform failed", metadata: [
-                            "statusCode": httpResponse.statusCode,
-                            "body": SensitiveLogValue(bodyString)
-                        ])
-                        guard self.isLive(requestID) else { return }
-                        completion(.failure(SelectionTransformError.httpStatus(httpResponse.statusCode)))
+                switch outcome {
+                case .httpError(let statusCode, let bodyString):
+                    // Same shape as the refiner's: status stays visible,
+                    // the untrusted body is withheld (#32).
+                    AppLogger.shared.error("Selection transform failed", metadata: [
+                        "statusCode": statusCode,
+                        "body": SensitiveLogValue(bodyString)
+                    ])
+                    guard self.isLive(requestID) else { return }
+                    completion(.failure(SelectionTransformError.httpStatus(statusCode)))
+                case .completed(let accumulated):
+                    let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Final delivery gate: identity and cancellation are
+                    // re-checked so a stale request can never resolve the
+                    // caller's in-flight state or inject its result.
+                    guard self.isLive(requestID) else { return }
+                    guard !trimmed.isEmpty else {
+                        AppLogger.shared.warning("Selection transform returned empty content")
+                        completion(.failure(SelectionTransformError.emptyResponse))
                         return
                     }
+                    completion(.success(trimmed))
                 }
-
-                var accumulated = ""
-                for try await line in bytes.lines {
-                    try Task.checkCancellation()
-                    guard line.hasPrefix("data:") else { continue }
-                    let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    if payload == "[DONE]" { break }
-                    guard let payloadData = payload.data(using: .utf8),
-                          let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                          let choices = json["choices"] as? [[String: Any]],
-                          let first = choices.first,
-                          let delta = first["delta"] as? [String: Any],
-                          let content = delta["content"] as? String else { continue }
-                    accumulated += content
-                    // A late partial from a superseded/cancelled request
-                    // must not reach the caller's panel.
-                    guard self.isLive(requestID) else { return }
-                    onPartial(accumulated)
-                }
-
-                let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
-                // Final delivery gate: identity and cancellation are
-                // re-checked so a stale request can never resolve the
-                // caller's in-flight state or inject its result.
-                guard self.isLive(requestID) else { return }
-                guard !trimmed.isEmpty else {
-                    AppLogger.shared.warning("Selection transform returned empty content")
-                    completion(.failure(SelectionTransformError.emptyResponse))
-                    return
-                }
-                completion(.success(trimmed))
             } catch is CancellationError {
                 AppLogger.shared.info("Selection transform canceled")
             } catch {
@@ -239,6 +226,17 @@ final class SelectionTransformer {
         // A cancelled request keeps running until its awaits unwind — track
         // it so shutdown observes the real exit (cancellation ≠ completion).
         TrackedTaskStore.shared.track(requestTask, label: "selection-transform")
+    }
+
+    /// MainActor hop target for coalesced partials — the exchange consumes
+    /// bytes off-actor, so emissions rejoin here for the identity gate
+    /// before reaching the caller's sink.
+    private func deliverPartial(_ text: String, requestID: UUID,
+                                onPartial: @Sendable (String) async -> Void) async {
+        // A late partial from a superseded/cancelled request must not
+        // reach the caller's panel.
+        guard isLive(requestID) else { return }
+        await onPartial(text)
     }
 
     /// A request is live only while it is the identity the caller waits on

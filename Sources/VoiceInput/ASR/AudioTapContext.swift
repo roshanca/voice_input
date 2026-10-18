@@ -32,6 +32,9 @@ final class AudioTapContext: @unchecked Sendable {
         var audioWriter: HistoryAudioWriter?
         var converter: AVAudioConverter?
         var rmsLogCounter = 0
+        /// Mirrors the file sink's `reachedLimit` latch so the remote
+        /// recognizer can fail an over-cap session (#34).
+        var fileSinkLimitReached = false
         /// Flipped by stopRecording/teardown: drained or in-flight buffers
         /// are dropped instead of touching released state.
         var active = true
@@ -56,6 +59,14 @@ final class AudioTapContext: @unchecked Sendable {
     var fileSink: RecordingFileWriter? {
         get { state.withLock { $0.fileSink } }
         set { state.withLock { $0.fileSink = newValue } }
+    }
+
+    /// Latched when the file sink rejected a buffer for exceeding its frame
+    /// cap — polled by the remote recognizer's tap so an over-limit
+    /// recording fails the session instead of silently truncating the
+    /// upload (#34).
+    var fileSinkLimitReached: Bool {
+        state.withLock { $0.fileSinkLimitReached }
     }
 
     /// Set once from the main actor right after the context is created.
@@ -155,6 +166,9 @@ final class AudioTapContext: @unchecked Sendable {
             logDebug("Converted buffer frameLength: \(convertedBuffer.frameLength)")
             state.request?.append(convertedBuffer)
             state.fileSink?.write(convertedBuffer)
+            if state.fileSink?.reachedLimit == true {
+                state.fileSinkLimitReached = true
+            }
             // The clip tees exactly what the recognizer was fed — same
             // buffer, same format, so playback matches the transcript.
             state.audioWriter?.write(convertedBuffer)

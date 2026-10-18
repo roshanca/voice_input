@@ -175,7 +175,7 @@ final class SelectionTransformerTests: XCTestCase {
 
     /// Callback sink for one transform call. Transform callbacks run on the
     /// main actor like the class itself — a plain log is safe.
-    private final class CallbackLog {
+    private final class CallbackLog: @unchecked Sendable {
         var partials: [String] = []
         var results: [Result<String, Error>] = []
     }

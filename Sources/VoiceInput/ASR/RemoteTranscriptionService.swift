@@ -23,6 +23,12 @@ enum RemoteASRError: LocalizedError, Equatable {
     /// The input route died mid-capture — the recording would be
     /// truncated, so the session fails instead of uploading partial audio.
     case audioDeviceChanged
+    /// The recording hit the duration cap mid-capture — the session fails
+    /// rather than uploading a truncated file (#34).
+    case recordingTooLong
+    /// The WAV on disk passed the upload ceiling — refused before it is
+    /// loaded into memory (#34).
+    case uploadTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -44,6 +50,10 @@ enum RemoteASRError: LocalizedError, Equatable {
             return "Microphone access denied. Please enable it in System Settings → Privacy & Security → Microphone."
         case .audioDeviceChanged:
             return "Audio input device changed. Please try again."
+        case .recordingTooLong:
+            return "Recording exceeded the maximum length."
+        case .uploadTooLarge:
+            return "Recording is too large to upload."
         }
     }
 
@@ -59,6 +69,8 @@ enum RemoteASRError: LocalizedError, Equatable {
         case .noAudioCaptured: return "noAudioCaptured"
         case .microphoneDenied: return "microphoneDenied"
         case .audioDeviceChanged: return "audioDeviceChanged"
+        case .recordingTooLong: return "recordingTooLong"
+        case .uploadTooLarge: return "uploadTooLarge"
         }
     }
 }
@@ -149,14 +161,34 @@ enum RemoteTranscriptionService {
         return message
     }
 
+    /// True while `fileSize` stays under the upload ceiling — pure so the
+    /// policy is testable without touching the filesystem or network.
+    static func isUploadSizeAllowed(_ fileSize: Int64) -> Bool {
+        fileSize <= Int64(ResourceLimits.asrMaxUploadBytes)
+    }
+
     /// POST the recording and return the transcript. Cancellation surfaces
     /// as CancellationError — the caller treats it as an expected unwind.
     /// Logging stays with the caller: this type does I/O, the recognizer
     /// decides what a failure means for the session.
     static func transcribe(fileURL: URL, config: RemoteASRConfig, apiKey: String, language: String?) async throws -> String {
+        // Bound the upload before loading it — `Data(contentsOf:)` pulls
+        // the whole file into memory, so a recording past the ceiling is
+        // refused by its on-disk size, not after allocation (#34).
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard isUploadSizeAllowed(fileSize) else {
+            throw RemoteASRError.uploadTooLarge
+        }
         let fileData = try Data(contentsOf: fileURL)
         let request = try makeRequest(config: config, apiKey: apiKey, language: language, fileName: fileURL.lastPathComponent, fileData: fileData)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // One wall-clock ceiling for connect + upload + response — the
+        // request's idle timeout can't stop a POST that trickles forever.
+        let (data, response) = try await TotalRequestTimeout.run(seconds: ResourceLimits.asrTotalRequestDuration) {
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            let body = try await BoundedBodyReader.collect(from: bytes, maxBytes: ResourceLimits.asrMaxResponseBytes)
+            return (body, response)
+        }
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw RemoteASRError.httpStatus(http.statusCode, errorMessage(from: data))
         }

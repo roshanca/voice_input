@@ -162,65 +162,48 @@ final class LLMRefiner {
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                // The request's total wall-clock budget (#34) covers the
+                // whole exchange — connect, headers, streamed body, and the
+                // error-body read — inside one race: when it fires it cancels
+                // the task holding the URLSession stream. timeoutInterval
+                // alone can't stop an endpoint that trickles bytes forever.
+                let outcome = try await SSEStreamExchange.run(
+                    request: request,
+                    seconds: ResourceLimits.llmTotalRequestDuration
+                ) { partial in
+                    await self.emitPartial(partial, requestID: requestID)
+                }
 
-                if let httpResponse = response as? HTTPURLResponse {
-                    AppLogger.shared.info("LLM HTTP status: \(httpResponse.statusCode)")
-                    guard (200...299).contains(httpResponse.statusCode) else {
-                        var bodyString = ""
-                        for try await line in bytes.lines {
-                            bodyString += line
-                            if bodyString.count > 2000 { break }
-                        }
-                        // The event and status stay visible; the response
-                        // body is untrusted content and is withheld via
-                        // SensitiveLogValue rather than collapsing the
-                        // whole line with `sensitive: true`.
-                        AppLogger.shared.error("LLM request failed", metadata: [
-                            "statusCode": httpResponse.statusCode,
-                            "body": SensitiveLogValue(bodyString)
-                        ])
-                        let message: String
-                        switch httpResponse.statusCode {
-                        case 401:
-                            message = "Unauthorized: check your API key."
-                        case 429:
-                            message = "Rate limited: too many requests."
-                        default:
-                            message = "LLM request failed with status \(httpResponse.statusCode)."
-                        }
-                        self.delegate?.llmRefiner(self, didFailWith: NSError(domain: "LLMRefiner", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message]), requestID: requestID)
+                switch outcome {
+                case .httpError(let statusCode, let bodyString):
+                    // The event and status stay visible; the response body
+                    // is untrusted content and is withheld via
+                    // SensitiveLogValue rather than collapsing the whole
+                    // line with `sensitive: true` (#32).
+                    AppLogger.shared.error("LLM request failed", metadata: [
+                        "statusCode": statusCode,
+                        "body": SensitiveLogValue(bodyString)
+                    ])
+                    let message: String
+                    switch statusCode {
+                    case 401:
+                        message = "Unauthorized: check your API key."
+                    case 429:
+                        message = "Rate limited: too many requests."
+                    default:
+                        message = "LLM request failed with status \(statusCode)."
+                    }
+                    self.delegate?.llmRefiner(self, didFailWith: NSError(domain: "LLMRefiner", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message]), requestID: requestID)
+                case .completed(let accumulated):
+                    let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        AppLogger.shared.warning("LLM stream completed with empty content — using raw text")
+                        self.delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
                         return
                     }
+                    AppLogger.shared.info("LLM response parsed successfully")
+                    self.delegate?.llmRefiner(self, didFinishWith: trimmed, requestID: requestID)
                 }
-
-                // Parse the SSE stream: "data: {json}" lines, terminated by
-                // "data: [DONE]". Accumulate delta content and mirror it to the
-                // floating panel so generation is visible in real time.
-                var accumulated = ""
-                for try await line in bytes.lines {
-                    try Task.checkCancellation()
-                    guard line.hasPrefix("data:") else { continue }
-                    let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    if payload == "[DONE]" { break }
-                    guard let payloadData = payload.data(using: .utf8),
-                          let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                          let choices = json["choices"] as? [[String: Any]],
-                          let first = choices.first,
-                          let delta = first["delta"] as? [String: Any],
-                          let content = delta["content"] as? String else { continue }
-                    accumulated += content
-                    self.delegate?.llmRefiner(self, didStreamPartial: accumulated, requestID: requestID)
-                }
-
-                let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else {
-                    AppLogger.shared.warning("LLM stream completed with empty content — using raw text")
-                    self.delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
-                    return
-                }
-                AppLogger.shared.info("LLM response parsed successfully")
-                self.delegate?.llmRefiner(self, didFinishWith: trimmed, requestID: requestID)
             } catch is CancellationError {
                 AppLogger.shared.info("LLM request canceled")
             } catch {
@@ -240,6 +223,13 @@ final class LLMRefiner {
     func cancel() {
         task?.cancel()
         task = nil
+    }
+
+    /// MainActor hop target for coalesced partials — the exchange consumes
+    /// bytes on a nonisolated task, so emissions rejoin the actor here
+    /// before touching the delegate.
+    private func emitPartial(_ text: String, requestID: UUID) {
+        delegate?.llmRefiner(self, didStreamPartial: text, requestID: requestID)
     }
 
     // MARK: - System Prompt
