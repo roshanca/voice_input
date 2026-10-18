@@ -573,7 +573,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the new press supersedes it (its callbacks would fail the
         // session-id guards anyway — cancelling just stops the waste).
         remoteASRRecognizer.cancelRecording()
-        let target = DictationTarget.capture()
+        let target = DictationTarget.capture(
+            unverifiedFocusAllowlist: UserDefaults.standard.unverifiedFocusAllowlist
+        )
         // Auto-send resolves once, here, against the recorded target's own
         // bundle ID — re-checking at send time could apply a different app's
         // rule after the user switched focus mid-delivery.
@@ -687,7 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Reuse the delivery bookkeeping so Esc still aborts mid-delivery.
         inFlightInjections += 1
         syncEscapeInterception()
-        TextInjector.shared.inject(text: text, keepInClipboard: false, sendReturn: false, target: DictationTarget.capture()) { [weak self] outcome in
+        TextInjector.shared.inject(text: text, keepInClipboard: false, sendReturn: false, target: DictationTarget.capture(unverifiedFocusAllowlist: UserDefaults.standard.unverifiedFocusAllowlist)) { [weak self] outcome in
             guard let self else { return }
             self.inFlightInjections -= 1
             self.syncEscapeInterception()
@@ -859,7 +861,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func selectionActionPressed(_ business: HotkeyBusiness) {
         guard selectionPresses[business] == nil else { return }
         selectionPresses[business] = .probing
-        let target = DictationTarget.capture()
+        let target = DictationTarget.capture(
+            unverifiedFocusAllowlist: UserDefaults.standard.unverifiedFocusAllowlist
+        )
         AppLogger.shared.info("Selection chord pressed (\(business.rawValue)) — probing selection")
         let probeTask = Task { @MainActor [weak self] in
             guard let self else { return }

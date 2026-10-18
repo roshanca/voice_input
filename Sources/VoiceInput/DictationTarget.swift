@@ -8,6 +8,10 @@ import Cocoa
 /// The target is re-validated right before the simulated paste and again
 /// before auto-send so a focus change while the result is in flight can't
 /// inject or submit text into a place the user has already moved away from.
+/// A target captured without a readable focused element is *unverifiable*
+/// (#31): delivery fails closed — the result is parked, no paste and no
+/// Return — unless the user explicitly allowlisted the app, in which case
+/// app-level identity checks are all that gate the delivery.
 struct DictationTarget {
     /// Why validation failed — drives the user-facing status message.
     enum Mismatch {
@@ -31,21 +35,89 @@ struct DictationTarget {
         }
     }
 
+    /// The attribute fingerprint of one focused element. Compared for
+    /// consistency when identity tokens differ — only `identifier` and
+    /// `frame` can positively distinguish a field (see `compare`).
+    struct FocusEvidence {
+        var role: String?
+        var subrole: String?
+        var identifier: String?
+        var elementDescription: String?
+        var title: String?
+        var frame: CGRect?
+
+        init(
+            role: String? = nil,
+            subrole: String? = nil,
+            identifier: String? = nil,
+            elementDescription: String? = nil,
+            title: String? = nil,
+            frame: CGRect? = nil
+        ) {
+            self.role = role
+            self.subrole = subrole
+            self.identifier = identifier
+            self.elementDescription = elementDescription
+            self.title = title
+            self.frame = frame
+        }
+    }
+
+    /// One live focused-element read: an identity token (the AXUIElement
+    /// itself in production, compared with CFEqual) plus a lazily-read
+    /// attribute snapshot, so probes whose token matches never pay the
+    /// attribute round-trips.
+    struct FocusProbe {
+        let token: AnyObject
+        let evidence: () -> FocusEvidence
+    }
+
+    /// Result of one focused-element read — the AX error is kept so
+    /// "focus went nowhere" (.noValue) stays distinct from "no answer
+    /// arrived" (anything else).
+    typealias FocusRead = (element: FocusProbe?, error: AXError)
+
     let pid: pid_t
     let bundleID: String?
     let appName: String?
 
-    /// Token for the AX focused element at capture time; nil when AX could
-    /// not read one, in which case validation falls back to the app level.
-    private let focusedElement: AXUIElement?
+    /// Identity token for the AX focused element at capture time (the
+    /// AXUIElement itself). Nil when AX could not read one — the target is
+    /// then unverifiable: `mismatch` fails closed unless the app carries
+    /// the user's explicit allowlist entry.
+    private let focusToken: AnyObject?
+    /// The captured element's attribute evidence — consulted only when a
+    /// validation probe's token differs from `focusToken`.
+    private let focusEvidence: FocusEvidence?
     /// Settable-text-attribute probe result at capture — see `isWritable`.
     private let elementWritable: Bool
-    private let elementRole: String?
-    private let elementSubrole: String?
-    private let elementIdentifier: String?
-    private let elementDescription: String?
-    private let elementTitle: String?
-    private let elementFrame: CGRect?
+    /// The user's explicit per-app opt-in for unverifiable-focus delivery
+    /// (#31), resolved at capture time so a mid-flight settings change
+    /// can't retroactively trust a target. The waiver covers "cannot
+    /// verify" outcomes only — positive evidence that focus moved still
+    /// blocks, and app identity is always re-checked.
+    let allowsUnverifiedFocus: Bool
+
+    /// Direct initializer — production builds targets through `capture`;
+    /// tests construct them here so `mismatch` can run against scripted
+    /// probes with no AX traffic or TCC grant.
+    init(
+        pid: pid_t,
+        bundleID: String?,
+        appName: String?,
+        focusToken: AnyObject? = nil,
+        focusEvidence: FocusEvidence? = nil,
+        elementWritable: Bool = false,
+        allowsUnverifiedFocus: Bool = false
+    ) {
+        self.pid = pid
+        self.bundleID = bundleID
+        self.appName = appName
+        self.focusToken = focusToken
+        self.focusEvidence = focusEvidence
+        self.elementWritable = elementWritable
+        self.allowsUnverifiedFocus = allowsUnverifiedFocus
+    }
 
     /// Bounds AX replies from a stuck or busy app.
     private static let axTimeout: Float = 0.2
@@ -66,46 +138,58 @@ struct DictationTarget {
     /// through the normal mismatch/parking path.
     var isWritable: Bool { elementWritable }
 
+    /// Whether the user explicitly allowlisted this app for delivery whose
+    /// focus can't be verified (#31). Fail closed by construction: a nil
+    /// bundle ID can never carry an allowlist entry.
+    static func unverifiedFocusAllowed(bundleID: String?, allowlist: Set<String>) -> Bool {
+        guard let bundleID else { return false }
+        return allowlist.contains(bundleID)
+    }
+
     /// Records the frontmost app and its focused element, if readable.
     /// Returns nil only when no frontmost app can be determined at all.
-    static func capture() -> DictationTarget? {
+    /// `unverifiedFocusAllowlist` carries the user's per-app opt-ins for
+    /// delivery into apps whose focus can't be verified.
+    @MainActor
+    static func capture(unverifiedFocusAllowlist: Set<String> = []) -> DictationTarget? {
         guard let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
         let pid = frontmost.processIdentifier
 
-        var element: AXUIElement?
+        var token: AnyObject?
+        var evidence: FocusEvidence?
         var writable = false
-        var role: String?, subrole: String?, identifier: String?
-        var description: String?, title: String?
-        var frame: CGRect?
 
         if HotkeyManager.checkAccessibility() {
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, axTimeout)
-            if let focused = copyFocusedElement(of: appElement).element {
+            let (focused, error) = copyFocusedElement(of: appElement)
+            if let focused {
                 AXUIElementSetMessagingTimeout(focused, axTimeout)
-                element = focused
+                token = focused
                 writable = isWritableElement(focused)
-                role = stringAttribute(kAXRoleAttribute, of: focused)
-                subrole = stringAttribute(kAXSubroleAttribute, of: focused)
-                identifier = stringAttribute(kAXIdentifierAttribute, of: focused)
-                description = stringAttribute(kAXDescriptionAttribute, of: focused)
-                title = stringAttribute(kAXTitleAttribute, of: focused)
-                frame = frameOf(focused)
+                evidence = Self.evidence(of: focused)
+            } else {
+                // No element token means there is nothing to re-verify a
+                // delivery against — the target is unverifiable, which
+                // fails closed at inject time unless this app is on the
+                // user's allowlist.
+                AppLogger.shared.info("Focused element unreadable at capture (AXError: \(error.rawValue)) — target unverifiable")
             }
+        } else {
+            AppLogger.shared.info("Accessibility not granted at capture — target unverifiable")
         }
 
         return DictationTarget(
             pid: pid,
             bundleID: frontmost.bundleIdentifier,
             appName: frontmost.localizedName,
-            focusedElement: element,
+            focusToken: token,
+            focusEvidence: evidence,
             elementWritable: writable,
-            elementRole: role,
-            elementSubrole: subrole,
-            elementIdentifier: identifier,
-            elementDescription: description,
-            elementTitle: title,
-            elementFrame: frame
+            allowsUnverifiedFocus: unverifiedFocusAllowed(
+                bundleID: frontmost.bundleIdentifier,
+                allowlist: unverifiedFocusAllowlist
+            )
         )
     }
 
@@ -124,19 +208,50 @@ struct DictationTarget {
     /// `includeGeometry` should be false for checks that run after the paste:
     /// multi-line inputs grow when text lands in them, and a moved frame is
     /// not evidence that focus went elsewhere.
-    func mismatch(includeGeometry: Bool = true) -> Mismatch? {
-        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
-            return .appTerminated
-        }
-        guard Self.frontmostPID == pid else {
-            return .appChanged
-        }
-        guard let captured = focusedElement else { return nil }
+    ///
+    /// The app-status and focused-element probes default to the live
+    /// system; tests inject scripted answers so the whole decision tree
+    /// runs without a TCC grant or real AX traffic.
+    func mismatch(
+        includeGeometry: Bool = true,
+        appIsAlive: ((pid_t) -> Bool)? = nil,
+        frontmostPID: (() -> pid_t?)? = nil,
+        fetchFocusedElement: (() -> FocusRead)? = nil
+    ) -> Mismatch? {
+        let appIsAlive = appIsAlive ?? Self.defaultAppIsAlive
+        let frontmostPID = frontmostPID ?? Self.defaultFrontmostPID
+        let readElement = fetchFocusedElement ?? focusedElementRead
 
-        let appElement = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appElement, Self.axTimeout)
+        /// Checked at both ends of validation: the AX round-trips in
+        /// between take real time, so the app verdict can go stale while
+        /// they run.
+        func appLevelMismatch() -> Mismatch? {
+            guard appIsAlive(pid) else { return .appTerminated }
+            guard frontmostPID() == pid else { return .appChanged }
+            return nil
+        }
 
-        let (fetched, fetchError) = Self.copyFocusedElement(of: appElement)
+        if let mismatch = appLevelMismatch() { return mismatch }
+
+        let verdict = focusMismatch(read: readElement, includeGeometry: includeGeometry)
+        if verdict == .unverifiable, allowsUnverifiedFocus {
+            // The user explicitly allowlisted this app for unverifiable
+            // focus — but the waiver covers "no answer arrived" only, and
+            // the app-level gate still applies.
+            return appLevelMismatch()
+        }
+        guard verdict == nil else { return verdict }
+        return appLevelMismatch()
+    }
+
+    /// The element-level half of validation: re-read the focused element
+    /// until one read confirms itself. A capture without an element token
+    /// is unverifiable — there is nothing to compare against; whether the
+    /// app's allowlist entry stands that down is the caller's decision.
+    private func focusMismatch(read: () -> FocusRead, includeGeometry: Bool) -> Mismatch? {
+        guard let captured = focusToken else { return .unverifiable }
+
+        let (fetched, fetchError) = read()
         guard var current = fetched else { return Self.fetchMismatch(fetchError) }
 
         // Every pass ends with a fresh focused-element read compared by token
@@ -146,31 +261,22 @@ struct DictationTarget {
         // exhaust the passes and fail closed as unverifiable.
         var passes = 0
         while true {
-            if !CFEqual(captured, current) {
-                AXUIElementSetMessagingTimeout(current, Self.axTimeout)
-                switch compare(current: current, includeGeometry: includeGeometry) {
+            if !CFEqual(captured, current.token) {
+                switch compare(current: current.evidence(), includeGeometry: includeGeometry) {
                 case .same: break
                 case .different: return .focusedElementChanged
                 case .ambiguous: return .unverifiable
                 }
             }
 
-            let (confirmed, confirmError) = Self.copyFocusedElement(of: appElement)
+            let (confirmed, confirmError) = read()
             guard let confirmed else { return Self.fetchMismatch(confirmError) }
-            if CFEqual(confirmed, current) { break }
+            if CFEqual(confirmed.token, current.token) { break }
 
             passes += 1
             guard passes < Self.maxValidationPasses else { return .unverifiable }
             current = confirmed
         }
-
-        // The AX round-trips above take real time — the app check at the
-        // top can go stale while they run, so identity is verified one
-        // last time before the target is reported valid.
-        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
-            return .appTerminated
-        }
-        guard Self.frontmostPID == pid else { return .appChanged }
         return nil
     }
 
@@ -185,42 +291,44 @@ struct DictationTarget {
     ///   field — `AXIdentifier`, or the frame when geometry is in scope —
     ///   can prove sameness. Without any, the comparison is `.ambiguous`
     ///   and delivery is suppressed.
-    private func compare(current element: AXUIElement, includeGeometry: Bool) -> ElementComparison {
+    private func compare(current: FocusEvidence, includeGeometry: Bool) -> ElementComparison {
+        let captured = focusEvidence ?? FocusEvidence()
+
         // Role is the baseline: a different kind of element is never the
         // same field, and it is too common to count as evidence by itself.
-        guard Self.stringAttribute(kAXRoleAttribute, of: element) == elementRole else {
+        guard current.role == captured.role else {
             return .different
         }
 
         // Generic metadata vetoes but never proves — a shared subrole or
         // label like "Search" describes a whole family of fields.
-        for (attribute, capturedValue) in [
-            (kAXSubroleAttribute, elementSubrole),
-            (kAXDescriptionAttribute, elementDescription),
-            (kAXTitleAttribute, elementTitle),
+        for (currentValue, capturedValue) in [
+            (current.subrole, captured.subrole),
+            (current.elementDescription, captured.elementDescription),
+            (current.title, captured.title),
         ] {
-            guard Self.stringAttribute(attribute, of: element) == capturedValue else {
+            guard currentValue == capturedValue else {
                 return .different
             }
         }
 
         var distinguished = false
 
-        if let elementIdentifier {
-            guard Self.stringAttribute(kAXIdentifierAttribute, of: element) == elementIdentifier else {
+        if let identifier = captured.identifier {
+            guard current.identifier == identifier else {
                 return .different
             }
             distinguished = true
         } else {
             // Captured without an identifier — a present one now is new
             // observable state, not proof of identity.
-            guard Self.stringAttribute(kAXIdentifierAttribute, of: element) == nil else {
+            guard current.identifier == nil else {
                 return .different
             }
         }
 
         if includeGeometry {
-            switch (elementFrame, Self.frameOf(element)) {
+            switch (captured.frame, current.frame) {
             case let (capturedFrame?, currentFrame?):
                 guard capturedFrame == currentFrame else { return .different }
                 distinguished = true
@@ -234,8 +342,25 @@ struct DictationTarget {
         return distinguished ? .same : .ambiguous
     }
 
-    private static var frontmostPID: pid_t? {
+    /// The production focused-element read `mismatch` uses by default —
+    /// live AX, timeout-bounded. Attribute evidence is read lazily so a
+    /// probe whose token matches never pays the extra round-trips.
+    private func focusedElementRead() -> FocusRead {
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, Self.axTimeout)
+        let (element, error) = Self.copyFocusedElement(of: appElement)
+        guard let element else { return (nil, error) }
+        AXUIElementSetMessagingTimeout(element, Self.axTimeout)
+        return (FocusProbe(token: element) { Self.evidence(of: element) }, error)
+    }
+
+    private static func defaultFrontmostPID() -> pid_t? {
         NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
+
+    private static func defaultAppIsAlive(_ pid: pid_t) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
+        return !app.isTerminated
     }
 
     /// The app's focused element, keeping the AX error so callers can tell
@@ -254,6 +379,19 @@ struct DictationTarget {
         // An explicit "no value" means focus left the recorded element;
         // anything else means the answer never arrived.
         error == .noValue ? .focusedElementChanged : .unverifiable
+    }
+
+    /// The attribute fingerprint kept for token-mismatch fallback —
+    /// captured eagerly at record start, read lazily during validation.
+    private static func evidence(of element: AXUIElement) -> FocusEvidence {
+        FocusEvidence(
+            role: stringAttribute(kAXRoleAttribute, of: element),
+            subrole: stringAttribute(kAXSubroleAttribute, of: element),
+            identifier: stringAttribute(kAXIdentifierAttribute, of: element),
+            elementDescription: stringAttribute(kAXDescriptionAttribute, of: element),
+            title: stringAttribute(kAXTitleAttribute, of: element),
+            frame: frameOf(element)
+        )
     }
 
     /// Any of the insert-relevant attributes reported settable counts as
