@@ -42,6 +42,13 @@ enum RecordingTempStoreError: LocalizedError, Equatable {
 /// lifetime; the sweep deletes a candidate only after taking the same
 /// lock non-blockingly, which is what proves no live session still owns
 /// the file — age is only a secondary gate.
+///
+/// The writer carries that verified inode end-to-end: AVAudioFile opens
+/// `/dev/fd/<lockFD>` (vnode-bound, no directory-path resolution) for
+/// writes and the upload reads the same descriptor path, while deletion
+/// goes through `removeRecordingFile`'s inode-checked `unlinkat`. A
+/// directory rename or a planted lookalike can neither pull audio out
+/// of the pinned dir nor make cleanup unlink the wrong file.
 final class RecordingTempStore {
     static let shared = RecordingTempStore()
 
@@ -197,6 +204,26 @@ final class RecordingTempStore {
             throw RecordingTempStoreError.recordingLocked
         }
         return fd
+    }
+
+    /// Unlinks `name` from the pinned directory — only while `name` still
+    /// binds the exact inode `lockedFD` is open on. A planted replacement
+    /// at that name (different inode, symlink, or missing) fails the match
+    /// and is left alone: deleting it would unlink somebody else's file
+    /// while the real recording stays behind.
+    @discardableResult
+    func removeRecordingFile(named name: String, lockedFD: Int32) -> Bool {
+        guard dirFD >= 0 else { return false }
+        var want = stat()
+        var have = stat()
+        guard fstat(lockedFD, &want) == 0,
+              fstatat(dirFD, name, &have, AT_SYMLINK_NOFOLLOW) == 0,
+              (have.st_mode & S_IFMT) == S_IFREG,
+              want.st_dev == have.st_dev,
+              want.st_ino == have.st_ino else {
+            return false
+        }
+        return unlinkat(dirFD, name, 0) == 0
     }
 
     /// Deletes recordings orphaned by a previous process — crash, kill, or

@@ -298,7 +298,7 @@ final class RemoteASRRecognizer: NSObject {
         // ends mid-utterance — fail honestly rather than uploading a
         // truncated take (#34), same as the mid-capture limit path.
         if writer.reachedLimit {
-            try? FileManager.default.removeItem(at: writer.url)
+            writer.discard()
             // Origin log like the zero-frames path — the delegate callback
             // does no error logging of its own (#32).
             AppLogger.shared.error("Remote ASR recording hit the duration cap — refusing upload of a truncated file")
@@ -309,12 +309,12 @@ final class RemoteASRRecognizer: NSObject {
         // Every bail-out below owns the finished file — a guard that
         // returns without uploading must not leave it on disk (#35).
         guard let config else {
-            try? FileManager.default.removeItem(at: writer.url)
+            writer.discard()
             return false
         }
 
         guard writer.totalFrames > 0 else {
-            try? FileManager.default.removeItem(at: writer.url)
+            writer.discard()
             // Logged here, once — the delegate callback does no error
             // logging of its own (see #32: failure lines live at their
             // origin, the delegate only drives session/panel state).
@@ -331,11 +331,18 @@ final class RemoteASRRecognizer: NSObject {
 
         let task = Task { [weak self] in
             // The temp recording is removed on every exit — success,
-            // failure, and cancellation alike must not leave audio on disk.
-            defer { try? FileManager.default.removeItem(at: writer.url) }
+            // failure, and cancellation alike must not leave audio on
+            // disk. discard() unlinks through the store's inode-checked
+            // unlinkat, so a swapped path can't make this remove a
+            // planted lookalike instead of the real recording.
+            defer { writer.discard() }
             do {
                 let text = try await RemoteTranscriptionService.transcribe(
-                    fileURL: writer.url,
+                    // Inode-bound (/dev/fd) read — the upload ships the
+                    // verified recording even if its dir was moved or its
+                    // path replanted mid-capture.
+                    fileURL: writer.uploadFileURL,
+                    fileName: writer.uploadFileName,
                     config: config,
                     apiKey: apiKey,
                     language: language

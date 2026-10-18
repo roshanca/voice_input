@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 
 /// AVAudioFile-backed sink for the tap's converted PCM. The batch remote
 /// ASR provider needs the whole utterance as one upload; Whisper-
@@ -22,6 +23,11 @@ final class RecordingFileWriter {
     /// a file a live session still owns can never be swept out from under
     /// it. -1 for writers created without a store (tests).
     private var lockFD: Int32 = -1
+    /// The store that owns the recording's directory — cleanup runs
+    /// through its inode-checked unlinkat, never a bare path remove.
+    private let store: RecordingTempStore?
+    /// Convention name inside the store dir — unlinkat operates on this.
+    private let name: String
     /// Frames actually written. Read on the main actor after finish():
     /// the tap lock's happens-before makes the count visible, and zero
     /// means capture produced nothing a server could transcribe.
@@ -38,33 +44,50 @@ final class RecordingFileWriter {
     /// directory under an exclusive flock — the sweep can't reclaim it
     /// while this writer (or the process) lives.
     init(sessionID: UUID, format: AVAudioFormat, store: RecordingTempStore, maxFrames: UInt64) throws {
+        self.store = store
+        self.name = RecordingTempStore.fileName(forSessionID: sessionID)
         self.url = store.fileURL(forSessionID: sessionID)
         self.maxFrames = maxFrames
         self.lockFD = try store.openRecordingFileDescriptor(forSessionID: sessionID)
         do {
             try self.openAudioFile(format: format)
         } catch {
+            // Unlink through the store while the lock is still held —
+            // a path remove could hit a swapped-in replacement instead.
+            store.removeRecordingFile(named: name, lockedFD: lockFD)
             close(lockFD)
             lockFD = -1
-            try? FileManager.default.removeItem(at: url)
             throw error
         }
     }
 
     init(url: URL, format: AVAudioFormat, maxFrames: UInt64) throws {
+        self.store = nil
+        self.name = url.lastPathComponent
         self.url = url
         self.maxFrames = maxFrames
         try openAudioFile(format: format)
     }
 
     private func openAudioFile(format: AVAudioFormat) throws {
-        // The .wav extension makes AVAudioFile wrap the LPCM stream in a
-        // WAVE container; the explicit commonFormat/interleaved arguments
-        // pin processingFormat to exactly what the tap delivers (Float32,
-        // 16 kHz mono, non-interleaved) — no conversion on write.
+        var settings = format.settings
+        var openURL = url
+        if lockFD >= 0 {
+            // /dev/fd/<fd> is vnode-bound — AVAudioFile opens the exact
+            // inode the lock holds, with zero directory-path resolution:
+            // renaming the dir or planting a symlink at `url` cannot
+            // redirect the write outside the pinned directory. The path
+            // has no .wav suffix, so the file type is stated explicitly.
+            openURL = URL(fileURLWithPath: "/dev/fd/\(lockFD)")
+            settings[AVAudioFileTypeKey] = NSNumber(value: kAudioFileWAVEType)
+        }
+        // The .wav container wraps the LPCM stream; the explicit
+        // commonFormat/interleaved arguments pin processingFormat to
+        // exactly what the tap delivers (Float32, 16 kHz mono,
+        // non-interleaved) — no conversion on write.
         file = try AVAudioFile(
-            forWriting: url,
-            settings: format.settings,
+            forWriting: openURL,
+            settings: settings,
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )
@@ -100,11 +123,35 @@ final class RecordingFileWriter {
         file = nil
     }
 
+    /// Inode-bound URL for the upload to read (#35): for store writers it
+    /// is `/dev/fd/<lockFD>` — the verified inode whatever the directory
+    /// path now resolves to. Plain-URL writers (tests) get `url`.
+    var uploadFileURL: URL {
+        lockFD >= 0 ? URL(fileURLWithPath: "/dev/fd/\(lockFD)") : url
+    }
+
+    /// The name the multipart upload should claim — the convention name,
+    /// never the /dev/fd path's "5"-style component (servers reject
+    /// extension-less audio file fields).
+    var uploadFileName: String { name }
+
     /// Esc path: close and delete the partial recording — a canceled
     /// dictation must not leave orphaned audio on disk.
     func discard() {
         file = nil
-        try? FileManager.default.removeItem(at: url)
+        removeRecording()
+    }
+
+    /// Identity-checked removal: store-backed writers unlink through the
+    /// pinned directory only while `name` still binds the locked inode —
+    /// a planted lookalike is left untouched. Path-based removal is the
+    /// store-less (test) fallback only.
+    private func removeRecording() {
+        if let store, lockFD >= 0 {
+            store.removeRecordingFile(named: name, lockedFD: lockFD)
+        } else {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     /// Last-resort cleanup (#35): a writer released without a finish→upload
@@ -115,7 +162,7 @@ final class RecordingFileWriter {
     deinit {
         // Unlink while the lock is still held — after close() the sweep
         // could take it and delete the same file (harmless, same outcome).
-        try? FileManager.default.removeItem(at: url)
+        removeRecording()
         if lockFD >= 0 {
             close(lockFD)
         }

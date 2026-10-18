@@ -216,4 +216,61 @@ final class RecordingFileWriterTests: XCTestCase {
         XCTAssertThrowsError(try RecordingFileWriter(sessionID: UUID(), format: format, store: store, maxFrames: .max))
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: external.path).isEmpty)
     }
+
+    /// Directory swap mid-capture: the real dir is renamed away and the
+    /// old path replanted as a symlink to an external dir. Because
+    /// AVAudioFile opens the lock fd's `/dev/fd` path — bound to the
+    /// verified inode — frames land on the real recording wherever the
+    /// dir now lives, and nothing is written through the planted link.
+    func testStoreWriterSurvivesDirectorySwap() throws {
+        let dirURL = tempDir.url.appendingPathComponent("VoiceInput-ASR", isDirectory: true)
+        let store = makeStore(dir: dirURL)
+        let id = UUID()
+        let writer = try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)
+
+        let moved = tempDir.url.appendingPathComponent("Moved", isDirectory: true)
+        let external = tempDir.url.appendingPathComponent("External", isDirectory: true)
+        try FileManager.default.moveItem(atPath: dirURL.path, toPath: moved.path)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(atPath: dirURL.path, withDestinationPath: external.path)
+
+        writer.write(makeBuffer())
+        writer.finish()
+
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: external.path).isEmpty)
+        // The real file followed the moved dir and holds the frames —
+        // the locked inode, not the stolen path.
+        let realFile = moved.appendingPathComponent(RecordingTempStore.fileName(forSessionID: id))
+        XCTAssertEqual(try AVAudioFile(forReading: realFile).length, 512)
+
+        writer.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: realFile.path))
+    }
+
+    /// Replacement file at the stolen path: after the recording is
+    /// finished the dir is moved and a same-named impostor is planted at
+    /// the original location. discard() must remove the real recording
+    /// through the pinned directory fd — and leave the impostor alone,
+    /// since unlinking it would be a wrong-file delete.
+    func testDiscardNeverDeletesReplacementFile() throws {
+        let dirURL = tempDir.url.appendingPathComponent("VoiceInput-ASR", isDirectory: true)
+        let store = makeStore(dir: dirURL)
+        let id = UUID()
+        let writer = try RecordingFileWriter(sessionID: id, format: format, store: store, maxFrames: .max)
+        writer.write(makeBuffer())
+        writer.finish()
+
+        let moved = tempDir.url.appendingPathComponent("Moved", isDirectory: true)
+        try FileManager.default.moveItem(atPath: dirURL.path, toPath: moved.path)
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: false)
+        let planted = dirURL.appendingPathComponent(RecordingTempStore.fileName(forSessionID: id))
+        try Data("impostor".utf8).write(to: planted)
+
+        writer.discard()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: planted.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: moved.appendingPathComponent(RecordingTempStore.fileName(forSessionID: id)).path
+        ))
+    }
 }
