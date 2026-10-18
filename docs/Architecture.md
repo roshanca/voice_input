@@ -94,7 +94,13 @@ records, and a launch-time reconcile sweeps files no record references.
 **Session identity:** `AppDelegate` owns `activeSession: {id, generation,
 submitted, ...}`. Every async callback re-checks `sessionID` before touching
 state — a stale callback from a cancelled session is dropped. A new dictation
-cancels any in-flight refinement so late chunks can't inject text.
+cancels any in-flight refinement so late chunks can't inject text. Selection
+transforms carry the same contract one level down (#33): the caller stamps
+each request with a UUID kept in `selectionTransformRequestID`, partial and
+completion callbacks for any other id are dropped, and cancellation is
+recognized in both its shapes (`CancellationError` and `URLError.cancelled`)
+— so a superseded/Esc-cancelled request can no longer resolve in-flight
+state under its successor.
 
 **Per-app profile routing:** at session start, the captured target's bundle
 ID resolves through `LLMProfileRouting` against the `perAppLLMProfileOverrides`
@@ -134,7 +140,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Selection/SelectedTextProbe.swift` | Selected-text read: AX `AXSelectedText` (0.2 s timeout, caret-only early-exit) → ⌘C clipboard fallback with snapshot/restore + `changeCount` ownership check; drives the selection-action chords |
 | `Selection/SelectionPolicy.swift` | Pure policy deciding caret vs real selection and dictionary-term validity; untested surface = system IO only |
 | `Selection/SelectionFallback.swift` | Pure press-outcome decision: act on selection / fall back to dictation / ignore when the key was released before the probe answered |
-| `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; writes no history |
+| `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; writes no history. Caller-stamped `requestID` gates every callback: identity is restamped/cleared before `task.cancel()`, and partial/failure/success emissions re-check it plus `Task.isCancelled` — `URLError.cancelled` counts as a cancel, never a failure. `config`/`session` injectable for the scripted-URLProtocol tests |
 | `Selection/SelectionPrompts.swift` | Whole-instruction system prompts for the transforms — the selection itself is the user message |
 | `TrackedTaskStore.swift` | Retains tasks (incl. cancelled) until actual exit; drained in `applicationWillTerminate`. **Cancellation ≠ release** |
 | `AppLogger.swift` + `LogRedactor.swift` | In-memory ring buffer; all lines redacted before storage (sensitive-key suffix match + `SensitiveLogValue` + free-text secret scrub + `~` home shortening) |
@@ -159,7 +165,9 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 hotkey routing/decoding, selection policy, log redaction, task store,
 stats, UserDefaults keys, translation prompt contract, end-command tail
 matching/truncation, remote-ASR wire format (multipart layout, request
-shape, response/error parsing) and session-plan resolution.
+shape, response/error parsing), session-plan resolution, and
+selection-transform cancellation isolation (scripted URLProtocol on a
+fictional host — no real network).
 `TestHelpers.swift` provides isolated `UserDefaults` suites and temp
 dirs. **No TCC-dependent tests.**
 
