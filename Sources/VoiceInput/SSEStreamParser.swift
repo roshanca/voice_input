@@ -14,7 +14,10 @@ enum SSEStreamEvent: Equatable {
 /// anomalous or hostile endpoint could grow memory and UI work without
 /// bound. Feed wire bytes one at a time; an exceeded cap throws
 /// `StreamError`, and unwinding the consume loop cancels the URLSession
-/// task behind the stream.
+/// task behind the stream. Total wall-clock duration is the caller's
+/// problem — `SSEStreamExchange` bounds it with a task race; a parser-side
+/// deadline could only fire when a line completes, which a trickling
+/// endpoint can delay forever.
 ///
 /// `\n` never occurs inside a UTF-8 multibyte sequence, so splitting on the
 /// raw byte is decoding-safe.
@@ -26,9 +29,6 @@ struct SSEStreamParser {
         case eventTooLarge
         /// Accumulated `delta.content` passed `maxOutputBytes`.
         case outputTooLarge
-        /// The stream was still producing past the caller's deadline —
-        /// `timeoutInterval` bounds idle gaps, not total duration.
-        case timedOut
 
         var errorDescription: String? {
             switch self {
@@ -38,8 +38,6 @@ struct SSEStreamParser {
                 return "Stream aborted: an event exceeded the size limit."
             case .outputTooLarge:
                 return "Stream aborted: the response exceeded the output limit."
-            case .timedOut:
-                return "The request took too long."
             }
         }
     }
@@ -47,11 +45,6 @@ struct SSEStreamParser {
     private let maxLineBytes: Int
     private let maxEventBytes: Int
     private let maxOutputBytes: Int
-    /// When set, completing a line after this point throws `timedOut`.
-    /// Checked per line — a stream that produces nothing at all is the
-    /// idle timeout's job.
-    private let deadline: Date?
-    private let now: () -> Date
 
     /// Bytes of the current unterminated line.
     private var lineBuffer = Data()
@@ -62,14 +55,10 @@ struct SSEStreamParser {
 
     init(maxLineBytes: Int = ResourceLimits.sseMaxLineBytes,
          maxEventBytes: Int = ResourceLimits.sseMaxEventBytes,
-         maxOutputBytes: Int = ResourceLimits.sseMaxOutputBytes,
-         deadline: Date? = nil,
-         now: @escaping () -> Date = Date.init) {
+         maxOutputBytes: Int = ResourceLimits.sseMaxOutputBytes) {
         self.maxLineBytes = maxLineBytes
         self.maxEventBytes = maxEventBytes
         self.maxOutputBytes = maxOutputBytes
-        self.deadline = deadline
-        self.now = now
     }
 
     /// Feed one wire byte. Returns an event when the byte completed a
@@ -95,7 +84,6 @@ struct SSEStreamParser {
     }
 
     private mutating func completeLine() throws -> SSEStreamEvent? {
-        if let deadline, now() >= deadline { throw StreamError.timedOut }
         defer { lineBuffer.removeAll(keepingCapacity: true) }
         var line = lineBuffer[...]
         if line.last == UInt8(ascii: "\r") { line = line.dropLast() }

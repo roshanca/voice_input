@@ -979,15 +979,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingPanel.show()
         AppLogger.shared.info("Selection transform started: \(kind)", metadata: ["selection": SensitiveLogValue(text)])
         selectionTransformer.transform(kind: kind, text: text, requestID: requestID, onPartial: { [weak self] partial in
-            // A dictation started mid-request owns the panel — don't let
-            // late tokens overwrite its live transcript; a superseded
-            // request's tokens are dropped outright.
-            guard let self, self.selectionTransformRequestID == requestID,
-                  !self.isHotkeyHeld, self.activeSession == nil, self.pendingSession == nil else { return }
-            self.floatingPanel.setText(partial)
+            await self?.selectionTransformPartial(partial, requestID: requestID)
         }, completion: { [weak self] result in
             self?.selectionTransformCompleted(kind: kind, result: result, target: target, requestID: requestID)
         })
+    }
+
+    /// Panel update for a streamed transform partial — the exchange emits
+    /// off-actor, so the @Sendable sink hops back here for each coalesced
+    /// emission.
+    private func selectionTransformPartial(_ partial: String, requestID: UUID) {
+        // A dictation started mid-request owns the panel — don't let
+        // late tokens overwrite its live transcript; a superseded
+        // request's tokens are dropped outright.
+        guard selectionTransformRequestID == requestID,
+              !isHotkeyHeld, activeSession == nil, pendingSession == nil else { return }
+        floatingPanel.setText(partial)
     }
 
     private func selectionTransformCompleted(kind: SelectionTransformer.Kind, result: Result<String, Error>, target: DictationTarget?, requestID: UUID) {

@@ -128,31 +128,4 @@ final class SSEStreamParserTests: XCTestCase {
             XCTAssertEqual(error as? SSEStreamParser.StreamError, .outputTooLarge)
         }
     }
-
-    // MARK: - Deadline
-
-    /// A stream still producing at the deadline aborts — `timeoutInterval`
-    /// only watches idle gaps, so total duration needs its own check.
-    func testDeadlineAbortsMidStream() {
-        var now = Date()
-        var parser = SSEStreamParser(deadline: now.addingTimeInterval(1), now: { now })
-        XCTAssertNoThrow(try feed(dataLine("a"), to: &parser))
-        now = now.addingTimeInterval(2)
-        XCTAssertThrowsError(try feed(dataLine("b"), to: &parser)) { error in
-            XCTAssertEqual(error as? SSEStreamParser.StreamError, .timedOut)
-        }
-    }
-
-    /// Bytes that arrive without a terminator don't consult the deadline —
-    /// only completed lines pay the (cheap) clock read.
-    func testDeadlineIsCheckedPerLine() throws {
-        var now = Date()
-        var parser = SSEStreamParser(deadline: now.addingTimeInterval(1), now: { now })
-        now = now.addingTimeInterval(2)
-        // No \n — the deadline fires on line completion, not per byte.
-        XCTAssertNoThrow(try feed("partial", to: &parser))
-        XCTAssertThrowsError(try feed("\n", to: &parser)) { error in
-            XCTAssertEqual(error as? SSEStreamParser.StreamError, .timedOut)
-        }
-    }
 }
