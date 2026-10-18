@@ -98,7 +98,7 @@ final class LLMRefiner {
         // already committed.
         let config = profileOverride ?? self.config
         let apiKey = apiKeyOverride ?? KeychainHelper.key(for: config.id)
-        AppLogger.shared.info("LLMRefiner request started — profile: \(config.name), provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(config.baseURL)")
+        AppLogger.shared.info("LLMRefiner request started — profile: \(config.name), provider: \(config.providerType.displayName), model: \(config.model), baseURL: \(LogRedactor.sanitizedURL(config.baseURL))")
         // A new request supersedes one still in flight: cancel it so its late
         // callbacks can't clobber the new session's result. Cancellation is
         // not instant, so the delegate must still check requestID.
@@ -114,7 +114,7 @@ final class LLMRefiner {
 
         let urlString = config.baseURL.hasSuffix("/") ? config.baseURL + "chat/completions" : config.baseURL + "/chat/completions"
         guard let url = URL(string: urlString) else {
-            AppLogger.shared.error("Invalid URL: \(urlString)")
+            AppLogger.shared.error("Invalid URL: \(LogRedactor.sanitizedURL(urlString))")
             delegate?.llmRefiner(self, didFinishWith: text, requestID: requestID)
             return
         }
@@ -158,7 +158,7 @@ final class LLMRefiner {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 15
 
-        AppLogger.shared.info("Sending streaming LLM request to \(urlString)")
+        AppLogger.shared.info("Sending streaming LLM request to \(LogRedactor.sanitizedURL(urlString))")
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -172,7 +172,14 @@ final class LLMRefiner {
                             bodyString += line
                             if bodyString.count > 2000 { break }
                         }
-                        AppLogger.shared.error("LLM request failed — status: \(httpResponse.statusCode), body: \(bodyString)", sensitive: true)
+                        // The event and status stay visible; the response
+                        // body is untrusted content and is withheld via
+                        // SensitiveLogValue rather than collapsing the
+                        // whole line with `sensitive: true`.
+                        AppLogger.shared.error("LLM request failed", metadata: [
+                            "statusCode": httpResponse.statusCode,
+                            "body": SensitiveLogValue(bodyString)
+                        ])
                         let message: String
                         switch httpResponse.statusCode {
                         case 401:

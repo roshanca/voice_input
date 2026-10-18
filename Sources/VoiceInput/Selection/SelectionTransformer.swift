@@ -123,7 +123,7 @@ final class SelectionTransformer {
         let baseURL = config.baseURL
         let urlString = baseURL.hasSuffix("/") ? baseURL + "chat/completions" : baseURL + "/chat/completions"
         guard let url = URL(string: urlString) else {
-            AppLogger.shared.error("Invalid LLM base URL: \(urlString)")
+            AppLogger.shared.error("Invalid LLM base URL: \(LogRedactor.sanitizedURL(urlString))")
             completion(.failure(SelectionTransformError.notConfigured))
             return
         }
@@ -163,7 +163,7 @@ final class SelectionTransformer {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 15
 
-        AppLogger.shared.info("Selection transform started (\(kind)) — streaming request to \(urlString)")
+        AppLogger.shared.info("Selection transform started (\(kind)) — streaming request to \(LogRedactor.sanitizedURL(urlString))")
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -177,7 +177,12 @@ final class SelectionTransformer {
                             bodyString += line
                             if bodyString.count > 2000 { break }
                         }
-                        AppLogger.shared.error("Selection transform failed — status: \(httpResponse.statusCode), body: \(bodyString)", sensitive: true)
+                        // Same shape as the refiner's: status stays
+                        // visible, the untrusted body is withheld.
+                        AppLogger.shared.error("Selection transform failed", metadata: [
+                            "statusCode": httpResponse.statusCode,
+                            "body": SensitiveLogValue(bodyString)
+                        ])
                         guard self.isLive(requestID) else { return }
                         completion(.failure(SelectionTransformError.httpStatus(httpResponse.statusCode)))
                         return

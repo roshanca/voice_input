@@ -93,6 +93,169 @@ final class LogRedactorTests: XCTestCase {
         )
     }
 
+    /// `user:password@` (or bare `user@`) userinfo in any interpolated
+    /// message is credentials — scrubbed even when nobody called
+    /// `sanitizedURL` first.
+    func testURLUserinfoInMessageIsRedacted() {
+        XCTAssertEqual(
+            LogRedactor.redactText("POST https://user:hunter2@gw.example.com/v1 failed"),
+            "POST https://\(LogRedactor.placeholder)@gw.example.com/v1 failed"
+        )
+        XCTAssertEqual(
+            LogRedactor.redactText("POST https://alice@gw.example.com/v1 failed"),
+            "POST https://\(LogRedactor.placeholder)@gw.example.com/v1 failed"
+        )
+    }
+
+    /// A URL without userinfo must survive text redaction untouched —
+    /// the pattern fires on "://" … "@" only.
+    func testURLWithoutUserinfoIsUntouched() {
+        XCTAssertEqual(
+            LogRedactor.redactText("POST http://localhost:8080/v1 failed"),
+            "POST http://localhost:8080/v1 failed"
+        )
+    }
+
+    // MARK: - URL sanitizing (#32)
+
+    /// The whole point: configured URLs can carry credentials in userinfo
+    /// — scheme/host/port are the debugging signal, userinfo never logs.
+    func testSanitizedURLStripsUserinfo() {
+        let safe = LogRedactor.sanitizedURL("https://alice:hunter2@gw.example.com:8443/v1")
+        XCTAssertEqual(safe, "https://gw.example.com:8443/v1")
+        XCTAssertFalse(safe.contains("alice"))
+        XCTAssertFalse(safe.contains("hunter2"))
+    }
+
+    /// Endpoint vocabulary stays legible; a user-chosen gateway path and
+    /// every query item not on the name allowlist collapse to `…`.
+    func testSanitizedURLAllowlistsPathAndQuery() {
+        let safe = LogRedactor.sanitizedURL(
+            "https://gw.example.com/tenant-secret/v1/audio/transcriptions?api_key=sk-9&format=json&tenant=acme"
+        )
+        XCTAssertEqual(
+            safe,
+            "https://gw.example.com/…/v1/audio/transcriptions?format=\(LogRedactor.placeholder)&…"
+        )
+        XCTAssertFalse(safe.contains("tenant-secret"))
+        XCTAssertFalse(safe.contains("sk-9"))
+        XCTAssertFalse(safe.contains("acme"))
+    }
+
+    /// Ordinary endpoint URLs pass through whole — the allowlist covers
+    /// every path this app builds (`/v1`, `/audio/transcriptions`,
+    /// `/chat/completions`, `/openai/v1` bases).
+    func testSanitizedURLKeepsEndpointShape() {
+        XCTAssertEqual(
+            LogRedactor.sanitizedURL("https://api.openai.com/v1"),
+            "https://api.openai.com/v1"
+        )
+        XCTAssertEqual(
+            LogRedactor.sanitizedURL("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        )
+        XCTAssertEqual(
+            LogRedactor.sanitizedURL("https://api.groq.com/openai/v1/audio/transcriptions"),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        )
+    }
+
+    /// Fragments never log; an unparseable string can't be checked at
+    /// all, so it collapses to the placeholder instead of being echoed.
+    func testSanitizedURLDropsFragmentAndUnparseableInput() {
+        XCTAssertEqual(
+            LogRedactor.sanitizedURL("https://api.openai.com/v1#frag"),
+            "https://api.openai.com/v1"
+        )
+        XCTAssertEqual(LogRedactor.sanitizedURL("not a url"), LogRedactor.placeholder)
+        XCTAssertEqual(LogRedactor.sanitizedURL("   "), LogRedactor.placeholder)
+    }
+
+    // MARK: - Error codes (#32)
+
+    /// `.httpStatus` carries the server's own `message` — body echo that
+    /// could parrot a secret back. The log code reports the status only.
+    func testErrorCodeNeverCarriesServerMessage() {
+        let echo = "server echoed sk-secret-echo"
+        let code = LogRedactor.errorCode(RemoteASRError.httpStatus(500, echo))
+        XCTAssertEqual(code, "remoteASR.httpStatus.500")
+        XCTAssertFalse(code.contains(echo))
+    }
+
+    func testErrorCodeCoversRemoteASRCases() {
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.notConfigured), "remoteASR.notConfigured")
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.httpStatus(401, nil)), "remoteASR.httpStatus.401")
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.malformedResponse), "remoteASR.malformedResponse")
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.noAudioCaptured), "remoteASR.noAudioCaptured")
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.microphoneDenied), "remoteASR.microphoneDenied")
+        XCTAssertEqual(LogRedactor.errorCode(RemoteASRError.audioDeviceChanged), "remoteASR.audioDeviceChanged")
+    }
+
+    /// Non-remote errors fall back to `domain.code` — stable, and unlike
+    /// `localizedDescription` incapable of carrying server/user text.
+    func testErrorCodeFallsBackToDomainCode() {
+        XCTAssertEqual(
+            LogRedactor.errorCode(URLError(.notConnectedToInternet)),
+            "NSURLErrorDomain.\(URLError.notConnectedToInternet.rawValue)"
+        )
+    }
+
+    /// Body/response/message keys redact on suffix alone — no
+    /// SensitiveLogValue wrapper required — so a future call site can't
+    /// leak server content by forgetting one.
+    func testContentCarrierKeysRedactWithoutWrapper() {
+        let rendered = LogRedactor.renderMetadata([
+            "body": "echo sk-1",
+            "serverResponse": "raw body",
+            "errorMessage": "server says hi",
+            "statusCode": 500
+        ])
+        XCTAssertFalse(rendered.contains("echo sk-1"))
+        XCTAssertFalse(rendered.contains("raw body"))
+        XCTAssertFalse(rendered.contains("server says hi"))
+        XCTAssertTrue(rendered.contains("statusCode: 500"))
+    }
+
+    // MARK: - Issue #32 end-to-end
+
+    /// The upload-failure log shape: event label + stable code, with the
+    /// localizedDescription (server message inside) withheld.
+    @MainActor
+    func testRemoteASRFailureLogKeepsOnlyStableCode() {
+        AppLogger.shared.clear()
+        let echo = "server echoed sk-secret-echo"
+        let error = RemoteASRError.httpStatus(500, echo)
+        AppLogger.shared.error("Remote ASR upload failed", metadata: [
+            "errorCode": LogRedactor.errorCode(error),
+            "detail": SensitiveLogValue(error.localizedDescription)
+        ])
+        let logs = AppLogger.shared.formattedLogs()
+        XCTAssertFalse(logs.contains(echo))
+        XCTAssertTrue(logs.contains("Remote ASR upload failed"))
+        XCTAssertTrue(logs.contains("remoteASR.httpStatus.500"))
+    }
+
+    /// Diagnostics export is the acceptance surface: a fictional error
+    /// echo and a `user:password@` URL pushed through the logger must not
+    /// appear in the exported report.
+    @MainActor
+    func testDiagnosticsExportContainsNoEchoOrUserinfo() {
+        AppLogger.shared.clear()
+        let echo = "diag-secret-echo"
+        let error = RemoteASRError.httpStatus(502, echo)
+        AppLogger.shared.error("Remote ASR upload failed", metadata: [
+            "errorCode": LogRedactor.errorCode(error),
+            "detail": SensitiveLogValue(error.localizedDescription)
+        ])
+        AppLogger.shared.info("Remote ASR upload started — baseURL: \(LogRedactor.sanitizedURL("https://user:hunter2@gw.example.com:8443/v1")), model: whisper-1, language: auto")
+        let report = DiagnosticsExporter.makeReport()
+        XCTAssertFalse(report.contains(echo))
+        XCTAssertFalse(report.contains("hunter2"))
+        XCTAssertFalse(report.contains("user@"))
+        XCTAssertTrue(report.contains("remoteASR.httpStatus.502"))
+        XCTAssertTrue(report.contains("https://gw.example.com:8443/v1"))
+    }
+
     func testHomeDirectoryIsShortened() {
         XCTAssertEqual(
             LogRedactor.redactText("Failed to read \(NSHomeDirectory())/Library/file.plist"),

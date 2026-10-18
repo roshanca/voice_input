@@ -46,6 +46,21 @@ enum RemoteASRError: LocalizedError, Equatable {
             return "Audio input device changed. Please try again."
         }
     }
+
+    /// Stable identifier for log lines — `errorDescription` stays on the
+    /// panel (its `.httpStatus` `message` is the server's own body text,
+    /// untrusted content that can echo secrets back), so logs record this
+    /// code instead.
+    var logCode: String {
+        switch self {
+        case .notConfigured: return "notConfigured"
+        case .httpStatus(let code, _): return "httpStatus.\(code)"
+        case .malformedResponse: return "malformedResponse"
+        case .noAudioCaptured: return "noAudioCaptured"
+        case .microphoneDenied: return "microphoneDenied"
+        case .audioDeviceChanged: return "audioDeviceChanged"
+        }
+    }
 }
 
 /// Batch-upload client for the remote ASR provider: multipart
