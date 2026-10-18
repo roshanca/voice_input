@@ -27,27 +27,35 @@ enum LogRedactor {
         "body", "response", "message", "detail", "content", "output"
     ]
 
-    /// Secrets embedded in plain message strings: "key=value" in URLs,
-    /// "Authorization: Bearer …" style headers, and `user:password@`
-    /// userinfo on a scheme:// authority — a host never contains "@", so
-    /// anything between "://" and "@" is credentials by definition.
+    /// Secrets embedded in plain message strings: "key=value" in URLs and
+    /// "Authorization: Bearer …" style headers. URL userinfo is NOT here —
+    /// a character-class regex can't bound it (spaces and unencoded "@"
+    /// inside userinfo are both legal to Foundation); scrubURLUserinfo
+    /// scans the authority properly.
     private static let sensitivePatterns = [
         #"(?i)(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~+/=-]+"#,
         #"(?i)([?&](?:api_key|apikey|key|token|access_token|refresh_token|secret|password)=)[^&#\s]+"#,
-        #"(?i)((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|oauth[-_ ]?token|bearer[-_ ]?token|token|secret|password)\s*[:=]\s*)[^\s,;&]+"#,
-        #"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+(?=@)"#
+        #"(?i)((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|oauth[-_ ]?token|bearer[-_ ]?token|token|secret|password)\s*[:=]\s*)[^\s,;&]+"#
     ]
 
     private static let compiledPatterns: [NSRegularExpression] = sensitivePatterns.compactMap {
         try? NSRegularExpression(pattern: $0)
     }
 
+    /// `scheme://` detector for the userinfo sweep — the authority that
+    /// follows is scanned char-by-char so malformed userinfo can't slip
+    /// past a character class.
+    private static let schemeDelimiterRegex = try? NSRegularExpression(
+        pattern: #"[a-z][a-z0-9+.-]*://"#, options: [.caseInsensitive]
+    )
+
     static func isSensitiveKey(_ key: String) -> Bool {
         let normalized = key.lowercased().filter { $0.isLetter || $0.isNumber }
         return sensitiveKeyWords.contains { normalized.hasSuffix($0) }
     }
 
-    /// Scrubs secrets embedded in free-text messages and shortens home paths.
+    /// Scrubs secrets embedded in free-text messages — key=value secrets,
+    /// bearer headers, URL userinfo — and shortens home paths.
     static func redactText(_ text: String) -> String {
         var output = text
         for pattern in compiledPatterns {
@@ -57,10 +65,58 @@ enum LogRedactor {
                 withTemplate: "$1\(placeholder)"
             )
         }
+        output = scrubURLUserinfo(output)
         let home = NSHomeDirectory()
         if !home.isEmpty {
             output = output.replacingOccurrences(of: home, with: "~")
         }
+        return output
+    }
+
+    /// Masks `userinfo@` on any `scheme://` authority embedded in free
+    /// text — userinfo is credentials by definition, and this is the
+    /// backstop for strings that never went through `sanitizedURL`.
+    ///
+    /// The authority run after `://` ends at the first `/`, `?`, or `#`;
+    /// whitespace does NOT end it, because Foundation accepts spaced
+    /// userinfo and auto-encodes it. For a run containing "@": userinfo
+    /// ends at the LAST "@" — an unencoded "@" is legal inside it, so a
+    /// lazier split leaves a password suffix standing (`pa@ss` → `ss`
+    /// would leak). If the run also contains whitespace the URL's extent
+    /// is ambiguous (encoded credentials vs. ordinary message text) and
+    /// the whole URL — authority plus its path tail — is masked instead.
+    private static func scrubURLUserinfo(_ text: String) -> String {
+        guard let matches = schemeDelimiterRegex?.matches(
+            in: text, range: NSRange(text.startIndex..., in: text)
+        ), !matches.isEmpty else { return text }
+
+        var output = ""
+        var cursor = text.startIndex
+        for match in matches {
+            guard let schemeRange = Range(match.range, in: text),
+                  schemeRange.lowerBound >= cursor else { continue }
+
+            var index = schemeRange.upperBound
+            while index < text.endIndex, !"/?#".contains(text[index]) {
+                index = text.index(after: index)
+            }
+            let authority = text[schemeRange.upperBound..<index]
+            // Userinfo ends at the LAST "@" in the authority.
+            guard let at = authority.lastIndex(of: "@") else { continue }
+
+            output += text[cursor..<schemeRange.upperBound]
+            if authority.contains(where: \.isWhitespace) {
+                while index < text.endIndex, !text[index].isWhitespace {
+                    index = text.index(after: index)
+                }
+                output += placeholder
+            } else {
+                output += "\(placeholder)@"
+                index = text.index(after: at)
+            }
+            cursor = index
+        }
+        output += text[cursor...]
         return output
     }
 

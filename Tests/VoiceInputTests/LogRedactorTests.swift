@@ -107,8 +107,27 @@ final class LogRedactorTests: XCTestCase {
         )
     }
 
-    /// A URL without userinfo must survive text redaction untouched —
-    /// the pattern fires on "://" … "@" only.
+    /// An unencoded "@" inside userinfo is legal — userinfo ends at the
+    /// LAST "@", so `pa@ss` must mask completely, not leave `ss@` behind.
+    func testURLUserinfoEndsAtLastAt() {
+        let out = LogRedactor.redactText("POST https://user:pa@ss@gw.example.com/v1 failed")
+        XCTAssertEqual(out, "POST https://\(LogRedactor.placeholder)@gw.example.com/v1 failed")
+        XCTAssertFalse(out.contains("pa@ss"))
+        XCTAssertFalse(out.contains("ss@"))
+    }
+
+    /// Whitespace inside the authority makes the URL boundary ambiguous —
+    /// Foundation would auto-encode it as userinfo, but in a log line it
+    /// could also be message text. Either way the whole URL is masked:
+    /// masking just "user:pass" would leave "word@gw.example.com" standing.
+    func testURLWithSpacedUserinfoIsMaskedWhole() {
+        let out = LogRedactor.redactText("POST https://user:pass word@gw.example.com/v1 failed")
+        XCTAssertEqual(out, "POST https://\(LogRedactor.placeholder) failed")
+        XCTAssertFalse(out.contains("pass"))
+        XCTAssertFalse(out.contains("word"))
+    }
+
+    /// A URL without userinfo must survive text redaction untouched.
     func testURLWithoutUserinfoIsUntouched() {
         XCTAssertEqual(
             LogRedactor.redactText("POST http://localhost:8080/v1 failed"),
@@ -254,6 +273,27 @@ final class LogRedactorTests: XCTestCase {
         XCTAssertFalse(report.contains("user@"))
         XCTAssertTrue(report.contains("remoteASR.httpStatus.502"))
         XCTAssertTrue(report.contains("https://gw.example.com:8443/v1"))
+    }
+
+    /// Regression for the #32 review: malformed userinfo in a plain
+    /// message must not survive into formatted logs or the diagnostics
+    /// export — spaced userinfo masks the whole URL, and multi-"@"
+    /// userinfo masks through the last "@", leaving no password suffix.
+    @MainActor
+    func testMalformedUserinfoNeverReachesLogsOrExport() {
+        AppLogger.shared.clear()
+        AppLogger.shared.error("POST https://user:pass word@gw.example.com/v1 failed")
+        AppLogger.shared.error("POST https://user:pa@ss@gw.example.com/v1 failed")
+
+        for surface in [AppLogger.shared.formattedLogs(), DiagnosticsExporter.makeReport()] {
+            XCTAssertFalse(surface.contains("pass word"), surface)
+            XCTAssertFalse(surface.contains("word@"), surface)
+            XCTAssertFalse(surface.contains("pa@ss"), surface)
+            XCTAssertFalse(surface.contains("ss@"), surface)
+        }
+        let logs = AppLogger.shared.formattedLogs()
+        XCTAssertTrue(logs.contains("https://\(LogRedactor.placeholder) failed"))
+        XCTAssertTrue(logs.contains("https://\(LogRedactor.placeholder)@gw.example.com/v1 failed"))
     }
 
     func testHomeDirectoryIsShortened() {
