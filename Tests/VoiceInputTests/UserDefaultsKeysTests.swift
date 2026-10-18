@@ -226,6 +226,28 @@ final class UserDefaultsKeysTests: XCTestCase {
         XCTAssertEqual(isolated.defaults.voiceEndCommandPhrases, "over,完毕")
     }
 
+    /// The unverified-focus opt-in list (#31) defaults empty — an absent
+    /// or corrupted value must decode to "no app is trusted", never to a
+    /// silent bypass.
+    func testUnverifiedFocusAllowlistDefaultsEmptyAndRoundTrips() {
+        let isolated = IsolatedDefaults()
+        XCTAssertEqual(isolated.defaults.unverifiedFocusAllowlist, [])
+        isolated.defaults.unverifiedFocusAllowlist = ["com.example.a", "com.example.b"]
+        XCTAssertEqual(isolated.defaults.unverifiedFocusAllowlist, ["com.example.a", "com.example.b"])
+        isolated.defaults.unverifiedFocusAllowlist = []
+        XCTAssertEqual(isolated.defaults.unverifiedFocusAllowlist, [])
+    }
+
+    /// A stored value that isn't a string array fails closed — the app
+    /// gets an empty allowlist, not whatever the corruption contained.
+    func testUnverifiedFocusAllowlistFailsClosedOnMalformedValue() {
+        let isolated = IsolatedDefaults()
+        isolated.defaults.set(42, forKey: "unverifiedFocusAllowlist")
+        XCTAssertEqual(isolated.defaults.unverifiedFocusAllowlist, [])
+        isolated.defaults.set([1, 2], forKey: "unverifiedFocusAllowlist")
+        XCTAssertEqual(isolated.defaults.unverifiedFocusAllowlist, [])
+    }
+
     func testCurrentLLMConfigFallsBackToFirstAndSelectsByID() {
         let isolated = IsolatedDefaults()
         let first = LLMConfig(id: UUID(), name: "A", providerType: .ollama,
