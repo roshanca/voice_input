@@ -122,12 +122,13 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch (only when provider = system — remote never requests Speech auth). `AudioTapContext` also tees the converted PCM into the session's `HistoryAudioWriter` when `historyAudioEnabled` is on |
 | `ASR/ASRProvider.swift` | `ASRProvider` (system/remote) + `ASRSessionPlan` — the plan resolved at press and snapshotted into the session, so mid-session settings can't reroute a recording |
-| `ASR/RemoteASRRecognizer.swift` | Remote-ASR backend: engine + shared `AudioTapContext` teeing converted PCM into a WAV file; release finalizes → uploads → delegate contract mirrors SpeechRecognizer's minus partials. Upload tracked in `TrackedTaskStore`; Esc cancels capture + upload. Also tees a history clip like the system path |
-| `ASR/AudioTapContext.swift` | Shared render-thread tap state (request, file sink, history writer, converter, RMS) — remote sessions set `fileSink`, system sessions set `request`; either may set `audioWriter`; system path byte-identical when `fileSink` is nil |
-| `ASR/RecordingFileWriter.swift` | `AVAudioFile` WAV sink (16 kHz mono Float32 — accepted by every Whisper-compatible endpoint); `discard` deletes partials so canceled dictations leave nothing on disk |
-| `ASR/RemoteTranscriptionService.swift` | OpenAI-compatible `POST /audio/transcriptions`: pure request builder + response parser (`{text}`, `error.message`), BCP-47→ISO-639-1 language hint; `transcribe` is the only I/O. `RemoteASRError` is `LocalizedError` so panel text survives `Error` bridging |
+| `ASR/RemoteASRRecognizer.swift` | Remote-ASR backend: engine + shared `AudioTapContext` teeing converted PCM into a frame-capped WAV file; release finalizes → uploads → delegate contract mirrors SpeechRecognizer's minus partials. The tap polls `fileSinkLimitReached` so an over-cap recording fails like a route change (#34). Upload tracked in `TrackedTaskStore`; Esc cancels capture + upload. Also tees a history clip like the system path |
+| `ASR/AudioTapContext.swift` | Shared render-thread tap state (request, file sink, history writer, converter, RMS) — remote sessions set `fileSink`, system sessions set `request`; either may set `audioWriter`; system path byte-identical when `fileSink` is nil. Mirrors the sink's `reachedLimit` latch onto `fileSinkLimitReached` (#34) |
+| `ASR/RecordingFileWriter.swift` | `AVAudioFile` WAV sink (16 kHz mono Float32 — accepted by every Whisper-compatible endpoint); `maxFrames` caps the recording and latches `reachedLimit`; `discard` deletes partials so canceled dictations leave nothing on disk |
+| `ASR/RemoteTranscriptionService.swift` | OpenAI-compatible `POST /audio/transcriptions`: pure request builder + response parser (`{text}`, `error.message`), BCP-47→ISO-639-1 language hint; `transcribe` is the only I/O — upload size gated before load, response read through `BoundedBodyReader`, whole request under `TotalRequestTimeout` (#34). `RemoteASRError` is `LocalizedError` so panel text survives `Error` bridging |
 | `ASR/MultipartFormData.swift` | Pure multipart/form-data body builder, fixed field order, byte-exact tested |
-| `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
+| `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); the stream runs through `SSEStreamParser` caps + `TotalRequestTimeout` deadline, partials rate-limited by `PartialUpdateCoalescer` (#34); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
+| `ResourceLimits.swift`, `SSEStreamParser.swift`, `PartialUpdateCoalescer.swift`, `TotalRequestTimeout.swift`, `BoundedBodyReader.swift` | Client-side resource ceilings (#34): numeric caps; incremental OpenAI-compatible SSE reader enforcing line/event/output limits + deadline; rate limiter for partial UI updates; wall-clock request race; capped response-body reader |
 | `LLMProfileRouting.swift` | Pure per-app profile routing: exact bundle-ID match wins, absent/dangling entries fall back to the global pick (selected id → first); resolved once at session start |
 | `TranslationPrompt.swift` | Pure prompt builder for translate sessions — bidirectional against Chinese (already-in-target input translates back to Chinese), `<transcript>` inert-text wrapper like refine |
 | `RewritePrompt.swift` | Pure prompt builder for rewrite sessions — the `<instruction>`-tagged transcript IS the command (inverse of the inert wrappers); output-only contract, ASR-noise-tolerant reading |
@@ -140,7 +141,7 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Selection/SelectedTextProbe.swift` | Selected-text read: AX `AXSelectedText` (0.2 s timeout, caret-only early-exit) → ⌘C clipboard fallback with snapshot/restore + `changeCount` ownership check; drives the selection-action chords |
 | `Selection/SelectionPolicy.swift` | Pure policy deciding caret vs real selection and dictionary-term validity; untested surface = system IO only |
 | `Selection/SelectionFallback.swift` | Pure press-outcome decision: act on selection / fall back to dictation / ignore when the key was released before the probe answered |
-| `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; writes no history. Caller-stamped `requestID` gates every callback: identity is restamped/cleared before `task.cancel()`, and partial/failure/success emissions re-check it plus `Task.isCancelled` — `URLError.cancelled` counts as a cancel, never a failure. `config`/`session` injectable for the scripted-URLProtocol tests |
+| `Selection/SelectionTransformer.swift` | One-shot streamed LLM transform (translate → `translateTargetLanguage`, rewrite); own client so it can't cancel a dictation refinement; same `SSEStreamParser`/timeout/coalescer limits as the refiner (#34); writes no history. Caller-stamped `requestID` gates every callback: identity is restamped/cleared before `task.cancel()`, and partial/failure/success emissions re-check it plus `Task.isCancelled` — `URLError.cancelled` counts as a cancel, never a failure. `config`/`session` injectable for the scripted-URLProtocol tests |
 | `Selection/SelectionPrompts.swift` | Whole-instruction system prompts for the transforms — the selection itself is the user message |
 | `TrackedTaskStore.swift` | Retains tasks (incl. cancelled) until actual exit; drained in `applicationWillTerminate`. **Cancellation ≠ release** |
 | `AppLogger.swift` + `LogRedactor.swift` | In-memory ring buffer; all lines redacted before storage (sensitive-key suffix match + `SensitiveLogValue` + free-text secret/userinfo scrub + `~` home shortening); endpoint URLs log via `sanitizedURL` (scheme/host/port + allowlisted path/query, userinfo never), failures via stable `errorCode` — server bodies and `localizedDescription` echo never reach a line |
@@ -165,11 +166,14 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 hotkey routing/decoding, selection policy, log redaction, task store,
 stats, UserDefaults keys, translation prompt contract, end-command tail
 matching/truncation, remote-ASR wire format (multipart layout, request
-shape, response/error parsing), session-plan resolution,
-selection-transform cancellation isolation (scripted URLProtocol on a
-fictional host — no real network), and
-dictation-target validation (#31: missing/unreadable/churning focus,
-same-app field switch, explicit-allowlist waiver — all via scripted probes).
+shape, response/error parsing, upload ceiling) and session-plan
+resolution, selection-transform cancellation isolation (scripted
+URLProtocol on a fictional host — no real network), dictation-target
+validation (#31: missing/unreadable/churning focus, same-app field
+switch, explicit-allowlist waiver — all via scripted probes), and client
+resource limits (#34: SSE line/event/output caps and total-duration
+bounds, partial-update coalescing, bounded body reads, request timeout,
+recording frame cap).
 `TestHelpers.swift` provides isolated `UserDefaults` suites and temp
 dirs. **No TCC-dependent tests.**
 

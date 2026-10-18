@@ -140,7 +140,10 @@ final class RemoteASRRecognizer: NSObject {
         let tapContext = AudioTapContext(sessionID: sessionID, targetFormat: targetFormat)
         let fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("voiceinput-asr-\(sessionID.uuidString).wav")
-        let writer = try RecordingFileWriter(url: fileURL, format: targetFormat)
+        // The frame cap is the recording-duration limit (#34): at the fixed
+        // 16 kHz format it bounds the WAV, the upload, and the in-memory
+        // multipart body all at once.
+        let writer = try RecordingFileWriter(url: fileURL, format: targetFormat, maxFrames: ResourceLimits.asrMaxRecordingFrames)
         tapContext.fileSink = writer
         fileWriter = writer
         // Remote sessions land in History like system ones — tee the same
@@ -165,8 +168,21 @@ final class RemoteASRRecognizer: NSObject {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: hardwareFormat) { [weak self] buffer, _ in
             guard let rms = tapContext.process(buffer: buffer) else { return }
             let sessionID = tapContext.sessionID
+            let reachedLimit = tapContext.fileSinkLimitReached
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if reachedLimit {
+                    // The WAV hit the duration cap — uploading it would
+                    // silently truncate the utterance, so the session fails
+                    // the way a mid-record route change does (#34). The
+                    // isRecording guard keeps a queued duplicate from
+                    // double-firing after the first teardown.
+                    guard self.isRecording, self.sessionID == sessionID else { return }
+                    AppLogger.shared.warning("Remote ASR recording hit the duration cap — ending capture")
+                    self.teardownCapture()
+                    self.delegate?.remoteASRRecognizer(self, didFailWithError: RemoteASRError.recordingTooLong, sessionID: sessionID)
+                    return
+                }
                 self.delegate?.remoteASRRecognizer(self, didUpdateRMS: rms, sessionID: sessionID)
             }
         }
@@ -271,6 +287,18 @@ final class RemoteASRRecognizer: NSObject {
     private func startUpload(sessionID: UUID) -> Bool {
         guard let writer = fileWriter, let config else { return false }
         fileWriter = nil
+
+        // A recording that latched the duration cap at the release boundary
+        // ends mid-utterance — fail honestly rather than uploading a
+        // truncated take (#34), same as the mid-capture limit path.
+        if writer.reachedLimit {
+            try? FileManager.default.removeItem(at: writer.url)
+            // Origin log like the zero-frames path — the delegate callback
+            // does no error logging of its own (#32).
+            AppLogger.shared.error("Remote ASR recording hit the duration cap — refusing upload of a truncated file")
+            delegate?.remoteASRRecognizer(self, didFailWithError: RemoteASRError.recordingTooLong, sessionID: sessionID)
+            return false
+        }
 
         guard writer.totalFrames > 0 else {
             try? FileManager.default.removeItem(at: writer.url)

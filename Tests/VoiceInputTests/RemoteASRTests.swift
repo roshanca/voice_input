@@ -136,6 +136,45 @@ final class RemoteASRTests: XCTestCase {
         }
     }
 
+    // MARK: - Upload ceiling (#34)
+
+    /// The upload predicate bounds what `transcribe` will ever load into
+    /// memory — the ceiling is Whisper's 25 MB file limit.
+    func testUploadSizePredicate() {
+        let cap = Int64(ResourceLimits.asrMaxUploadBytes)
+        XCTAssertTrue(RemoteTranscriptionService.isUploadSizeAllowed(cap))
+        XCTAssertTrue(RemoteTranscriptionService.isUploadSizeAllowed(0))
+        XCTAssertFalse(RemoteTranscriptionService.isUploadSizeAllowed(cap + 1))
+    }
+
+    /// An over-cap file is refused by its on-disk size before a byte is
+    /// read or a request is built — a sparse file proves the gate without
+    /// writing 25 MB of real data.
+    func testTranscribeRejectsOversizedFileBeforeLoading() async throws {
+        let tempDir = try TemporaryDirectory()
+        let fileURL = tempDir.url.appendingPathComponent("big.wav")
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: fileURL)
+        try handle.truncate(atOffset: UInt64(ResourceLimits.asrMaxUploadBytes) + 1)
+        try handle.close()
+
+        let config = RemoteASRConfig(baseURL: "https://api.openai.com/v1", model: "whisper-1")
+        do {
+            _ = try await RemoteTranscriptionService.transcribe(fileURL: fileURL, config: config, apiKey: "", language: nil)
+            XCTFail("expected uploadTooLarge")
+        } catch {
+            XCTAssertEqual(error as? RemoteASRError, .uploadTooLarge)
+        }
+    }
+
+    /// The recording-duration cap keeps a real session's WAV under the
+    /// upload ceiling — the two limits are consistent by construction.
+    func testRecordingCapStaysUnderUploadCeiling() {
+        // Float32 mono: 4 bytes per frame, plus the WAV header.
+        let wavBytes = Int64(ResourceLimits.asrMaxRecordingFrames * 4) + 1024
+        XCTAssertTrue(RemoteTranscriptionService.isUploadSizeAllowed(wavBytes))
+    }
+
     // MARK: - Language hint mapping
 
     /// Whisper's `language` is ISO-639-1; the app stores BCP-47 tags.
@@ -193,7 +232,9 @@ final class RemoteASRTests: XCTestCase {
             .malformedResponse,
             .noAudioCaptured,
             .microphoneDenied,
-            .audioDeviceChanged
+            .audioDeviceChanged,
+            .recordingTooLong,
+            .uploadTooLarge
         ]
         for error in errors {
             let description = (error as Error).localizedDescription

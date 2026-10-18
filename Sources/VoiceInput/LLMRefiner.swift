@@ -162,16 +162,22 @@ final class LLMRefiner {
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                // The request's total wall-clock budget (#34): the group
+                // race bounds connect + headers, and the parser enforces
+                // the same deadline while the body streams — the idle
+                // timeoutInterval can't stop an endpoint that trickles.
+                let deadline = Date().addingTimeInterval(ResourceLimits.llmTotalRequestDuration)
+                let (bytes, response) = try await TotalRequestTimeout.run(seconds: ResourceLimits.llmTotalRequestDuration) { [request] in
+                    try await URLSession.shared.bytes(for: request)
+                }
 
                 if let httpResponse = response as? HTTPURLResponse {
                     AppLogger.shared.info("LLM HTTP status: \(httpResponse.statusCode)")
                     guard (200...299).contains(httpResponse.statusCode) else {
-                        var bodyString = ""
-                        for try await line in bytes.lines {
-                            bodyString += line
-                            if bodyString.count > 2000 { break }
-                        }
+                        // Bounded read — an error body is a page of text
+                        // at most; unterminated lines must not buffer whole.
+                        let bodyData = try await BoundedBodyReader.prefix(from: bytes, maxBytes: ResourceLimits.errorBodyMaxBytes)
+                        let bodyString = String(String(decoding: bodyData, as: UTF8.self).prefix(2000))
                         // The event and status stay visible; the response
                         // body is untrusted content and is withheld via
                         // SensitiveLogValue rather than collapsing the
@@ -196,21 +202,31 @@ final class LLMRefiner {
 
                 // Parse the SSE stream: "data: {json}" lines, terminated by
                 // "data: [DONE]". Accumulate delta content and mirror it to the
-                // floating panel so generation is visible in real time.
+                // floating panel so generation is visible in real time. The
+                // parser enforces per-line, per-event, and cumulative caps —
+                // an exceeded cap throws and unwinds the request.
+                var parser = SSEStreamParser(deadline: deadline)
+                var coalescer = PartialUpdateCoalescer()
                 var accumulated = ""
-                for try await line in bytes.lines {
+                stream: for try await byte in bytes {
                     try Task.checkCancellation()
-                    guard line.hasPrefix("data:") else { continue }
-                    let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    if payload == "[DONE]" { break }
-                    guard let payloadData = payload.data(using: .utf8),
-                          let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                          let choices = json["choices"] as? [[String: Any]],
-                          let first = choices.first,
-                          let delta = first["delta"] as? [String: Any],
-                          let content = delta["content"] as? String else { continue }
+                    switch try parser.ingest(byte) {
+                    case .delta(let content):
+                        accumulated += content
+                        // Rate-limited: a partial re-renders the whole
+                        // accumulated string, so per-token forwarding is
+                        // O(output²) panel work on a long stream.
+                        if coalescer.shouldEmit() {
+                            self.delegate?.llmRefiner(self, didStreamPartial: accumulated, requestID: requestID)
+                        }
+                    case .done:
+                        break stream
+                    case nil:
+                        continue
+                    }
+                }
+                if case .delta(let content) = try parser.finish() {
                     accumulated += content
-                    self.delegate?.llmRefiner(self, didStreamPartial: accumulated, requestID: requestID)
                 }
 
                 let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)

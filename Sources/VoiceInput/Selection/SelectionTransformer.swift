@@ -167,16 +167,24 @@ final class SelectionTransformer {
         let requestTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let (bytes, response) = try await self.session.bytes(for: request)
+                // Same resource ceilings as the refiner's stream (#34): a
+                // wall-clock race bounds connect + headers, the parser
+                // enforces line/event/output caps and the deadline while
+                // the body streams. The injected session stays the transport
+                // so scripted cancellation tests still drive this path.
+                let session = self.session
+                let deadline = Date().addingTimeInterval(ResourceLimits.llmTotalRequestDuration)
+                let (bytes, response) = try await TotalRequestTimeout.run(seconds: ResourceLimits.llmTotalRequestDuration) { [request, session] in
+                    try await session.bytes(for: request)
+                }
 
                 if let httpResponse = response as? HTTPURLResponse {
                     AppLogger.shared.info("Selection transform HTTP status: \(httpResponse.statusCode)")
                     guard (200...299).contains(httpResponse.statusCode) else {
-                        var bodyString = ""
-                        for try await line in bytes.lines {
-                            bodyString += line
-                            if bodyString.count > 2000 { break }
-                        }
+                        // Bounded read — an error body is a page of text at
+                        // most; unterminated lines must not buffer whole.
+                        let bodyData = try await BoundedBodyReader.prefix(from: bytes, maxBytes: ResourceLimits.errorBodyMaxBytes)
+                        let bodyString = String(String(decoding: bodyData, as: UTF8.self).prefix(2000))
                         // Same shape as the refiner's: status stays
                         // visible, the untrusted body is withheld.
                         AppLogger.shared.error("Selection transform failed", metadata: [
@@ -189,23 +197,30 @@ final class SelectionTransformer {
                     }
                 }
 
+                var parser = SSEStreamParser(deadline: deadline)
+                var coalescer = PartialUpdateCoalescer()
                 var accumulated = ""
-                for try await line in bytes.lines {
+                stream: for try await byte in bytes {
                     try Task.checkCancellation()
-                    guard line.hasPrefix("data:") else { continue }
-                    let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    if payload == "[DONE]" { break }
-                    guard let payloadData = payload.data(using: .utf8),
-                          let json = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                          let choices = json["choices"] as? [[String: Any]],
-                          let first = choices.first,
-                          let delta = first["delta"] as? [String: Any],
-                          let content = delta["content"] as? String else { continue }
+                    switch try parser.ingest(byte) {
+                    case .delta(let content):
+                        accumulated += content
+                        // Rate-limited — each partial re-renders the full
+                        // accumulated string in the panel.
+                        if coalescer.shouldEmit() {
+                            // A late partial from a superseded/cancelled
+                            // request must not reach the caller's panel.
+                            guard self.isLive(requestID) else { return }
+                            onPartial(accumulated)
+                        }
+                    case .done:
+                        break stream
+                    case nil:
+                        continue
+                    }
+                }
+                if case .delta(let content) = try parser.finish() {
                     accumulated += content
-                    // A late partial from a superseded/cancelled request
-                    // must not reach the caller's panel.
-                    guard self.isLive(requestID) else { return }
-                    onPartial(accumulated)
                 }
 
                 let trimmed = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
