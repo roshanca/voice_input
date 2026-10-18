@@ -34,6 +34,10 @@ final class RemoteASRRecognizer: NSObject {
     /// registered with TrackedTaskStore so its real exit stays observable.
     private var uploadTask: Task<Void, Never>?
 
+    /// Restricted-permission directory the session WAVs live in (#35) —
+    /// injectable so tests never touch the real temp location.
+    private let tempStore: RecordingTempStore
+
     private var isRecording = false
     private var stopRequested = false
     /// Identifies the dictation session the current capture/upload belongs
@@ -51,7 +55,8 @@ final class RemoteASRRecognizer: NSObject {
     private var recordingSampleRate: Double = 0
     private var recordingChannelCount: UInt32 = 0
 
-    override init() {
+    init(tempStore: RecordingTempStore = .shared) {
+        self.tempStore = tempStore
         super.init()
         NotificationCenter.default.addObserver(self, selector: #selector(handleConfigurationChange), name: .AVAudioEngineConfigurationChange, object: nil)
     }
@@ -138,12 +143,13 @@ final class RemoteASRRecognizer: NSObject {
         // written verbatim into a WAV container.
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         let tapContext = AudioTapContext(sessionID: sessionID, targetFormat: targetFormat)
-        let fileURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("voiceinput-asr-\(sessionID.uuidString).wav")
-        // The frame cap is the recording-duration limit (#34): at the fixed
-        // 16 kHz format it bounds the WAV, the upload, and the in-memory
-        // multipart body all at once.
-        let writer = try RecordingFileWriter(url: fileURL, format: targetFormat, maxFrames: ResourceLimits.asrMaxRecordingFrames)
+        // Dedicated owner-only directory (#35): raw mic audio must not sit
+        // world-visible in the shared temp root. The frame cap is the
+        // recording-duration limit (#34): at the fixed 16 kHz format it
+        // bounds the WAV, the upload, and the in-memory multipart body
+        // all at once.
+        try tempStore.ensureDirectory()
+        let writer = try RecordingFileWriter(url: tempStore.fileURL(forSessionID: sessionID), format: targetFormat, maxFrames: ResourceLimits.asrMaxRecordingFrames)
         tapContext.fileSink = writer
         fileWriter = writer
         // Remote sessions land in History like system ones — tee the same
@@ -285,7 +291,7 @@ final class RemoteASRRecognizer: NSObject {
     /// is nothing a server could transcribe.
     @discardableResult
     private func startUpload(sessionID: UUID) -> Bool {
-        guard let writer = fileWriter, let config else { return false }
+        guard let writer = fileWriter else { return false }
         fileWriter = nil
 
         // A recording that latched the duration cap at the release boundary
@@ -297,6 +303,13 @@ final class RemoteASRRecognizer: NSObject {
             // does no error logging of its own (#32).
             AppLogger.shared.error("Remote ASR recording hit the duration cap — refusing upload of a truncated file")
             delegate?.remoteASRRecognizer(self, didFailWithError: RemoteASRError.recordingTooLong, sessionID: sessionID)
+            return false
+        }
+
+        // Every bail-out below owns the finished file — a guard that
+        // returns without uploading must not leave it on disk (#35).
+        guard let config else {
+            try? FileManager.default.removeItem(at: writer.url)
             return false
         }
 

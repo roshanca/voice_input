@@ -31,11 +31,16 @@ HotkeyManager (CGEvent tap)
       │     the phrase is stripped from the stored text — the final
       │     result re-strips (a mid-string occurrence means post-command
       │     audio kept transcribing, so it's truncated there)
-      └── .remote → RemoteASRRecognizer (same engine+tap, PCM → WAV file)
+      └── .remote → RemoteASRRecognizer (same engine+tap, PCM → WAV file
+            in RecordingTempStore's owner-only temp dir)
             release → multipart POST {base}/audio/transcriptions →
             {text} → final result → same submitSession path — batch ASR
             can't fire the command mid-record; the same tail-strip still
-            removes a spoken trigger before submit
+            removes a spoken trigger before submit. WAV lifecycle (#35):
+            Esc/quit discard it, the upload removes it on every outcome,
+            writer release is a last-resort delete, and a launch sweep
+            removes only age-expired orphans (young files may belong to a
+            live capture)
   → on release: submitSession()
       ├── LLMRefiner (SSE stream, OpenAI-compatible / Ollama)
       │     streamed tokens → FloatingPanel
@@ -122,9 +127,10 @@ back to the global `currentLLMConfig` pick; selection transforms don't route.
 | `Hotkey/GestureRouting.swift` | Pure tap/doubleTap edge state machine: tap fires on the release edge of a full cycle; doubleTap fires on the second press inside the double-click window; held-key repeats never count; unclaimed releases pass through. Per-binding state lives in the tap callback (`nonisolated` static, `escapeOwnership` pattern) |
 | `SpeechRecognizer.swift` | `SFSpeechRecognizer` wrapper; prefers on-device, falls back to server; warmed at launch (only when provider = system — remote never requests Speech auth). `AudioTapContext` also tees the converted PCM into the session's `HistoryAudioWriter` when `historyAudioEnabled` is on |
 | `ASR/ASRProvider.swift` | `ASRProvider` (system/remote) + `ASRSessionPlan` — the plan resolved at press and snapshotted into the session, so mid-session settings can't reroute a recording |
-| `ASR/RemoteASRRecognizer.swift` | Remote-ASR backend: engine + shared `AudioTapContext` teeing converted PCM into a frame-capped WAV file; release finalizes → uploads → delegate contract mirrors SpeechRecognizer's minus partials. The tap polls `fileSinkLimitReached` so an over-cap recording fails like a route change (#34). Upload tracked in `TrackedTaskStore`; Esc cancels capture + upload. Also tees a history clip like the system path |
+| `ASR/RemoteASRRecognizer.swift` | Remote-ASR backend: engine + shared `AudioTapContext` teeing converted PCM into a frame-capped WAV file under the restricted `RecordingTempStore` dir; release finalizes → uploads → delegate contract mirrors SpeechRecognizer's minus partials. The tap polls `fileSinkLimitReached` so an over-cap recording fails like a route change (#34). Upload tracked in `TrackedTaskStore`; Esc and app-quit cancel capture + upload and discard the file. Also tees a history clip like the system path |
 | `ASR/AudioTapContext.swift` | Shared render-thread tap state (request, file sink, history writer, converter, RMS) — remote sessions set `fileSink`, system sessions set `request`; either may set `audioWriter`; system path byte-identical when `fileSink` is nil. Mirrors the sink's `reachedLimit` latch onto `fileSinkLimitReached` (#34) |
-| `ASR/RecordingFileWriter.swift` | `AVAudioFile` WAV sink (16 kHz mono Float32 — accepted by every Whisper-compatible endpoint); `maxFrames` caps the recording and latches `reachedLimit`; `discard` deletes partials so canceled dictations leave nothing on disk |
+| `ASR/RecordingTempStore.swift` | Dedicated owner-only (0700) temp dir `VoiceInput-ASR/` for remote-ASR WAVs, `voiceinput-asr-<sessionID>.wav` convention, path-contained file ops; launch `sweepOrphans` deletes only regular files past `orphanMaxAge` so a live capture's file is never touched |
+| `ASR/RecordingFileWriter.swift` | `AVAudioFile` WAV sink (16 kHz mono Float32 — accepted by every Whisper-compatible endpoint); `maxFrames` caps the recording and latches `reachedLimit`; `discard` deletes partials so canceled dictations leave nothing on disk, and `deinit` removes the file as a last resort — a released writer can never strand audio |
 | `ASR/RemoteTranscriptionService.swift` | OpenAI-compatible `POST /audio/transcriptions`: pure request builder + response parser (`{text}`, `error.message`), BCP-47→ISO-639-1 language hint; `transcribe` is the only I/O — upload size gated before load, response read through `BoundedBodyReader`, whole request under `TotalRequestTimeout` (#34). `RemoteASRError` is `LocalizedError` so panel text survives `Error` bridging |
 | `ASR/MultipartFormData.swift` | Pure multipart/form-data body builder, fixed field order, byte-exact tested |
 | `LLMRefiner.swift` | SSE streaming refine, translate, **or** rewrite (`Mode` selects system prompt + user wrapper); the whole exchange runs through `SSEStreamExchange` (headers + body inside one wall-clock race, byte caps, coalesced partials — #34); `profileOverride` pins a request to the session's routed `LLMConfig`; task stored in `TrackedTaskStore` |
@@ -170,10 +176,11 @@ shape, response/error parsing, upload ceiling) and session-plan
 resolution, selection-transform cancellation isolation (scripted
 URLProtocol on a fictional host — no real network), dictation-target
 validation (#31: missing/unreadable/churning focus, same-app field
-switch, explicit-allowlist waiver — all via scripted probes), and client
+switch, explicit-allowlist waiver — all via scripted probes), client
 resource limits (#34: SSE line/event/output caps and total-duration
 bounds, partial-update coalescing, bounded body reads, request timeout,
-recording frame cap).
+recording frame cap), and the temp-recording lifecycle (writer
+finish/discard/release, tap-context cancel, orphan-sweep age gate).
 `TestHelpers.swift` provides isolated `UserDefaults` suites and temp
 dirs. **No TCC-dependent tests.**
 

@@ -2,10 +2,13 @@ import XCTest
 import AVFAudio
 @testable import VoiceInput
 
-/// Recording-cap coverage (#34): the writer refuses frames past its
-/// ceiling and latches `reachedLimit` so the recognizer can fail the
-/// session rather than upload a truncated take. Pure AVFAudio file IO
-/// against a temp dir — no mic, engine, or TCC involved.
+/// Recording writer coverage: the frame cap (#34) refuses frames past
+/// its ceiling and latches `reachedLimit` so the recognizer can fail the
+/// session rather than upload a truncated take; and the lifecycle (#35)
+/// — write→finish leaves a readable file for the upload, discard
+/// deletes, and releasing the writer without either handoff deletes
+/// too, so no exit path strands raw audio on disk.
+/// Pure AVFAudio file IO against a temp dir — no mic, engine, or TCC.
 final class RecordingFileWriterTests: XCTestCase {
     private var tempDir: TemporaryDirectory!
 
@@ -18,6 +21,10 @@ final class RecordingFileWriterTests: XCTestCase {
 
     override func tearDown() {
         tempDir = nil
+    }
+
+    private func fileURL(_ name: String = "recording.wav") -> URL {
+        tempDir.url.appendingPathComponent(name)
     }
 
     private func makeBuffer(frames: UInt32 = 512) -> AVAudioPCMBuffer {
@@ -89,5 +96,76 @@ final class RecordingFileWriterTests: XCTestCase {
         // by the writer and mirrored onto the context flag.
         _ = context.process(buffer: hwBuffer)
         XCTAssertTrue(context.fileSinkLimitReached)
+    }
+
+    func testWriteFinishProducesReadableWAV() throws {
+        let url = fileURL()
+        let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+        writer.write(makeBuffer())
+        XCTAssertEqual(writer.totalFrames, 512)
+        writer.finish()
+        // The finished file must decode — the upload ships whatever the
+        // header claims.
+        let readBack = try AVAudioFile(forReading: url)
+        XCTAssertEqual(readBack.length, 512)
+    }
+
+    /// Graceful stop only seals the file — it must still be on disk while
+    /// the writer is alive, because the upload reads it next.
+    func testFinishedFileSurvivesWhileWriterHeld() throws {
+        let url = fileURL()
+        let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+        writer.write(makeBuffer())
+        writer.finish()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// Esc path: a canceled dictation deletes its partial recording.
+    func testDiscardDeletesPartialRecording() throws {
+        let url = fileURL()
+        let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+        writer.write(makeBuffer())
+        writer.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// The release fallback: a writer dropped without finish→upload or
+    /// discard — torn-down startup, quit mid-capture — must not strand
+    /// its file.
+    func testReleaseWithoutHandoffDeletesFile() throws {
+        let url = fileURL()
+        do {
+            let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+            writer.write(makeBuffer())
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// The recognizer's cancel/quit path runs through the tap context:
+    /// deactivating it must delete the recording even while the writer
+    /// object itself is still referenced.
+    func testTapContextDiscardDeletesRecording() throws {
+        let url = fileURL()
+        let context = AudioTapContext(sessionID: UUID(), targetFormat: format)
+        let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+        context.fileSink = writer
+        writer.write(makeBuffer())
+        context.deactivateAndDiscardRecording()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// The release path runs through `deactivateAndEndAudio`: buffers are
+    /// rejected and the file is sealed — but it stays on disk for the
+    /// upload that follows.
+    func testTapContextEndAudioKeepsFinishedFile() throws {
+        let url = fileURL()
+        let context = AudioTapContext(sessionID: UUID(), targetFormat: format)
+        let writer = try RecordingFileWriter(url: url, format: format, maxFrames: .max)
+        context.fileSink = writer
+        writer.write(makeBuffer())
+        context.deactivateAndEndAudio()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertNil(context.process(buffer: makeBuffer()))
     }
 }

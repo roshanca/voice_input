@@ -80,4 +80,13 @@ final class RecordingFileWriter {
         file = nil
         try? FileManager.default.removeItem(at: url)
     }
+
+    /// Last-resort cleanup (#35): a writer released without a finish→upload
+    /// handoff or an explicit discard — a torn-down startup, a config that
+    /// vanished mid-session, a recognizer dropped at quit — must not
+    /// strand its recording. The upload path is unaffected: it still holds
+    /// the writer, and its own defer removes the file first.
+    deinit {
+        try? FileManager.default.removeItem(at: url)
+    }
 }
