@@ -9,15 +9,24 @@ final class WaveformView: NSView {
     private let barLayers: [CAShapeLayer]
     private let attack: CGFloat = 0.40
     private let release: CGFloat = 0.15
+    private let barWidth: CGFloat
+    private let barSpacing: CGFloat
 
     var rms: CGFloat = 0 {
         didSet { /* updated on display link */ }
     }
 
-    override init(frame frameRect: NSRect) {
+    var barColor: NSColor {
+        didSet { barLayers.forEach { $0.fillColor = barColor.cgColor } }
+    }
+
+    init(frame frameRect: NSRect, barWidth: CGFloat = 4, spacing: CGFloat = 3, barColor: NSColor = .white) {
+        self.barWidth = barWidth
+        self.barSpacing = spacing
+        self.barColor = barColor
         barLayers = (0..<5).map { _ in
             let layer = CAShapeLayer()
-            layer.fillColor = NSColor.white.cgColor
+            layer.fillColor = barColor.cgColor
             return layer
         }
         super.init(frame: frameRect)
@@ -55,10 +64,9 @@ final class WaveformView: NSView {
 
     private func updateBars() {
         let currentRMS = rms
-        let baseHeight: CGFloat = 32.0
-        let barWidth: CGFloat = 4.0
-        let spacing: CGFloat = 3.0
-        let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * spacing
+        // Headroom keeps a hot signal from clipping inside its container.
+        let baseHeight = bounds.height * 0.85
+        let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barSpacing
         let startX = (bounds.width - totalWidth) / 2.0
 
         for i in 0..<barCount {
@@ -69,9 +77,9 @@ final class WaveformView: NSView {
             smoothedValues[i] = prev + delta * factor
 
             let jittered = smoothedValues[i] * (1.0 + CGFloat.random(in: -0.04...0.04))
-            let height = max(jittered * baseHeight, 3.0)
+            let height = max(jittered * baseHeight, barWidth)
 
-            let x = startX + CGFloat(i) * (barWidth + spacing)
+            let x = startX + CGFloat(i) * (barWidth + barSpacing)
             let y = (bounds.height - height) / 2.0
             let rect = CGRect(x: x, y: y, width: barWidth, height: height)
             let path = NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2)

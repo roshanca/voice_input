@@ -634,7 +634,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startRecordingAnimation()
         SoundPlayer.recordStart()
 
-        floatingPanel.setText("")
         floatingPanel.show()
 
         // Signal every outstanding startup — stale ones bail on the identity
@@ -663,7 +662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // the panel — only the session that started this recording
                 // may surface its startup error.
                 guard self.activeSession?.id == sessionID else { return }
-                floatingPanel.setText("Error: \(error.localizedDescription)")
+                floatingPanel.setText("Error: \(error.localizedDescription)", status: .error)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     // Session-guarded: if a newer dictation is already
                     // underway, its panel and hotkey state must not be
@@ -763,7 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 activeSession = nil
                 floatingPanel.hide()
             } else if uploadStarted {
-                floatingPanel.setText("Transcribing…")
+                floatingPanel.setText("Transcribing…", status: .transcribing)
             } else if activeSession?.id == session.id {
                 // No upload started and no failure was flagged: either the
                 // recognizer already surfaced the error itself (it cleared
@@ -947,7 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func addSelectionToDictionary(_ text: String) {
         guard let term = SelectionPolicy.dictionaryCandidate(from: text) else {
             AppLogger.shared.info("Add-to-dictionary skipped — selection isn't a term")
-            flashIfPanelFree("Not a dictionary term")
+            flashIfPanelFree("Not a dictionary term", status: .info)
             return
         }
         // Duplicates add no information and would just grow the LLM prompt
@@ -956,12 +955,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.term.caseInsensitiveCompare(term) == .orderedSame
         }) else {
             AppLogger.shared.info("Add-to-dictionary skipped — term already present")
-            flashIfPanelFree("Already in dictionary")
+            flashIfPanelFree("Already in dictionary", status: .info)
             return
         }
         DictionaryStore.shared.add(DictionaryEntry(term: term))
         AppLogger.shared.info("Added selection to dictionary", metadata: ["term": SensitiveLogValue(term)])
-        flashIfPanelFree("Added to dictionary")
+        flashIfPanelFree("Added to dictionary", status: .success)
     }
 
     /// Translate/rewrite path: stream the transform into the panel, then
@@ -978,14 +977,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard selectionTransformer.isConfigured else {
             AppLogger.shared.warning("Selection transform (\(kind)) skipped — LLM not configured")
-            flashIfPanelFree("Set up an LLM profile to use selection actions")
+            flashIfPanelFree("Set up an LLM profile to use selection actions", status: .warning)
             return
         }
         let requestID = UUID()
         selectionTransformRequestID = requestID
         syncEscapeInterception()
-        floatingPanel.setText(kind.progressLabel)
         floatingPanel.show()
+        floatingPanel.setText(kind.progressLabel, status: kind == .translate ? .translating : .generating)
         AppLogger.shared.info("Selection transform started: \(kind)", metadata: ["selection": SensitiveLogValue(text)])
         selectionTransformer.transform(kind: kind, text: text, requestID: requestID, onPartial: { [weak self] partial in
             await self?.selectionTransformPartial(partial, requestID: requestID)
@@ -1038,7 +1037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLogger.shared.error("Selection transform (\(kind)) failed: \(error.localizedDescription)")
             syncEscapeInterception()
             if !isHotkeyHeld, activeSession == nil, pendingSession == nil {
-                floatingPanel.flash("\(kind.failureLabel): \(error.localizedDescription)")
+                floatingPanel.flash("\(kind.failureLabel): \(error.localizedDescription)", status: .error)
             }
         }
     }
@@ -1059,17 +1058,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .parked(let mismatch, let onClipboard):
             floatingPanel.flash(onClipboard
                 ? "\(mismatch.userMessage) — result left on clipboard"
-                : mismatch.userMessage)
+                : mismatch.userMessage, status: .warning)
         case .clipboardNotDelivered:
-            floatingPanel.flash("Couldn't replace the selection")
+            floatingPanel.flash("Couldn't replace the selection", status: .error)
         }
     }
 
     /// Panel flash for a selection action — suppressed while a dictation
     /// owns the panel, same ownership rule as `reportInjectionOutcome`.
-    private func flashIfPanelFree(_ text: String) {
+    private func flashIfPanelFree(_ text: String, status: FloatingPanel.Status) {
         guard activeSession == nil, pendingSession == nil, !isHotkeyHeld else { return }
-        floatingPanel.flash(text)
+        floatingPanel.flash(text, status: status)
     }
 
     /// Strip the voice end command out of a recognized transcript (#26).
@@ -1130,7 +1129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // global pick isn't, and vice versa.
             if session.llmEnabled && LLMRefiner.isConfigured(session.llmConfig) {
                 AppLogger.shared.info("LLM enabled and configured — starting refinement")
-                floatingPanel.setText("Refining…")
+                floatingPanel.setText("Refining…", status: .refining)
                 floatingPanel.setUseOriginalVisible(true)
                 session.submittedText = trimmed
                 pendingSession = session
@@ -1151,12 +1150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let output = applyReplacements(trimmed)
                 AppLogger.shared.warning("Translate session submitted with no configured LLM — parking transcript in History")
                 recordHistory(raw: trimmed, refined: nil, output: output, session: session)
-                floatingPanel.flash("Translation needs a configured LLM profile — transcript saved in History")
+                floatingPanel.flash("Translation needs a configured LLM profile — transcript saved in History", status: .warning)
                 syncEscapeInterception()
                 return
             }
             AppLogger.shared.info("Translate session submitted — translating to \(session.translateTargetLanguage)")
-            floatingPanel.setText("Translating…")
+            floatingPanel.setText("Translating…", status: .translating)
             floatingPanel.setUseOriginalVisible(true)
             session.submittedText = trimmed
             pendingSession = session
@@ -1173,12 +1172,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let output = applyReplacements(trimmed)
                 AppLogger.shared.warning("Rewrite session submitted with no configured LLM — parking transcript in History")
                 recordHistory(raw: trimmed, refined: nil, output: output, session: session)
-                floatingPanel.flash("Rewrite needs a configured LLM profile — transcript saved in History")
+                floatingPanel.flash("Rewrite needs a configured LLM profile — transcript saved in History", status: .warning)
                 syncEscapeInterception()
                 return
             }
             AppLogger.shared.info("Rewrite session submitted — generating answer")
-            floatingPanel.setText("Generating…")
+            floatingPanel.setText("Generating…", status: .generating)
             floatingPanel.setUseOriginalVisible(true)
             session.submittedText = trimmed
             pendingSession = session
@@ -1275,12 +1274,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .inserted:
             break
         case .insertedSendSuppressed(let mismatch):
-            floatingPanel.flash("Pasted — auto-send skipped: \(mismatch.userMessage)")
+            floatingPanel.flash("Pasted — auto-send skipped: \(mismatch.userMessage)", status: .warning)
         case .parked(let mismatch, let onClipboard):
             let destination = onClipboard ? "kept on clipboard" : "saved in History"
-            floatingPanel.flash("\(mismatch.userMessage) — result \(destination)")
+            floatingPanel.flash("\(mismatch.userMessage) — result \(destination)", status: .warning)
         case .clipboardNotDelivered:
-            floatingPanel.flash("Couldn't insert — result saved in History")
+            floatingPanel.flash("Couldn't insert — result saved in History", status: .error)
         case .cancelled:
             // Handled by the deliver() completion — a canceled delivery
             // shows no feedback.
@@ -1387,7 +1386,7 @@ extension AppDelegate: SpeechRecognizerDelegate {
         // No error log here — the recognizer already logged the failure at
         // its origin; a second line only duplicated it (#32).
         if isHotkeyHeld {
-            floatingPanel.setText("Error: \(error.localizedDescription)")
+            floatingPanel.setText("Error: \(error.localizedDescription)", status: .error)
         }
     }
 
@@ -1434,14 +1433,14 @@ extension AppDelegate: RemoteASRRecognizerDelegate {
             // started.
             session.captureFailed = true
             activeSession = session
-            floatingPanel.setText("Error: \(error.localizedDescription)")
+            floatingPanel.setText("Error: \(error.localizedDescription)", status: .error)
         } else {
             // Post-release the only work in flight was the upload itself —
             // it produced no transcript, so there is nothing to submit and
             // nothing to record in History. The flash self-hides so the
             // panel isn't left on a stale "Transcribing…".
             activeSession = nil
-            floatingPanel.flash("Transcription failed: \(error.localizedDescription)")
+            floatingPanel.flash("Transcription failed: \(error.localizedDescription)", status: .error)
             syncEscapeInterception()
         }
     }
