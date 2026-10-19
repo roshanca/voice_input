@@ -33,11 +33,6 @@ final class SettingsStore: ObservableObject {
     @Published var perAppLLMProfileOverrides: [String: String] {
         didSet { UserDefaults.standard.perAppLLMProfileOverrides = perAppLLMProfileOverrides }
     }
-    /// Apps the user explicitly allowlisted for unverifiable-focus
-    /// delivery (#31) — presence in the set is the opt-in.
-    @Published var unverifiedFocusAllowlist: Set<String> {
-        didSet { UserDefaults.standard.unverifiedFocusAllowlist = unverifiedFocusAllowlist }
-    }
     @Published var interactionSounds: Bool {
         didSet { UserDefaults.standard.interactionSounds = interactionSounds }
     }
@@ -158,7 +153,6 @@ final class SettingsStore: ObservableObject {
         autoSend = defaults.autoSend
         autoSendOverrides = defaults.autoSendOverrides
         perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
-        unverifiedFocusAllowlist = defaults.unverifiedFocusAllowlist
         interactionSounds = defaults.interactionSounds
         historyAudioEnabled = defaults.historyAudioEnabled
         selectedMicUID = defaults.selectedMicUID
@@ -187,7 +181,6 @@ final class SettingsStore: ObservableObject {
         autoSend = defaults.autoSend
         autoSendOverrides = defaults.autoSendOverrides
         perAppLLMProfileOverrides = defaults.perAppLLMProfileOverrides
-        unverifiedFocusAllowlist = defaults.unverifiedFocusAllowlist
         interactionSounds = defaults.interactionSounds
         historyAudioEnabled = defaults.historyAudioEnabled
         selectedMicUID = defaults.selectedMicUID
@@ -220,20 +213,6 @@ final class SettingsStore: ObservableObject {
         case .off: overrides[bundleID] = false
         }
         autoSendOverrides = overrides
-    }
-
-    // MARK: - Per-app unverified focus
-
-    /// Writes one app's opt-in for unverifiable-focus delivery (#31);
-    /// removing it returns the app to fail-closed verification.
-    func setUnverifiedFocusAllowed(_ allowed: Bool, for bundleID: String) {
-        var allowlist = unverifiedFocusAllowlist
-        if allowed {
-            allowlist.insert(bundleID)
-        } else {
-            allowlist.remove(bundleID)
-        }
-        unverifiedFocusAllowlist = allowlist
     }
 
     // MARK: - Per-app LLM profiles

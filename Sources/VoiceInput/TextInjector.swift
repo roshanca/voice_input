@@ -420,11 +420,10 @@ final class TextInjector {
         completion?(.clipboardNotDelivered)
     }
 
-    /// Validates the recorded dictation target. A missing capture means the
-    /// target can never be verified, which is reported as `.unverifiable`.
+    /// Validates the recorded dictation target. A missing capture leaves
+    /// nothing to check — delivery proceeds against whatever is frontmost.
     private static func mismatch(for target: DictationTarget?, includeGeometry: Bool = true) -> DictationTarget.Mismatch? {
-        guard let target else { return .unverifiable }
-        return target.mismatch(includeGeometry: includeGeometry)
+        target?.mismatch(includeGeometry: includeGeometry)
     }
 
     /// Auto-send: press Return after the paste settles (sends the message in chat apps).

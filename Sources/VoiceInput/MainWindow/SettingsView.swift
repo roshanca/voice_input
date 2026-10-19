@@ -113,14 +113,6 @@ struct SettingsView: View {
             }
 
             Section {
-                UnverifiedFocusAllowlistView()
-            } header: {
-                Label("Unverified Focus", systemImage: "exclamationmark.shield")
-            } footer: {
-                Text("Delivery fails closed when the focused field can't be verified — nothing is pasted or sent, and the result is kept on the clipboard for manual recovery. Add an app here to explicitly allow delivery to it anyway.")
-            }
-
-            Section {
                 Toggle("End with a spoken word", isOn: $store.voiceEndCommandEnabled)
                 if store.voiceEndCommandEnabled {
                     TextField("End words", text: $store.voiceEndCommandPhrases, prompt: Text("over,完毕"))

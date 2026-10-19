@@ -2,10 +2,11 @@ import SwiftUI
 import AppKit
 
 /// Per-app auto-send rules for the Dictation settings section: one row per
-/// app holding an explicit override, each offering Inherit / On / Off, plus
-/// a menu for adding a rule for one of the running apps. Rules are keyed by
-/// bundle identifier, so they survive relaunch and still match the app even
-/// if it moves on disk.
+/// app holding an explicit override — On / Off plus a visible remove
+/// button that drops the entry so the app follows the global setting —
+/// and a menu for adding a rule for one of the running apps. Rules are
+/// keyed by bundle identifier, so they survive relaunch and still match
+/// the app even if it moves on disk.
 struct AutoSendOverridesView: View {
     @ObservedObject private var store = SettingsStore.shared
 
@@ -31,13 +32,21 @@ struct AutoSendOverridesView: View {
                 .lineLimit(1)
             Spacer()
             Picker("Auto-send for \(displayName(for: bundleID))", selection: overrideBinding(for: bundleID)) {
-                Text("Inherit").tag(AutoSendRules.Override.inherit)
                 Text("On").tag(AutoSendRules.Override.on)
                 Text("Off").tag(AutoSendRules.Override.off)
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 180)
+            .frame(width: 120)
+            Button {
+                // `.inherit` writes no entry — removing it returns the app
+                // to following the global auto-send toggle.
+                store.setAutoSendOverride(.inherit, for: bundleID)
+            } label: {
+                Image(systemName: "minus.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove — follow the global setting again")
         }
     }
 

@@ -10,7 +10,6 @@ extension UserDefaults {
         static let autoSend = "autoSend"
         static let autoSendOverrides = "autoSendOverrides"
         static let perAppLLMProfileOverrides = "perAppLLMProfileOverrides"
-        static let unverifiedFocusAllowlist = "unverifiedFocusAllowlist"
         static let interactionSounds = "interactionSounds"
         static let selectedMicUID = "selectedMicUID"
         static let dictionaryDirectReplacement = "dictionaryDirectReplacement"
@@ -97,17 +96,6 @@ extension UserDefaults {
             }
         }
         set { set(newValue, forKey: Keys.perAppLLMProfileOverrides) }
-    }
-
-    /// Per-app opt-ins for unverifiable-focus delivery (#31): the bundle
-    /// IDs the user explicitly trusts to receive a paste — and auto-send —
-    /// even when the focused element can't be read at validation time.
-    /// Membership IS the opt-in: removing an entry returns the app to
-    /// fail-closed verification, and a corrupted value decodes to an empty
-    /// set rather than silently trusting something.
-    var unverifiedFocusAllowlist: Set<String> {
-        get { Set(stringArray(forKey: Keys.unverifiedFocusAllowlist) ?? []) }
-        set { set(newValue.sorted(), forKey: Keys.unverifiedFocusAllowlist) }
     }
 
     var interactionSounds: Bool {
